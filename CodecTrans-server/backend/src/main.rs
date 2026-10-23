@@ -1524,6 +1524,18 @@ pub async fn library_scan(State(store): State<Store>, Json(req): Json<ScanReq>) 
     }
     let limit = req.limit.unwrap_or(500).max(1).min(5000);
 
+    // Re-encode outputs land NEXT TO their source inside the scan root — a
+    // naive rescan would discover them as new videos and re-encode them in an
+    // endless cascade. Skip any file whose name is a known re-encoded output
+    // of the current catalog.
+    let out_names: std::collections::HashSet<String> = store
+        .lock()
+        .unwrap()
+        .list_library()
+        .into_iter()
+        .filter_map(|e| e.reencoded)
+        .collect();
+
     // Walk (blocking, but cheap) — collect relative video paths.
     let rels = std::thread::scope(|sc| {
         sc.spawn(|| {
@@ -1534,6 +1546,13 @@ pub async fn library_scan(State(store): State<Store>, Json(req): Json<ScanReq>) 
         .join()
         .unwrap_or_default()
     });
+    let rels: Vec<PathBuf> = rels
+        .into_iter()
+        .filter(|rel| {
+            let fname = rel.file_name().and_then(|x| x.to_str()).unwrap_or("");
+            !out_names.contains(fname)
+        })
+        .collect();
 
     // ffprobe each (sequential; bounded by `limit`). MVP — parallelize later.
     let mut entries: Vec<LibraryEntry> = Vec::with_capacity(rels.len());
