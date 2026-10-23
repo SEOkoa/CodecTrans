@@ -12,3 +12,6 @@ CodecTrans-node/out/
 
 # logs
 *.log
+
+# library automation config (runtime, per-host)
+CodecTrans-server/auto.json

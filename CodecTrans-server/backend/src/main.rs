@@ -149,6 +149,10 @@ pub struct Job {
     pub executed_by: String,
     /// true when effective_video_codec was auto-rewritten to an HW encoder.
     pub accelerated: bool,
+    /// Set for library-automation jobs: path relative to the storage root, so
+    /// the node can pull the source and the result lands next to it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lib_path: Option<String>,
 }
 
 /// One accelerator as reported by a node: a physical device (GPU or iGPU)
@@ -1165,6 +1169,205 @@ async fn run_transcode(store: Store, job: Job) {
 }
 
 // ============================================================
+//  Dashboard server stats (CPU/RAM of the server host)
+// ============================================================
+
+fn read_cpu_times() -> Option<(u64, u64)> {
+    // (idle, total) jiffies from /proc/stat's aggregate "cpu" line
+    let s = std::fs::read_to_string("/proc/stat").ok()?;
+    let line = s.lines().find(|l| l.starts_with("cpu "))?;
+    let f: Vec<u64> = line.split_whitespace().skip(1).filter_map(|x| x.parse().ok()).collect();
+    let total = f.iter().sum::<u64>();
+    let idle = f.get(3).copied().unwrap_or(0) + f.get(4).copied().unwrap_or(0); // idle + iowait
+    Some((idle, total))
+}
+
+fn read_mem() -> Option<(u64, u64)> {
+    // (total_bytes, available_bytes) from /proc/meminfo
+    let s = std::fs::read_to_string("/proc/meminfo").ok()?;
+    let get = |k: &str| -> Option<u64> {
+        s.lines().find_map(|l| {
+            let (a, b) = l.split_once(':')?;
+            (a.trim() == k)
+                .then(|| b.trim().trim_end_matches(" kB").parse::<u64>().ok())
+                .flatten()
+        })
+        .map(|kb| kb * 1024)
+    };
+    Some((get("MemTotal")?, get("MemAvailable").unwrap_or(0)))
+}
+
+/// GET /api/server-stats — CPU% (sampled over ~250 ms) + RAM totals for the
+/// dashboard. Non-Linux hosts report nulls rather than failing.
+pub async fn server_stats() -> impl IntoResponse {
+    let (cpu_pct, cores) = {
+        let cores = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1);
+        let a = read_cpu_times();
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+        let b = read_cpu_times();
+        let pct = match (a, b) {
+            (Some((ia, ta)), Some((ib, tb))) if tb > ta => {
+                (100.0 * (tb - ta - ib.saturating_sub(ia)) as f64 / (tb - ta) as f64).min(100.0)
+            }
+            _ => 0.0,
+        };
+        (pct, cores)
+    };
+    let (ram_total, ram_used, ram_pct) = match read_mem() {
+        Some((t, a)) => {
+            let u = t.saturating_sub(a);
+            (
+                Some(t),
+                Some(u),
+                Some(if t > 0 { 100.0 * u as f64 / t as f64 } else { 0.0 }),
+            )
+        }
+        None => (None, None, None),
+    };
+    Json(json!({
+        "cpuPct": cpu_pct,
+        "cores": cores,
+        "ramTotal": ram_total,
+        "ramUsed": ram_used,
+        "ramPct": ram_pct,
+    }))
+}
+
+// ============================================================
+//  Library automation — saved settings + auto-queue on scan
+// ============================================================
+
+#[derive(Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct AutoConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    /// Logical video codec (h264/h265/av1/...); rewritten per-node by the
+    /// usual HW-encoder resolution.
+    #[serde(default)]
+    pub video_codec: Option<String>,
+    #[serde(default)]
+    pub audio_codec: Option<String>,
+    #[serde(default)]
+    pub container: Option<String>,
+    /// "crf" | "pct" (percent of source bitrate).
+    #[serde(default)]
+    pub mode: Option<String>,
+    #[serde(default)]
+    pub crf: Option<u32>,
+    #[serde(default)]
+    pub bitrate_pct: Option<u32>,
+}
+
+fn auto_cfg_path() -> PathBuf {
+    base_dir().join("auto.json")
+}
+
+fn load_auto() -> AutoConfig {
+    std::fs::read_to_string(auto_cfg_path())
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default()
+}
+
+fn save_auto(c: &AutoConfig) -> std::io::Result<()> {
+    std::fs::write(auto_cfg_path(), serde_json::to_string_pretty(c)?)
+}
+
+pub async fn auto_get(State(_store): State<Store>) -> impl IntoResponse {
+    Json(load_auto())
+}
+
+pub async fn auto_post(State(_store): State<Store>, Json(c): Json<AutoConfig>) -> Response {
+    match save_auto(&c) {
+        Ok(_) => Json(json!({"ok": true, "auto": c})).into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": e.to_string()})),
+        )
+            .into_response(),
+    }
+}
+
+/// Queue one library entry for re-encoding on a node using the saved auto
+/// config. The node pulls the source straight from the storage root
+/// (node_fetch_file falls back to it) and the finished file is moved back
+/// next to the source (node_result). Returns true when a job was queued;
+/// false leaves the entry pending (e.g. no online node, file missing).
+async fn dispatch_lib_job(store: &Store, e: &LibraryEntry, cfg: &AutoConfig) -> bool {
+    let root = store.lock().unwrap().storage_root().to_string();
+    let full = PathBuf::from(root.as_str()).join(e.path.as_str());
+    if !full.is_file() {
+        return false;
+    }
+    let vcodec = cfg
+        .video_codec
+        .clone()
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "h264".into());
+    let acodec = cfg
+        .audio_codec
+        .clone()
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "aac".into());
+    let container = cfg
+        .container
+        .clone()
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "mp4".into());
+    let (node_id, node_name, effective, accelerated) = {
+        let c = store.lock().unwrap().redis();
+        let node = match pick_node_redis(c, &codec_family(&vcodec)).await {
+            Some(n) => n,
+            None => return false,
+        };
+        let (effective, accelerated) = resolve_video_codec(&vcodec, &node.hw_encoders);
+        (node.id.clone(), node.name.clone(), effective, accelerated)
+    };
+    let out_name = format!(
+        "{}_{}_{}.{}",
+        safe_base(&e.path),
+        effective.replace("lib", "").replace('-', "_"),
+        container,
+        container
+    );
+    let pct_mode = cfg.mode.as_deref().unwrap_or("pct") == "pct";
+    let (crf, video_bitrate, bitrate_pct) = if pct_mode {
+        let pct = cfg.bitrate_pct.unwrap_or(70).clamp(10, 100);
+        (None, target_kbps(e.video_bit_rate, Some(pct)), Some(pct))
+    } else {
+        (cfg.crf, None, None)
+    };
+    let job = Job {
+        id: uuid::Uuid::new_v4().to_string(),
+        input_file: e.path.clone(),
+        output_file: out_name,
+        video_codec: vcodec,
+        effective_video_codec: effective,
+        audio_codec: acodec,
+        container,
+        crf,
+        video_bitrate,
+        bitrate_pct,
+        source_bit_rate: e.video_bit_rate,
+        status: "queued".into(),
+        progress: 0.0,
+        created_at: now_ms(),
+        started_at: None,
+        finished_at: None,
+        error: None,
+        input_size: Some(e.size),
+        output_size: None,
+        node_id: Some(node_id),
+        executed_by: node_name,
+        accelerated,
+        lib_path: Some(e.path.clone()),
+    };
+    store.lock().unwrap().insert(job);
+    true
+}
+
+// ============================================================
 //  Handlers
 // ============================================================
 
@@ -1362,11 +1565,64 @@ pub async fn library_scan(State(store): State<Store>, Json(req): Json<ScanReq>) 
     {
         let mut s = store.lock().unwrap();
         s.set_storage_root(rootp.to_string_lossy().to_string());
+        // A rescan must not reset files already processed: carry the previous
+        // status/re-encoded info forward before replacing the list.
+        // In-flight statuses (queued/running/...) are only kept when a live
+        // non-terminal library job still exists for the file — otherwise the
+        // entry goes back to "pending" so it can be re-queued.
+        let old = s.list_library();
+        let live: std::collections::HashSet<String> = s
+            .list()
+            .into_iter()
+            .filter(|j| j.lib_path.is_some() && !["done", "error"].contains(&j.status.as_str()))
+            .map(|j| j.input_file)
+            .collect();
+        for e in entries.iter_mut() {
+            if let Some(o) = old.iter().find(|o| o.path == e.path) {
+                let keep = match o.status.as_str() {
+                    "done" => true,
+                    "queued" | "running" | "dispatched" => live.contains(&o.path),
+                    // "error" (and unknown) fall back to pending so a rescan
+                    // retries the file — matches the node_report intent.
+                    _ => false,
+                };
+                if keep {
+                    e.status = o.status.clone();
+                    e.reencoded = o.reencoded.clone();
+                    e.new_size = o.new_size;
+                    e.error = o.error.clone();
+                }
+            }
+        }
         s.set_library(entries.clone());
+    }
+    // Library automation: queue anything newly found (pending) when auto is on.
+    let mut queued_paths: Vec<String> = Vec::new();
+    {
+        let cfg = load_auto();
+        if cfg.enabled {
+            for e in &entries {
+                if e.status == "pending" && dispatch_lib_job(&store, e, &cfg).await {
+                    queued_paths.push(e.path.clone());
+                }
+            }
+            if !queued_paths.is_empty() {
+                for e in entries.iter_mut() {
+                    if queued_paths.contains(&e.path) {
+                        e.status = "queued".into();
+                    }
+                }
+                let mut s = store.lock().unwrap();
+                for p in &queued_paths {
+                    s.update_library_entry(p, |e| e.status = "queued".into());
+                }
+            }
+        }
     }
     Json(json!({
         "root": rootp.to_string_lossy(),
         "count": entries.len(),
+        "queued": queued_paths.len(),
         "entries": entries,
     }))
     .into_response()
@@ -1441,6 +1697,7 @@ pub async fn transcode(State(store): State<Store>, Json(req): Json<TranscodeReq>
         node_id: None,
         executed_by: "server".into(),
         accelerated: false,
+        lib_path: None,
     };
     let job_for_worker = job.clone();
     {
@@ -1719,6 +1976,7 @@ struct ReportReq {
 
 /// POST /api/nodes/:id/report — a node reports job progress / completion.
 pub async fn node_report(State(store): State<Store>, UrlPath(id): UrlPath<String>, Json(req): Json<ReportReq>) -> Response {
+    let req_error = req.error.clone();
     {
         let mut s = store.lock().unwrap();
         if let Some(j) = s.jobs.get_mut(&req.job_id) {
@@ -1747,18 +2005,38 @@ pub async fn node_report(State(store): State<Store>, UrlPath(id): UrlPath<String
         let c = store.lock().unwrap().redis();
         let _ = set_current_job(c, &id, None).await;
     }
+    // Library-automation job failed → mark the entry so a rescan re-queues it.
+    if req.status == "error" {
+        let lp = store.lock().unwrap().jobs.get(&req.job_id).and_then(|j| j.lib_path.clone());
+        if let Some(lp) = lp {
+            let mut s = store.lock().unwrap();
+            s.update_library_entry(&lp, |e| {
+                e.status = "error".into();
+                e.error = req_error;
+            });
+        }
+    }
     Json(json!({"ok": true})).into_response()
 }
 
-/// GET /api/nodes/:id/file/:name — a node fetches an input file from the server.
-pub async fn node_fetch_file(UrlPath((_id, name)): UrlPath<(String, String)>) -> Response {
-    if name.contains("..") || name.contains('/') || name.contains('\\') {
+/// GET /api/nodes/:id/file/:name (or /*name for library subpaths) — a node
+/// fetches an input file from the server. Uploads first; library jobs pull
+/// straight from the storage root (name is then a relative path with slashes).
+pub async fn node_fetch_file(State(store): State<Store>, UrlPath((_id, name)): UrlPath<(String, String)>) -> Response {
+    if name.contains("..") {
         return (StatusCode::BAD_REQUEST, Json(json!({"error": "bad filename"}))).into_response();
     }
-    let path = uploads_dir().join(&name);
-    if !path.exists() {
-        return (StatusCode::NOT_FOUND, Json(json!({"error": "not found"}))).into_response();
-    }
+    let up = uploads_dir().join(&name);
+    let path = if up.exists() {
+        up
+    } else {
+        let root = store.lock().unwrap().storage_root().to_string();
+        let rp = PathBuf::from(root).join(&name);
+        if !rp.exists() {
+            return (StatusCode::NOT_FOUND, Json(json!({"error": "not found"}))).into_response();
+        }
+        rp
+    };
     match std::fs::read(&path) {
         Ok(b) => (StatusCode::OK, [("content-type", "application/octet-stream")], b).into_response(),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e.to_string()}))).into_response(),
@@ -1846,11 +2124,41 @@ pub async fn node_result(State(store): State<Store>, UrlPath(id): UrlPath<String
         return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": format!("write {e}")}))).into_response();
     }
     let size = tmp_size;
-    {
+    // Library-automation jobs land next to the source file, not in outputs/.
+    let lib = {
         let mut s = store.lock().unwrap();
+        let lp = s.jobs.get(&job_id).and_then(|j| j.lib_path.clone());
         if let Some(j) = s.jobs.get_mut(&job_id) {
             j.output_file = out_name.clone();
             j.output_size = Some(size);
+        }
+        (s.storage_root().to_string(), lp)
+    };
+    if let (root, Some(lp)) = (&lib.0, &lib.1) {
+        if !root.is_empty() {
+            let src = PathBuf::from(root).join(&lp);
+            if let Some(dir) = src.parent() {
+                let _ = std::fs::create_dir_all(dir);
+            }
+            let dest = src.with_file_name(&out_name);
+            // rename fails across devices (e.g. outputs on /, storage on
+            // /tmp or a NAS mount) — fall back to copy + delete.
+            let moved = std::fs::rename(&path, &dest).is_ok() || {
+                let ok = std::fs::copy(&path, &dest).is_ok();
+                if ok {
+                    let _ = std::fs::remove_file(&path);
+                }
+                ok
+            };
+            if moved {
+                let mut s = store.lock().unwrap();
+                s.update_library_entry(&lp, |e| {
+                    e.status = "done".into();
+                    e.reencoded = Some(out_name.clone());
+                    e.new_size = Some(size);
+                    e.error = None;
+                });
+            }
         }
     }
     Json(json!({"ok": true, "file": out_name, "size": size})).into_response()
@@ -1946,6 +2254,7 @@ pub async fn dispatch(State(store): State<Store>, Json(req): Json<DispatchReq>) 
         node_id: Some(node_id.clone()),
         executed_by: node_name.clone(),
         accelerated,
+        lib_path: None,
     };
     store.lock().unwrap().insert(job);
     Json(json!({
@@ -1986,9 +2295,11 @@ async fn main() {
 
     let app = Router::new()
         .route("/api/health", get(health))
+        .route("/api/server-stats", get(server_stats))
         .route("/api/codecs", get(codecs))
         .route("/api/library", get(library_get))
         .route("/api/library/scan", post(library_scan))
+        .route("/api/library/auto", get(auto_get).post(auto_post))
         .route("/api/upload", post(upload))
         .route("/api/media/analyze", get(media_analyze))
         .route("/api/transcode", post(transcode))
@@ -2005,7 +2316,7 @@ async fn main() {
         .route("/api/nodes/:id/heartbeat", post(node_heartbeat))
         .route("/api/nodes/:id/poll", get(node_poll))
         .route("/api/nodes/:id/report", post(node_report))
-        .route("/api/nodes/:id/file/:name", get(node_fetch_file))
+        .route("/api/nodes/:id/file/*name", get(node_fetch_file))
         .route("/api/nodes/:id/result", post(node_result))
         .with_state(store)
         // Lift Multipart's 2MB default body limit (it silently breaks real

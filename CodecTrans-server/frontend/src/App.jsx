@@ -118,6 +118,15 @@ export default function App() {
   const [health, setHealth] = useState(null);
   const [codecs, setCodecs] = useState(null);
 
+  // tabs: dashboard (default) | library | settings | test (the original screen)
+  const [tab, setTab] = useState("dashboard");
+  // dashboard: server host stats, refreshed on the 2s tick
+  const [stats, setStats] = useState(null);
+  // library automation settings (persisted server-side in auto.json)
+  const [auto, setAuto] = useState(null);
+  const [autoMsg, setAutoMsg] = useState("");
+  const [autoSaving, setAutoSaving] = useState(false);
+
   // upload
   const [file, setFile] = useState(null);
   const [uploadedFile, setUploadedFile] = useState(null);
@@ -165,6 +174,7 @@ export default function App() {
   // load catalog + health
   useEffect(() => {
     api.health().then(setHealth).catch(() => setHealth({ status: "down" }));
+    api.autoGet().then(setAuto).catch(() => {});
     api
       .library()
       .then((l) => {
@@ -190,6 +200,7 @@ export default function App() {
       api.nodes().then(setNodes).catch(() => {});
       api.discoveredNodes().then(setDiscovered).catch(() => {});
       api.library().then(setLibrary).catch(() => {});
+      if (tab === "dashboard") api.serverStats().then(setStats).catch(() => {});
       // keep the active job's progress bar live until it's terminal
       const aj = activeJobRef.current;
       if (aj && !["done", "error"].includes(aj.status)) {
@@ -203,7 +214,7 @@ export default function App() {
       }
     }, 2000);
     return () => clearInterval(t);
-  }, []);
+  }, [tab]);
 
   // poll the active job for a smooth progress bar (500ms). Depend only on the
   // job id so the interval isn't torn down on every progress tick.
@@ -377,16 +388,51 @@ export default function App() {
     }
   }
 
+  // Persist the library-automation settings (server saves them to auto.json
+  // and applies them to newly found videos on the next scan).
+  async function saveAuto() {
+    if (!auto) return;
+    setAutoSaving(true);
+    setAutoMsg("");
+    try {
+      await api.autoPost(auto);
+      setAutoMsg("저장됨 ✓");
+      setTimeout(() => setAutoMsg(""), 3000);
+    } catch (err) {
+      setAutoMsg(err.message);
+    } finally {
+      setAutoSaving(false);
+    }
+  }
+
   return (
     <div className="wrap">
       <header>
         <h1>CodecTrans</h1>
+        <nav className="tabs">
+          {[
+            ["dashboard", "대시보드"],
+            ["library", "라이브러리"],
+            ["settings", "세팅"],
+            ["test", "테스트"],
+          ].map(([id, label]) => (
+            <button
+              key={id}
+              className={tab === id ? "on" : ""}
+              onClick={() => setTab(id)}
+            >
+              {label}
+            </button>
+          ))}
+        </nav>
         <div className={`pill ${health?.status === "ok" ? "ok" : "bad"}`}>
           {health?.status === "ok" ? "backend online" : "backend offline"}
         </div>
       </header>
       {health?.ffmpeg && <div className="sub">{health.ffmpeg}</div>}
 
+      {/* ═══ 테스트 — the original upload/transcode screen ═══ */}
+      {tab === "test" && (
       <div className="grid">
         {/* left: upload + settings */}
         <section className="card">
@@ -654,8 +700,56 @@ export default function App() {
           </div>
         </section>
       </div>
+      )}
 
-      {/* nodes */}
+      {/* ═══ 대시보드 — server CPU/RAM + node registry ═══ */}
+      {tab === "dashboard" && (
+        <>
+          <section className="card stats">
+            <h2>서버</h2>
+            <div className="statgrid">
+              <div className="stat">
+                <div className="stat-top">
+                  <span className="stat-label">CPU</span>
+                  <span className="stat-val">
+                    {stats?.cpuPct != null ? `${Math.round(stats.cpuPct)}%` : "—"}
+                  </span>
+                </div>
+                <div className="bar">
+                  <div
+                    className="bar-fill"
+                    style={{ width: `${Math.min(100, stats?.cpuPct ?? 0)}%` }}
+                  />
+                </div>
+                {stats?.cores != null && (
+                  <div className="meta">
+                    <span>{stats.cores} cores</span>
+                  </div>
+                )}
+              </div>
+              <div className="stat">
+                <div className="stat-top">
+                  <span className="stat-label">RAM</span>
+                  <span className="stat-val">
+                    {stats?.ramPct != null ? `${Math.round(stats.ramPct)}%` : "—"}
+                  </span>
+                </div>
+                <div className="bar">
+                  <div
+                    className="bar-fill"
+                    style={{ width: `${Math.min(100, stats?.ramPct ?? 0)}%` }}
+                  />
+                </div>
+                {stats?.ramTotal != null && (
+                  <div className="meta">
+                    <span>
+                      {fmtSize(stats.ramUsed)} / {fmtSize(stats.ramTotal)}
+                    </span>
+                  </div>
+                )}
+              </div>
+            </div>
+          </section>
       <section className="card nodes">
         <h2>
           Nodes ({shownNodes.length})
@@ -778,6 +872,134 @@ export default function App() {
           </>
         )}
       </section>
+        </>
+      )}
+
+      {/* ═══ 라이브러리 — folder + automation ═══ */}
+      {tab === "library" && (
+        <>
+          <section className="card auto">
+            <h2>자동화</h2>
+            <div className="hint">
+              활성화하면 스캔할 때마다 <b>새로 발견된</b> 영상을 아래 설정으로
+              자동 큐잉합니다. 가장 적합한 노드의 HW 인코더가 자동으로 선택되고,
+              결과는 원본 옆에 저장됩니다 (원본은 건드리지 않음).
+            </div>
+            {auto ? (
+              <div className="autoform">
+                <label className="chk">
+                  <input
+                    type="checkbox"
+                    checked={!!auto.enabled}
+                    onChange={(e) => setAuto({ ...auto, enabled: e.target.checked })}
+                  />
+                  새 영상 자동 처리
+                </label>
+                <div className="auto-row">
+                  <label>
+                    비디오 코덱
+                    <select
+                      value={auto.videoCodec || "h264"}
+                      onChange={(e) => setAuto({ ...auto, videoCodec: e.target.value })}
+                    >
+                      {(codecs?.videoCodecs || [])
+                        .filter((c) => c.id !== "copy")
+                        .map((c) => (
+                          <option key={c.id} value={c.id}>
+                            {c.label}
+                          </option>
+                        ))}
+                    </select>
+                  </label>
+                  <label>
+                    오디오 코덱
+                    <select
+                      value={auto.audioCodec || "aac"}
+                      onChange={(e) => setAuto({ ...auto, audioCodec: e.target.value })}
+                    >
+                      {(codecs?.audioCodecs || []).map((c) => (
+                        <option key={c.id} value={c.id}>
+                          {c.label}
+                        </option>
+                      ))}
+                    </select>
+                  </label>
+                  <label>
+                    컨테이너
+                    <select
+                      value={auto.container || "mp4"}
+                      onChange={(e) => setAuto({ ...auto, container: e.target.value })}
+                    >
+                      {(codecs?.containers || []).map((c) => (
+                        <option key={c.id} value={c.id}>
+                          {c.label}
+                        </option>
+                      ))}
+                    </select>
+                  </label>
+                </div>
+                <div className="auto-row">
+                  <div className="ratemode">
+                    <button
+                      type="button"
+                      className={`rm-opt ${auto.mode === "crf" ? "on" : ""}`}
+                      onClick={() => setAuto({ ...auto, mode: "crf" })}
+                    >
+                      질량 (CRF)
+                    </button>
+                    <button
+                      type="button"
+                      className={`rm-opt ${auto.mode !== "crf" ? "on" : ""}`}
+                      onClick={() => setAuto({ ...auto, mode: "pct" })}
+                    >
+                      원본 비트레이트 %
+                    </button>
+                  </div>
+                  {auto.mode !== "crf" ? (
+                    <label>
+                      목표: {auto.bitratePct ?? 70}%
+                      <input
+                        type="range"
+                        min="10"
+                        max="100"
+                        step="5"
+                        value={auto.bitratePct ?? 70}
+                        onChange={(e) =>
+                          setAuto({ ...auto, bitratePct: Number(e.target.value) })
+                        }
+                      />
+                      <div className="rm-scale">
+                        <span>작아짐</span>
+                        <span>50%</span>
+                        <span className="mid">100% = 원본</span>
+                      </div>
+                    </label>
+                  ) : (
+                    <label>
+                      CRF {auto.crf ?? 23} — 낮을수록 선명
+                      <input
+                        type="range"
+                        min="0"
+                        max="51"
+                        value={auto.crf ?? 23}
+                        onChange={(e) => setAuto({ ...auto, crf: Number(e.target.value) })}
+                      />
+                    </label>
+                  )}
+                </div>
+                <div className="row">
+                  <button className="primary" onClick={saveAuto} disabled={autoSaving}>
+                    {autoSaving ? "저장 중…" : "자동화 저장"}
+                  </button>
+                  {autoMsg && <span className="meta ok-text">{autoMsg}</span>}
+                </div>
+              </div>
+            ) : (
+              <div className="meta">
+                <span>자동화 설정을 불러오는 중…</span>
+              </div>
+            )}
+          </section>
 
       {/* storage library (server-scanned directory of videos) */}
       <section className="card lib">
@@ -840,6 +1062,34 @@ export default function App() {
           </div>
         )}
       </section>
+        </>
+      )}
+
+      {/* ═══ 세팅 — skeleton for now ═══ */}
+      {tab === "settings" && (
+        <section className="card settings">
+          <h2>세팅</h2>
+          <div className="hint">
+            더 많은 설정은 추가 예정입니다. 지금은 서버 정보만 보여드려요.
+          </div>
+          <div className="statgrid">
+            <div className="stat">
+              <div className="stat-top">
+                <span className="stat-label">서비스</span>
+                <span className="stat-val">{health?.service || "—"}</span>
+              </div>
+            </div>
+            <div className="stat">
+              <div className="stat-top">
+                <span className="stat-label">FFmpeg</span>
+                <span className="stat-val">
+                  {health?.ffmpeg ? health.ffmpeg.split(" ").slice(0, 3).join(" ") : "—"}
+                </span>
+              </div>
+            </div>
+          </div>
+        </section>
+      )}
     </div>
   );
 }

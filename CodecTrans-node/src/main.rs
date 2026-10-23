@@ -833,6 +833,11 @@ async fn run_job(client: &reqwest::Client, state: &NState, server: &str, node_id
         }
     };
     if let Ok(bytes) = dl.bytes().await {
+        // input_file may be a library-relative path with subdirectories
+        // (e.g. "subdir/movie.mp4") — make sure the parent exists first.
+        if let Some(p) = in_path.parent() {
+            let _ = std::fs::create_dir_all(p);
+        }
         let _ = std::fs::write(&in_path, &bytes);
     }
 

@@ -19,6 +19,7 @@ async function jfetch(path, opts = {}) {
 
 export const api = {
   health: () => jfetch("/api/health"),
+  serverStats: () => jfetch("/api/server-stats"),
   codecs: () => jfetch("/api/codecs"),
   jobs: () => jfetch("/api/jobs"),
   job: (id) => jfetch(`/api/jobs/${id}`),
@@ -95,6 +96,14 @@ export const api = {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ root: root || undefined, limit }),
+    }),
+  // library automation settings (persisted server-side)
+  autoGet: () => jfetch("/api/library/auto"),
+  autoPost: (cfg) =>
+    jfetch("/api/library/auto", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(cfg),
     }),
 };
 
