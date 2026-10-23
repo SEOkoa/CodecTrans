@@ -699,18 +699,28 @@ fn is_hw_encoder(enc: &str) -> bool {
         || e.ends_with("_qsv")
         || e.ends_with("_amf")
         || e.ends_with("_mft")
+        || e.ends_with("_vt") // videotoolbox (macOS): h264_vt, hevc_vt, mjpeg_vt
         || e.contains("videotoolbox")
 }
 
+/// Rank a HW encoder by backend preference (lower = faster on typical media):
+/// nvenc > vaapi > qsv > amf > mft > videotoolbox. Suffix-based so names like
+/// `hevc_vt` map to the videotoolbox rank.
+fn backend_rank(enc: &str) -> usize {
+    let e = enc.to_lowercase();
+    let pref = ["nvenc", "vaapi", "qsv", "amf", "mft", "vt"];
+    pref.iter()
+        .position(|p| e.ends_with(&format!("_{p}")))
+        .unwrap_or(99)
+}
+
 /// Pick the best accelerated encoder for a family from a node's HW encoders.
-/// Preference order of backends: nvenc > vaapi > qsv > amf > mft > videotoolbox.
 fn best_hw_encoder(hw: &[String], family: &str) -> Option<String> {
-    let pref = ["nvenc", "vaapi", "qsv", "amf", "mft", "videotoolbox"];
     let mut cands: Vec<&String> = hw.iter().filter(|h| codec_family(h) == family).collect();
     cands.sort_by(|a, b| {
-        let ra = pref.iter().position(|p| a.contains(p)).unwrap_or(99);
-        let rb = pref.iter().position(|p| b.contains(p)).unwrap_or(99);
-        ra.cmp(&rb).then_with(|| a.cmp(b))
+        backend_rank(a)
+            .cmp(&backend_rank(b))
+            .then_with(|| a.cmp(b))
     });
     cands.first().map(|s| s.to_string())
 }

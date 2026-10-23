@@ -160,6 +160,7 @@ fn is_hw_encoder(enc: &str) -> bool {
         || e.ends_with("_qsv")
         || e.ends_with("_amf")
         || e.ends_with("_mft")
+        || e.ends_with("_vt") // videotoolbox (macOS): h264_vt, hevc_vt, mjpeg_vt
         || e.contains("videotoolbox")
 }
 
@@ -218,9 +219,77 @@ fn intel_gpu_name(sys_dev: &str) -> String {
     "Intel iGPU".into()
 }
 
-/// Enumerate GPU devices: NVIDIA via nvidia-smi, iGPUs (Intel and friends)
-/// via /dev/dri render nodes + PCI vendor id.
+/// macOS GPU name (VideoToolbox device). system_profiler is slow-ish but this
+/// runs once at startup.
+fn mac_gpu_name() -> String {
+    if let Ok(o) = std::process::Command::new("system_profiler")
+        .args(["SPDisplaysDataType", "-json"])
+        .output()
+    {
+        for line in String::from_utf8_lossy(&o.stdout).lines() {
+            let l = line.trim();
+            for key in ["\"chipset_model\"", "\"chip_model\""] {
+                if let Some(i) = l.find(key) {
+                    let rest = l[i + key.len()..].trim().trim_start_matches(':').trim().trim_matches('"');
+                    if !rest.is_empty() {
+                        return rest.to_string();
+                    }
+                }
+            }
+        }
+    }
+    "Apple GPU".into()
+}
+
+/// Windows video controllers (vendor, name) via WMI. NVIDIA is reported by
+/// nvidia-smi already, so skip it here to avoid double numbering.
+fn windows_video_controllers() -> Option<Vec<(String, String)>> {
+    let out = std::process::Command::new("powershell")
+        .args([
+            "-NoProfile",
+            "-Command",
+            "Get-CimInstance Win32_VideoController | Select-Object -ExpandProperty Name",
+        ])
+        .output()
+        .ok()?;
+    let mut res: Vec<(String, String)> = Vec::new();
+    for line in String::from_utf8_lossy(&out.stdout).lines() {
+        let n = line.trim();
+        if n.is_empty() {
+            continue;
+        }
+        let l = n.to_lowercase();
+        if l.contains("nvidia") {
+            continue;
+        }
+        if l.contains("intel") {
+            res.push(("intel".into(), n.to_string()));
+        } else if l.contains("amd") || l.contains("radeon") {
+            res.push(("amd".into(), n.to_string()));
+        }
+    }
+    Some(res)
+}
+
+/// Enumerate GPU devices per platform:
+///  - NVIDIA via nvidia-smi (Linux + Windows)
+///  - Linux iGPUs via /dev/dri render nodes + PCI vendor id
+///  - Windows iGPU/AMD via WMI (Win32_VideoController)
+///  - macOS: one VideoToolbox device
 fn enumerate_gpus() -> Vec<GpuDev> {
+    let os = std::env::consts::OS;
+
+    // --- macOS: single VideoToolbox device ---
+    if os == "macos" {
+        return vec![GpuDev {
+            kind: "gpu".into(),
+            index: 0,
+            name: mac_gpu_name(),
+            vendor: "apple".into(),
+            render_node: None,
+        }];
+    }
+
     let mut out: Vec<GpuDev> = Vec::new();
 
     // --- NVIDIA (discrete GPUs) ---
@@ -244,31 +313,65 @@ fn enumerate_gpus() -> Vec<GpuDev> {
         }
     }
 
-    // --- render nodes: classify by PCI vendor ---
+    // --- Linux render nodes: classify by PCI vendor ---
     let mut intel: Vec<(u32, String, String)> = Vec::new(); // (idx, node, name)
     let mut nvidia_nodes: Vec<String> = Vec::new();
     let mut n_idx = 0u32;
-    if let Ok(rd) = std::fs::read_dir("/dev/dri") {
-        let mut entries: Vec<String> = rd
-            .filter_map(|e| e.ok())
-            .map(|e| e.file_name().to_string_lossy().to_string())
-            .filter(|n| n.starts_with("renderD"))
-            .collect();
-        entries.sort();
-        for n in entries {
-            let sys = format!("/sys/class/drm/{}/device", n);
-            let vendor = std::fs::read_to_string(format!("{sys}/vendor"))
-                .ok()
-                .map(|v| v.trim().to_string())
-                .unwrap_or_default();
-            match vendor.as_str() {
-                "0x8086" => {
-                    let name = intel_gpu_name(&sys);
-                    intel.push((n_idx, format!("/dev/dri/{n}"), name));
-                    n_idx += 1;
+    if os == "linux" {
+        if let Ok(rd) = std::fs::read_dir("/dev/dri") {
+            let mut entries: Vec<String> = rd
+                .filter_map(|e| e.ok())
+                .map(|e| e.file_name().to_string_lossy().to_string())
+                .filter(|n| n.starts_with("renderD"))
+                .collect();
+            entries.sort();
+            for n in entries {
+                let sys = format!("/sys/class/drm/{}/device", n);
+                let vendor = std::fs::read_to_string(format!("{sys}/vendor"))
+                    .ok()
+                    .map(|v| v.trim().to_string())
+                    .unwrap_or_default();
+                match vendor.as_str() {
+                    "0x8086" => {
+                        let name = intel_gpu_name(&sys);
+                        intel.push((n_idx, format!("/dev/dri/{n}"), name));
+                        n_idx += 1;
+                    }
+                    "0x10de" => nvidia_nodes.push(format!("/dev/dri/{n}")),
+                    _ => {}
                 }
-                "0x10de" => nvidia_nodes.push(format!("/dev/dri/{n}")),
-                _ => {}
+            }
+        }
+    }
+
+    // --- Windows: WMI video controllers (Intel iGPU -> QSV, AMD -> AMF) ---
+    if os == "windows" {
+        if let Some(ctrls) = windows_video_controllers() {
+            let mut i_idx = 0u32;
+            let mut a_idx = 0u32;
+            for (vendor, name) in ctrls {
+                match vendor.as_str() {
+                    "intel" => out.push(GpuDev {
+                        kind: "cpu".into(),
+                        index: i_idx,
+                        name,
+                        vendor: "intel".into(),
+                        render_node: None, // QSV on Windows picks its device
+                    }),
+                    "amd" => out.push(GpuDev {
+                        kind: "gpu".into(),
+                        index: a_idx,
+                        name,
+                        vendor: "amd".into(),
+                        render_node: None,
+                    }),
+                    _ => {}
+                }
+                if vendor == "intel" {
+                    i_idx += 1;
+                } else {
+                    a_idx += 1;
+                }
             }
         }
     }
@@ -347,9 +450,12 @@ struct ProbeTask {
 
 /// Build per-(device, backend, encoder) probe tasks for every HW encoder
 /// ffmpeg reports. NVENC: one task set per NVIDIA GPU (CUDA_VISIBLE_DEVICES=i
-/// makes that GPU the only visible one). QSV/VA-API: pinned per render node
-/// via -qsv_device / -vaapi_device (both accept a DRM path).
+/// makes that GPU the only visible one; works on Linux and Windows).
+/// QSV/VA-API on Linux: pinned per render node via -qsv_device / -vaapi_device
+/// (both accept a DRM path). QSV on Windows / AMF / VideoToolbox: no device
+/// pinning needed — the backend picks its own device.
 fn build_probe_tasks(encs: &[String], devs: &[GpuDev]) -> Vec<ProbeTask> {
+    let os = std::env::consts::OS;
     let mut tasks: Vec<ProbeTask> = Vec::new();
     for d in devs {
         let base = || Accel {
@@ -389,22 +495,63 @@ fn build_probe_tasks(encs: &[String], devs: &[GpuDev]) -> Vec<ProbeTask> {
                 }
             }
             "intel" => {
-                if let Some(node) = &d.render_node {
+                // Linux: pin the render node. Windows: QSV finds its own device.
+                let on_windows = os == "windows";
+                if d.render_node.is_some() || on_windows {
+                    let node = d.render_node.clone();
                     for backend in ["qsv", "vaapi"] {
+                        // VA-API only exists as a backend on Linux.
+                        if backend == "vaapi" && node.is_none() {
+                            continue;
+                        }
                         for e in encs.iter().filter(|e| e.ends_with(&format!("_{backend}"))) {
                             let mut a = base();
                             a.backend = backend.into();
-                            let flag = if backend == "qsv" { "-qsv_device" } else { "-vaapi_device" };
+                            let mut extra = vec![];
+                            if let Some(n) = &node {
+                                let flag = if backend == "qsv" { "-qsv_device" } else { "-vaapi_device" };
+                                extra = vec![flag.into(), n.clone()];
+                            }
                             tasks.push(ProbeTask {
                                 enc: e.clone(),
-                                tag: format!("{backend}{}", d.index),
+                                tag: format!("{backend}{}{}", d.index, if on_windows { "w" } else { "" }),
                                 vf: if backend == "vaapi" { "format=nv12,hwupload".into() } else { "format=nv12".into() },
-                                extra_args: vec![flag.into(), node.clone()],
+                                extra_args: extra,
                                 env: vec![],
                                 accel: a,
                             });
                         }
                     }
+                }
+            }
+            "amd" => {
+                // AMF (Windows) — the backend picks the default AMD GPU.
+                for e in encs.iter().filter(|e| e.ends_with("_amf")) {
+                    let mut a = base();
+                    a.backend = "amf".into();
+                    tasks.push(ProbeTask {
+                        enc: e.clone(),
+                        tag: format!("amf{}", d.index),
+                        vf: "format=nv12".into(),
+                        extra_args: vec![],
+                        env: vec![],
+                        accel: a,
+                    });
+                }
+            }
+            "apple" => {
+                // VideoToolbox (macOS) — h264_vt / hevc_vt / mjpeg_vt, no pinning.
+                for e in encs.iter().filter(|e| e.ends_with("_vt")) {
+                    let mut a = base();
+                    a.backend = "videotoolbox".into();
+                    tasks.push(ProbeTask {
+                        enc: e.clone(),
+                        tag: format!("vt{}", d.index),
+                        vf: "format=nv12".into(),
+                        extra_args: vec![],
+                        env: vec![],
+                        accel: a,
+                    });
                 }
             }
             _ => {}

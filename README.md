@@ -37,6 +37,17 @@ CT_SERVER=http://<server>:8400 ./CodecTrans-node/run.sh
 - The node probes every (device, backend, encoder) combination at startup and reports
   accelerators per physical device: `GPU #0 (nvenc)`, `CPU #0 (qsv)`, `CPU #0 (vaapi)`, …
 - The server auto-rewrites logical codecs to the node's best working HW encoder
-  (nvenc > vaapi > qsv > software) and records `effectiveVideoCodec` + `accelerated` per job.
+  (nvenc > vaapi > qsv > amf > videotoolbox > software) and records `effectiveVideoCodec` + `accelerated` per job.
 - `frontend/dist` is committed so a clone runs without a Node toolchain; rebuild it with
   `npm run build` in `CodecTrans-server/frontend/` when changing the UI.
+
+## Per-OS support
+
+| | server | node HW accel |
+|---|---|---|
+| **Linux** | any distro | NVENC (dGPU), QSV + VA-API (Intel iGPU, needs `libmfx-gen1.2` + `libvpl-tools` + `intel-media-va-driver`, account in `video`+`render`) |
+| **Windows** | any | NVENC (NVIDIA), QSV (Intel iGPU, oneVPL), AMF (AMD) — ffmpeg from [gyan.dev](https://www.gyan.dev/ffmpeg/builds/) (full build), start with `run.bat` |
+| **macOS** | any (Apple Silicon OK) | VideoToolbox (`h264_vt`/`hevc_vt`/`mjpeg_vt`) via `brew install ffmpeg` |
+
+- No HW device? The node simply reports none and the server falls back to software encoders — the service still works everywhere.
+- The `sg render` / group setup is Linux-only (VA-API device access); Windows/macOS need nothing extra.
