@@ -1138,7 +1138,17 @@ fn txt_str(svc: &ResolvedService, key: &str) -> Option<String> {
         .map(|b| String::from_utf8_lossy(b).into_owned())
 }
 
-async fn heartbeat_loop(client: reqwest::Client, server: String, name: String, caps: Caps, id: SharedId) {
+/// A fresh HTTP client (new connection pool). Used to recover after a
+/// transport error: a pooled keep-alive connection left over from a
+/// restarted server would otherwise be reused by every retry.
+fn fresh_client() -> reqwest::Client {
+    reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(30))
+        .build()
+        .unwrap()
+}
+
+async fn heartbeat_loop(mut client: reqwest::Client, server: String, name: String, caps: Caps, id: SharedId) {
     loop {
         let nid = id.lock().unwrap().clone();
         let resp = client.post(format!("{}/api/nodes/{}/heartbeat", server, nid)).send().await;
@@ -1149,9 +1159,10 @@ async fn heartbeat_loop(client: reqwest::Client, server: String, name: String, c
                     let _ = do_register(&client, &server, &name, &caps, &id).await;
                 }
             }
-            // Transport failure: flush the pool — a stale connection from a
-            // restarted server would poison every subsequent attempt.
-            Err(_) => client.close_idle_connections(),
+            // Transport failure: a stale keep-alive connection from a
+            // restarted server would be reused by every retry and keep
+            // timing out. Swap in a fresh client (new pool).
+            Err(_) => client = fresh_client(),
         }
         tokio::time::sleep(std::time::Duration::from_secs(3)).await;
     }
@@ -1159,7 +1170,7 @@ async fn heartbeat_loop(client: reqwest::Client, server: String, name: String, c
 
 /// Long-poll loop: blocks on /poll (server holds up to 20s), runs any job, repeats.
 /// Re-registers automatically if the server no longer knows this node.
-async fn poll_loop(client: reqwest::Client, server: String, name: String, caps: Caps, id: SharedId, state: NState) {
+async fn poll_loop(mut client: reqwest::Client, server: String, name: String, caps: Caps, id: SharedId, state: NState) {
     loop {
         let nid = id.lock().unwrap().clone();
         let url = format!("{}/api/nodes/{}/poll", server, nid);
@@ -1185,10 +1196,10 @@ async fn poll_loop(client: reqwest::Client, server: String, name: String, caps: 
             }
             Err(e) => {
                 println!("[node] poll error: {e} (retrying)");
-                // Flush the pool — a stale keep-alive connection from a
-                // restarted server (or a long-poll interrupted by it) would
+                // Swap in a fresh client (new pool) — a stale keep-alive /
+                // long-poll connection from a restarted server would
                 // otherwise be reused by every retry and keep timing out.
-                client.close_idle_connections();
+                client = fresh_client();
             }
         }
         // poll returned empty or errored; small pause to avoid hammering
