@@ -540,8 +540,10 @@ fn build_probe_tasks(encs: &[String], devs: &[GpuDev]) -> Vec<ProbeTask> {
                 }
             }
             "apple" => {
-                // VideoToolbox (macOS) — h264_vt / hevc_vt / mjpeg_vt, no pinning.
-                for e in encs.iter().filter(|e| e.ends_with("_vt")) {
+                // VideoToolbox (macOS) — h264_vt / hevc_vt / mjpeg_vt (old
+                // ffmpeg) or h264_videotoolbox / hevc_videotoolbox / ... (new
+                // ffmpeg renamed them). No device pinning needed.
+                for e in encs.iter().filter(|e| e.ends_with("_vt") || e.contains("videotoolbox")) {
                     let mut a = base();
                     a.backend = "videotoolbox".into();
                     tasks.push(ProbeTask {

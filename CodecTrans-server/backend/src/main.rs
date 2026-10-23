@@ -705,10 +705,13 @@ fn is_hw_encoder(enc: &str) -> bool {
 
 /// Rank a HW encoder by backend preference (lower = faster on typical media):
 /// nvenc > vaapi > qsv > amf > mft > videotoolbox. Suffix-based so names like
-/// `hevc_vt` map to the videotoolbox rank.
+/// `hevc_vt` / `hevc_videotoolbox` map to the videotoolbox rank.
 fn backend_rank(enc: &str) -> usize {
     let e = enc.to_lowercase();
     let pref = ["nvenc", "vaapi", "qsv", "amf", "mft", "vt"];
+    if e.contains("videotoolbox") {
+        return 5;
+    }
     pref.iter()
         .position(|p| e.ends_with(&format!("_{p}")))
         .unwrap_or(99)
