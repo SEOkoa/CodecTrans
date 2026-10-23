@@ -1142,11 +1142,16 @@ async fn heartbeat_loop(client: reqwest::Client, server: String, name: String, c
     loop {
         let nid = id.lock().unwrap().clone();
         let resp = client.post(format!("{}/api/nodes/{}/heartbeat", server, nid)).send().await;
-        if let Ok(r) = resp {
-            // 404 = unknown node (server restarted) → re-register
-            if r.status() == reqwest::StatusCode::NOT_FOUND {
-                let _ = do_register(&client, &server, &name, &caps, &id).await;
+        match resp {
+            Ok(r) => {
+                // 404 = unknown node (server restarted) → re-register
+                if r.status() == reqwest::StatusCode::NOT_FOUND {
+                    let _ = do_register(&client, &server, &name, &caps, &id).await;
+                }
             }
+            // Transport failure: flush the pool — a stale connection from a
+            // restarted server would poison every subsequent attempt.
+            Err(_) => client.close_idle_connections(),
         }
         tokio::time::sleep(std::time::Duration::from_secs(3)).await;
     }
@@ -1180,6 +1185,10 @@ async fn poll_loop(client: reqwest::Client, server: String, name: String, caps: 
             }
             Err(e) => {
                 println!("[node] poll error: {e} (retrying)");
+                // Flush the pool — a stale keep-alive connection from a
+                // restarted server (or a long-poll interrupted by it) would
+                // otherwise be reused by every retry and keep timing out.
+                client.close_idle_connections();
             }
         }
         // poll returned empty or errored; small pause to avoid hammering
