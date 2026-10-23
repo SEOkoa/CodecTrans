@@ -1094,8 +1094,9 @@ async fn do_register(client: &reqwest::Client, server: &str, name: &str, caps: &
             true
         }
         Ok(r) => {
+            let st = r.status();
             let txt = r.text().await.unwrap_or_default();
-            println!("[node] register HTTP {}: {}", r.status(), txt.chars().take(300).collect::<String>());
+            println!("[node] register HTTP {}: {}", st, txt.chars().take(300).collect::<String>());
             false
         }
         Err(e) => {
