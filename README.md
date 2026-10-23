@@ -23,11 +23,15 @@ CodecTrans/
 
 ## Quick start (test machine)
 
-Requires: `ffmpeg` (8.x tested), `cargo`, and for Intel iGPU HW accel the QSV stack
+Requires: `ffmpeg` (8.x tested), `cargo`, a **Redis** server for the node registry
+(default `127.0.0.1:6379`, override with `CT_REDIS`), and for Intel iGPU HW accel the QSV stack
 (`libmfx-gen1.2` + `libvpl-tools` + `intel-media-va-driver`, account in `video`+`render` groups).
 
 ```sh
 git clone <repo> && cd CodecTrans
+
+# Redis (node registry) — one container is enough
+docker run -d --name ct-redis --restart unless-stopped -p 127.0.0.1:6379:6379 redis:7-alpine
 
 # server (+ local node) — builds if needed, serves UI at :8400
 ./CodecTrans-server/start-all.sh
@@ -42,6 +46,13 @@ CT_SERVER=http://<server>:8400 ./CodecTrans-node/run.sh
 
 ## Notes
 
+- The **node registry lives in Redis** (`ct:node:*` keys): node identity (UUID) survives
+  server restarts — queued jobs are never orphaned — and offline nodes are tracked with
+  their last-seen time. The UI hides offline nodes by default (`Online / Offline / All`
+  toggle) and can filter by HW-accel backend (nvenc/qsv/vaapi/…) or encoder codec
+  family (h264/h265/av1/…); the same filters are available on the API
+  (`GET /api/nodes?status=…&backend=…&family=…`). Jobs themselves stay in memory.
+  Without Redis the server retries the connection on startup and won't bind.
 - The node probes every (device, backend, encoder) combination at startup and reports
   accelerators per physical device: `GPU #0 (nvenc)`, `CPU #0 (qsv)`, `CPU #0 (vaapi)`, …
 - The server auto-rewrites logical codecs to the node's best working HW encoder

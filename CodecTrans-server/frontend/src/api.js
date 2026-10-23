@@ -22,7 +22,8 @@ export const api = {
   codecs: () => jfetch("/api/codecs"),
   jobs: () => jfetch("/api/jobs"),
   job: (id) => jfetch(`/api/jobs/${id}`),
-  nodes: () => jfetch("/api/nodes"),
+  nodes: (status = "all") =>
+    jfetch(`/api/nodes?status=${encodeURIComponent(status)}`),
   discoveredNodes: () => jfetch("/api/nodes/discovered"),
   // "server finds a node": probe a node's local API (ip:port) and register it.
   searchNode: (ip, port) =>

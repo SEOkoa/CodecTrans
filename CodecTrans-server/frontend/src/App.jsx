@@ -38,6 +38,19 @@ function fmtFps(f) {
   return String(r);
 }
 
+// HW encoder name -> codec family (mirrors the server's codec_family).
+function codecFamily(enc) {
+  const e = (enc || "").toLowerCase();
+  if (e.includes("h264") || e.includes("x264") || e.includes("avc")) return "h264";
+  if (e.includes("hevc") || e.includes("h265") || e.includes("x265")) return "h265";
+  if (e.includes("vp9")) return "vp9";
+  if (e.includes("vp8")) return "vp8";
+  if (e.includes("av1")) return "av1";
+  if (e.includes("mpeg4")) return "mpeg4";
+  if (e.includes("mjpeg") || e.includes("jpeg")) return "mjpeg";
+  return e.split("_")[0] || enc;
+}
+
 function HwChips({ encs }) {
   if (!encs || encs.length === 0) return <span className="cpu-only">CPU only</span>;
   return (
@@ -130,6 +143,9 @@ export default function App() {
 
   // nodes
   const [nodes, setNodes] = useState([]);
+  // registry view filters: status (online hidden-offline default), HW accel
+  // backend, and encoder codec family
+  const [nodeFilter, setNodeFilter] = useState({ status: "online", backend: "", family: "" });
   // node search (server finds a node by the IP:port it printed)
   const [searchIp, setSearchIp] = useState("");
   const [searchPort, setSearchPort] = useState("8401");
@@ -306,6 +322,26 @@ export default function App() {
       ? Math.max(100, Math.round((analysis.videoBitRate * bitratePct) / 100 / 1000))
       : null;
   const onlineNodes = nodes.filter((n) => n.status === "online");
+  const offlineNodes = nodes.filter((n) => n.status !== "online");
+
+  // Registry view: what's actually shown in the Nodes card.
+  const shownNodes = nodes.filter((n) => {
+    if (nodeFilter.status !== "all" && n.status !== nodeFilter.status) return false;
+    if (
+      nodeFilter.backend &&
+      !n.accels?.some((a) => a.backend === nodeFilter.backend)
+    )
+      return false;
+    if (
+      nodeFilter.family &&
+      !n.hwEncoders?.some((h) => codecFamily(h) === nodeFilter.family)
+    )
+      return false;
+    return true;
+  });
+  // Filter options derived from what the registry actually offers.
+  const backendOptions = [...new Set(nodes.flatMap((n) => n.accels?.map((a) => a.backend) || []))].sort();
+  const familyOptions = [...new Set(nodes.flatMap((n) => n.hwEncoders?.map(codecFamily) || []))].sort();
 
   // "Server finds a node": probe the IP:port the node printed in its terminal.
   async function doSearch() {
@@ -621,7 +657,51 @@ export default function App() {
 
       {/* nodes */}
       <section className="card nodes">
-        <h2>Nodes ({nodes.length})</h2>
+        <h2>
+          Nodes ({shownNodes.length})
+          {offlineNodes.length > 0 && (
+            <span className="meta" style={{ marginLeft: 8, fontWeight: 400 }}>
+              · {offlineNodes.length} offline
+            </span>
+          )}
+        </h2>
+
+        {/* registry filters: online default (offline hidden), HW accel backend, codec family */}
+        <div className="nodefilters">
+          <div className="seg">
+            {["online", "offline", "all"].map((s) => (
+              <button
+                key={s}
+                className={nodeFilter.status === s ? "on" : ""}
+                onClick={() => setNodeFilter((f) => ({ ...f, status: s }))}
+              >
+                {s === "online" ? `Online (${onlineNodes.length})` : s === "offline" ? `Offline (${offlineNodes.length})` : "All"}
+              </button>
+            ))}
+          </div>
+          <select
+            value={nodeFilter.backend}
+            onChange={(e) => setNodeFilter((f) => ({ ...f, backend: e.target.value }))}
+          >
+            <option value="">All backends</option>
+            {backendOptions.map((b) => (
+              <option key={b} value={b}>
+                {b}
+              </option>
+            ))}
+          </select>
+          <select
+            value={nodeFilter.family}
+            onChange={(e) => setNodeFilter((f) => ({ ...f, family: e.target.value }))}
+          >
+            <option value="">All codecs</option>
+            {familyOptions.map((f) => (
+              <option key={f} value={f}>
+                {f}
+              </option>
+            ))}
+          </select>
+        </div>
 
         {/* server finds a node: enter the IP:port it printed in its terminal */}
         <div className="search">
@@ -653,7 +733,18 @@ export default function App() {
             No nodes yet. Run <code>CodecTransNode</code> and search it above.
           </div>
         )}
-        {nodes.map((n) => (
+        {nodes.length > 0 && shownNodes.length === 0 && (
+          <div className="empty">
+            No nodes match the current filter.
+            <button
+              className="linkish"
+              onClick={() => setNodeFilter({ status: "online", backend: "", family: "" })}
+            >
+              Reset
+            </button>
+          </div>
+        )}
+        {shownNodes.map((n) => (
           <div key={n.id} className="node">
             <div className="row">
               <span className={`status ${n.status === "online" ? "done" : ""}`}>{n.status}</span>

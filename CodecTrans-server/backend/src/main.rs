@@ -179,6 +179,8 @@ pub struct Node {
     pub accels: Vec<Accel>,
     pub status: String,          // online | offline
     pub last_heartbeat: i64,
+    /// When this node was first seen in the registry (epoch ms; persisted in Redis).
+    pub first_seen: i64,
     pub current_job: Option<String>,
 }
 
@@ -217,16 +219,30 @@ pub struct LibraryEntry {
     pub error: Option<String>,
 }
 
-#[derive(Default)]
 pub struct JobStore {
     jobs: HashMap<String, Job>,
-    nodes: HashMap<String, Node>,
     discovered: HashMap<String, Discovered>,
     library: HashMap<String, LibraryEntry>, // keyed by relative path
     storage_root: String,
+    /// Node registry lives in Redis (persistent identity + liveness); this is
+    /// the shared connection handle.
+    redis: RConn,
 }
 
 impl JobStore {
+    pub fn new(redis: RConn) -> Self {
+        JobStore {
+            jobs: HashMap::new(),
+            discovered: HashMap::new(),
+            library: HashMap::new(),
+            storage_root: String::new(),
+            redis,
+        }
+    }
+    /// Clone the Redis handle out (drop any store guard before awaiting on it).
+    pub fn redis(&self) -> RConn {
+        self.redis.clone()
+    }
     pub fn insert(&mut self, j: Job) {
         self.jobs.insert(j.id.clone(), j);
     }
@@ -247,36 +263,7 @@ impl JobStore {
         v
     }
 
-    // ---- nodes ----
-    fn online(n: &Node) -> bool {
-        now_ms() - n.last_heartbeat <= 10_000
-    }
-    pub fn upsert_node(&mut self, n: Node) {
-        self.nodes.insert(n.id.clone(), n);
-    }
-    pub fn get_node(&self, id: &str) -> Option<Node> {
-        self.nodes.get(id).cloned()
-    }
-    pub fn find_node_by_name(&self, name: &str) -> Option<Node> {
-        self.nodes.values().find(|n| n.name == name).cloned()
-    }
-    pub fn list_nodes(&mut self) -> Vec<Node> {
-        let mut v: Vec<Node> = self.nodes.values().cloned().collect();
-        for n in v.iter_mut() {
-            if !Self::online(n) {
-                n.status = "offline".into();
-            }
-        }
-        v.sort_by(|a, b| a.name.cmp(&b.name));
-        v
-    }
-    pub fn heartbeat(&mut self, id: &str) -> Option<Node> {
-        if let Some(n) = self.nodes.get_mut(id) {
-            n.last_heartbeat = now_ms();
-            n.status = "online".into();
-        }
-        self.nodes.get(id).cloned()
-    }
+    // ---- nodes: see the Redis node registry section below ----
     /// Atomically claim the oldest queued job destined for `node_id`.
     pub fn claim_for_node(&mut self, node_id: &str) -> Option<Job> {
         let best: Option<Job> = self
@@ -288,29 +275,10 @@ impl JobStore {
         if let Some(mut j) = best {
             j.status = "dispatched".into();
             self.jobs.insert(j.id.clone(), j.clone());
-            if let Some(n) = self.nodes.get_mut(node_id) {
-                n.current_job = Some(j.id.clone());
-            }
             Some(j)
         } else {
             None
         }
-    }
-    /// Auto-pick a node: prefer an online node that has an HW encoder for the
-    /// requested codec family, else any online node.
-    pub fn pick_node(&self, family: &str) -> Option<Node> {
-        let online: Vec<Node> = self
-            .nodes
-            .values()
-            .filter(|n| Self::online(n))
-            .cloned()
-            .collect();
-        for n in &online {
-            if n.hw_encoders.iter().any(|h| codec_family(h) == family) {
-                return Some(n.clone());
-            }
-        }
-        online.first().cloned()
     }
 
     // ---- discovered (mDNS LAN discovery) ----
@@ -367,6 +335,228 @@ impl JobStore {
 }
 
 type Store = Arc<Mutex<JobStore>>;
+
+// ============================================================
+//  Node registry — Redis (persistent identity + liveness)
+//
+//  The node map used to live in memory: a server restart wiped it (fresh
+//  UUIDs → orphaned queued jobs, offline history lost, no filtering). The
+//  registry now lives in Redis:
+//
+//    ct:node:{id}          HASH  name, ffmpegVersion, haccels, hwEncoders,
+//                                accels (JSON), firstSeen, lastHeartbeat,
+//                                currentJob
+//    ct:node:name:{name}   STRING -> id     (idempotent re-register by name)
+//    ct:node:ids           SET of all node ids
+//    ct:online:{id}        STRING "1" + TTL (refreshed by register/heartbeat)
+//
+//  Jobs stay in memory (ephemeral); the registry is the only persisted state.
+// ============================================================
+
+const ONLINE_TTL_SECS: u64 = 20;
+const RK_IDS: &str = "ct:node:ids";
+
+fn rk_node(id: &str) -> String {
+    format!("ct:node:{}", id)
+}
+fn rk_online(id: &str) -> String {
+    format!("ct:online:{}", id)
+}
+fn rk_name(name: &str) -> String {
+    format!("ct:node:name:{}", name)
+}
+
+type RConn = redis::aio::MultiplexedConnection;
+
+type NodeHash = HashMap<String, String>;
+
+fn hash_get<'a>(h: &'a NodeHash, k: &str) -> Option<&'a str> {
+    h.get(k).map(|s| s.as_str())
+}
+
+fn parse_node(id: &str, h: &NodeHash, online: bool) -> Option<Node> {
+    let name = hash_get(h, "name")?.to_string();
+    let mut accels: Vec<Accel> = serde_json::from_str(hash_get(h, "accels").unwrap_or("[]")).unwrap_or_default();
+    let hw_encoders: Vec<String> = serde_json::from_str(hash_get(h, "hwEncoders").unwrap_or("[]")).unwrap_or_default();
+    let haccels: Vec<String> = serde_json::from_str(hash_get(h, "haccels").unwrap_or("[]")).unwrap_or_default();
+    let first_seen = hash_get(h, "firstSeen").and_then(|s| s.parse::<i64>().ok()).unwrap_or_else(now_ms);
+    let last_heartbeat = hash_get(h, "lastHeartbeat").and_then(|s| s.parse::<i64>().ok()).unwrap_or_else(now_ms);
+    let cur = hash_get(h, "currentJob").unwrap_or("");
+    accels.sort_by(|a, b| a.backend.cmp(&b.backend));
+    Some(Node {
+        id: id.to_string(),
+        name,
+        ffmpeg_version: hash_get(h, "ffmpegVersion").unwrap_or("").to_string(),
+        hw_encoders,
+        haccels,
+        accels,
+        status: if online { "online".into() } else { "offline".into() },
+        last_heartbeat,
+        first_seen,
+        current_job: if cur.is_empty() { None } else { Some(cur.to_string()) },
+    })
+}
+
+async fn hgetall_node(c: RConn, id: &str) -> Option<Node> {
+    let mut c = c;
+    let h: NodeHash = redis::cmd("HGETALL")
+        .arg(rk_node(id))
+        .query_async(&mut c)
+        .await
+        .ok()?;
+    let ttl: i64 = redis::cmd("TTL")
+        .arg(rk_online(id))
+        .query_async(&mut c)
+        .await
+        .ok()
+        .flatten()
+        .unwrap_or(-2);
+    parse_node(id, &h, ttl > 0)
+}
+
+/// Register (or re-register) a node by name. A node that registered under the
+/// same name before keeps its id across restarts — that is what lets queued
+/// jobs survive a server restart instead of becoming orphans.
+async fn reg_node(
+    c: RConn,
+    name: &str,
+    ffmpeg_version: &str,
+    haccels: &[String],
+    hw_encoders: &[String],
+    accels: &[Accel],
+) -> Node {
+    let mut c = c;
+    let now = now_ms();
+    let existing: Option<String> = redis::cmd("GET")
+        .arg(rk_name(name))
+        .query_async(&mut c)
+        .await
+        .ok()
+        .flatten();
+    let (id, is_new) = match existing {
+        Some(i) if !i.is_empty() => (i, false),
+        _ => (uuid::Uuid::new_v4().to_string(), true),
+    };
+    let first_seen = if is_new {
+        now
+    } else {
+        hgetall_node(c.clone(), &id).await.map(|n| n.first_seen).unwrap_or(now)
+    };
+    let mut pipe = redis::pipe();
+    pipe.atomic();
+    if is_new {
+        pipe.cmd("SET").arg(rk_name(name)).arg(&id);
+        pipe.cmd("SADD").arg(RK_IDS).arg(&id);
+    }
+    pipe.cmd("HSET")
+        .arg(rk_node(&id))
+        .arg("name").arg(name)
+        .arg("ffmpegVersion").arg(ffmpeg_version)
+        .arg("haccels").arg(serde_json::to_string(haccels).unwrap_or_else(|_| "[]".into()))
+        .arg("hwEncoders").arg(serde_json::to_string(hw_encoders).unwrap_or_else(|_| "[]".into()))
+        .arg("accels").arg(serde_json::to_string(accels).unwrap_or_else(|_| "[]".into()))
+        .arg("firstSeen").arg(first_seen)
+        .arg("lastHeartbeat").arg(now);
+    if is_new {
+        pipe.cmd("HSET").arg(rk_node(&id)).arg("currentJob").arg("");
+    }
+    pipe.cmd("SETEX").arg(rk_online(&id)).arg(ONLINE_TTL_SECS).arg("1");
+    let _: () = pipe.query_async(&mut c).await.expect("redis register");
+    hgetall_node(c.clone(), &id).await.unwrap_or(Node {
+        id,
+        name: name.to_string(),
+        ffmpeg_version: ffmpeg_version.to_string(),
+        hw_encoders: hw_encoders.to_vec(),
+        haccels: haccels.to_vec(),
+        accels: accels.to_vec(),
+        status: "online".into(),
+        last_heartbeat: now,
+        first_seen,
+        current_job: None,
+    })
+}
+
+/// Heartbeat: refresh liveness + last_heartbeat. None if the node is unknown.
+async fn beat_node(c: RConn, id: &str) -> Option<Node> {
+    let mut pipe = redis::pipe();
+    pipe.cmd("HSET").arg(rk_node(id)).arg("lastHeartbeat").arg(now_ms());
+    pipe.cmd("SETEX").arg(rk_online(id)).arg(ONLINE_TTL_SECS).arg("1");
+    let mut c = c;
+    let _: () = pipe.query_async(&mut c).await.ok()?;
+    hgetall_node(c.clone(), id).await
+}
+
+async fn set_current_job(c: RConn, id: &str, job: Option<&str>) {
+    let v = job.unwrap_or("");
+    let mut c = c;
+    let _ = redis::cmd("HSET")
+        .arg(rk_node(id))
+        .arg("currentJob")
+        .arg(v)
+        .query_async::<i32>(&mut c)
+        .await;
+}
+
+/// All nodes, filtered. status: "online" (default) | "offline" | "all";
+/// backend: only nodes exposing that HW acceleration (nvenc/qsv/…);
+/// family: only nodes with an HW encoder for that codec family.
+async fn list_nodes_redis(c: RConn, status: &str, backend: Option<&str>, family: Option<&str>) -> Vec<Node> {
+    let mut c = c;
+    let ids: Vec<String> = redis::cmd("SMEMBERS")
+        .arg(RK_IDS)
+        .query_async(&mut c)
+        .await
+        .unwrap_or_default();
+    let mut out = Vec::new();
+    for id in ids {
+        if let Some(n) = hgetall_node(c.clone(), &id).await {
+            let on = n.status == "online";
+            match status {
+                "online" if !on => continue,
+                "offline" if on => continue,
+                _ => {}
+            }
+            if let Some(b) = backend {
+                if !n.accels.iter().any(|a| a.backend == b) {
+                    continue;
+                }
+            }
+            if let Some(f) = family {
+                if !n.hw_encoders.iter().any(|h| codec_family(h) == f) {
+                    continue;
+                }
+            }
+            out.push(n);
+        }
+    }
+    out.sort_by(|a, b| a.name.cmp(&b.name));
+    out
+}
+
+/// Auto-pick a node: prefer an online node with an HW encoder for the
+/// requested codec family, else any online node.
+async fn pick_node_redis(c: RConn, family: &str) -> Option<Node> {
+    let online = list_nodes_redis(c, "online", None, None).await;
+    for n in &online {
+        if n.hw_encoders.iter().any(|h| codec_family(h) == family) {
+            return Some(n.clone());
+        }
+    }
+    online.first().cloned()
+}
+
+/// Forced codec (forceCodec=true): pick an online node that actually has this
+/// exact encoder — e.g. forced hevc_vaapi must not go to a node without VA-API.
+/// If no node lists it (e.g. a pure SW encoder), fall back to any online node.
+async fn pick_node_encoder(c: RConn, encoder: &str) -> Option<Node> {
+    let online = list_nodes_redis(c, "online", None, None).await;
+    for n in &online {
+        if n.hw_encoders.iter().any(|h| h == encoder) {
+            return Some(n.clone());
+        }
+    }
+    online.first().cloned()
+}
 
 // ============================================================
 //  ffmpeg helpers
@@ -1333,41 +1523,23 @@ pub async fn node_register(State(store): State<Store>, Json(req): Json<RegisterR
         req.hw_encoders.unwrap_or_default(),
         req.accels.unwrap_or_default(),
     );
-    // idempotent re-register by name
-    {
-        let mut s = store.lock().unwrap();
-        if let Some(existing) = s.find_node_by_name(&req.name) {
-            if let Some(n) = s.nodes.get_mut(&existing.id) {
-                n.ffmpeg_version = ffmpeg_version;
-                n.haccels = haccels;
-                n.hw_encoders = hw_encoders;
-                n.accels = accels;
-                n.last_heartbeat = now_ms();
-                n.status = "online".into();
-            }
-            return Json(json!({"nodeId": existing.id})).into_response();
-        }
-    }
-    // new node
-    let id = uuid::Uuid::new_v4().to_string();
-    let node = Node {
-        id: id.clone(),
-        name: req.name,
-        ffmpeg_version,
-        haccels,
-        hw_encoders,
-        accels,
-        status: "online".into(),
-        last_heartbeat: now_ms(),
-        current_job: None,
-    };
-    store.lock().unwrap().upsert_node(node);
-    Json(json!({"nodeId": id})).into_response()
+    // idempotent re-register by name — the id is looked up in Redis, so a
+    // node keeps its identity across server (and its own) restarts.
+    let mut c = store.lock().unwrap().redis();
+    let already: Option<String> = redis::cmd("GET")
+        .arg(rk_name(&req.name))
+        .query_async(&mut c)
+        .await
+        .ok()
+        .flatten();
+    let node = reg_node(c, &req.name, &ffmpeg_version, &haccels, &hw_encoders, &accels).await;
+    Json(json!({"nodeId": node.id, "new": already.is_none()})).into_response()
 }
 
 /// POST /api/nodes/:id/heartbeat — liveness.
 pub async fn node_heartbeat(State(store): State<Store>, UrlPath(id): UrlPath<String>) -> Response {
-    match store.lock().unwrap().heartbeat(&id) {
+    let c = store.lock().unwrap().redis();
+    match beat_node(c, &id).await {
         Some(n) => match serde_json::to_value(n) {
             Ok(v) => Json(json!({"ok": true, "node": v})).into_response(),
             Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e.to_string()}))).into_response(),
@@ -1376,12 +1548,23 @@ pub async fn node_heartbeat(State(store): State<Store>, UrlPath(id): UrlPath<Str
     }
 }
 
-/// GET /api/nodes — all nodes with live status + acceleration capabilities.
-pub async fn list_nodes(State(store): State<Store>) -> impl IntoResponse {
-    let v: Vec<Value> = store
-        .lock()
-        .unwrap()
-        .list_nodes()
+/// GET /api/nodes — registry (Redis) with live status + acceleration
+/// capabilities. Filters: status=online|offline|all (default online),
+/// backend=nvenc|qsv|... (has that HW accel), family=h264|av1|... (has an HW
+/// encoder for that codec family).
+#[derive(Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+struct NodeFilter {
+    status: Option<String>,
+    backend: Option<String>,
+    family: Option<String>,
+}
+
+pub async fn list_nodes(State(store): State<Store>, Query(f): Query<NodeFilter>) -> impl IntoResponse {
+    let c = store.lock().unwrap().redis();
+    let status = f.status.as_deref().unwrap_or("online");
+    let v: Vec<Value> = list_nodes_redis(c, status, f.backend.as_deref(), f.family.as_deref())
+        .await
         .into_iter()
         .map(serde_json::to_value)
         .collect::<Result<Vec<_>, _>>()
@@ -1474,34 +1657,17 @@ pub async fn search_node(State(store): State<Store>, Json(req): Json<SearchReq>)
         _ => (String::new(), vec![], vec![], vec![]),
     };
 
-    // 3. Upsert into the registry (idempotent by name).
-    let node = {
-        let mut st = store.lock().unwrap();
-        let id = match st.find_node_by_name(&name) {
-            Some(n) => n.id,
-            None => uuid::Uuid::new_v4().to_string(),
-        };
-        let node = Node {
-            id,
-            name: name.clone(),
-            ffmpeg_version,
-            haccels,
-            hw_encoders,
-            accels,
-            status: "online".into(),
-            last_heartbeat: now_ms(),
-            current_job: None,
-        };
-        st.upsert_node(node.clone());
-        node
-    };
+    // 3. Upsert into the Redis registry (idempotent by name).
+    let c = store.lock().unwrap().redis();
+    let node = reg_node(c, &name, &ffmpeg_version, &haccels, &hw_encoders, &accels).await;
 
     Json(serde_json::to_value(node).unwrap_or(Value::Null)).into_response()
 }
 
 /// GET /api/nodes/:id — one node.
 pub async fn get_node(State(store): State<Store>, UrlPath(id): UrlPath<String>) -> Response {
-    match store.lock().unwrap().get_node(&id) {
+    let c = store.lock().unwrap().redis();
+    match hgetall_node(c, &id).await {
         Some(n) => match serde_json::to_value(n) {
             Ok(v) => Json(v).into_response(),
             Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e.to_string()}))).into_response(),
@@ -1512,13 +1678,18 @@ pub async fn get_node(State(store): State<Store>, UrlPath(id): UrlPath<String>) 
 
 /// GET /api/nodes/:id/poll — long-poll (up to 20s) for the next dispatched job.
 pub async fn node_poll(State(store): State<Store>, UrlPath(id): UrlPath<String>) -> Response {
-    if store.lock().unwrap().get_node(&id).is_none() {
-        return (StatusCode::NOT_FOUND, Json(json!({"error": "unknown node"}))).into_response();
+    {
+        let c = store.lock().unwrap().redis();
+        if hgetall_node(c, &id).await.is_none() {
+            return (StatusCode::NOT_FOUND, Json(json!({"error": "unknown node"}))).into_response();
+        }
     }
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
     loop {
         let claimed = store.lock().unwrap().claim_for_node(&id);
         if let Some(job) = claimed {
+            let c = store.lock().unwrap().redis();
+            let _ = set_current_job(c, &id, Some(&job.id)).await;
             return match serde_json::to_value(job) {
                 Ok(v) => Json(json!({"job": v})).into_response(),
                 Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e.to_string()}))).into_response(),
@@ -1571,11 +1742,10 @@ pub async fn node_report(State(store): State<Store>, UrlPath(id): UrlPath<String
                 j.started_at = Some(now_ms());
             }
         }
-        if req.status == "done" || req.status == "error" {
-            if let Some(n) = s.nodes.get_mut(&id) {
-                n.current_job = None;
-            }
-        }
+    }
+    if req.status == "done" || req.status == "error" {
+        let c = store.lock().unwrap().redis();
+        let _ = set_current_job(c, &id, None).await;
     }
     Json(json!({"ok": true})).into_response()
 }
@@ -1719,11 +1889,14 @@ pub async fn dispatch(State(store): State<Store>, Json(req): Json<DispatchReq>) 
     let container = req.container.unwrap_or_else(|| "mp4".into());
 
     let (node_id, node_name, effective, accelerated) = {
-        let s = store.lock().unwrap();
+        let c = store.lock().unwrap().redis();
         let node = if let Some(nid) = &req.node_id {
-            s.get_node(nid)
+            hgetall_node(c, nid).await
+        } else if req.force_codec.unwrap_or(false) {
+            // Forced encoder: must land on a node that actually has it.
+            pick_node_encoder(c, &vcodec).await
         } else {
-            s.pick_node(&codec_family(&vcodec))
+            pick_node_redis(c, &codec_family(&vcodec)).await
         };
         let node = match node {
             Some(n) => n,
@@ -1792,7 +1965,21 @@ pub async fn dispatch(State(store): State<Store>, Json(req): Json<DispatchReq>) 
 #[tokio::main]
 async fn main() {
     let port: u16 = std::env::var("CT_PORT").ok().and_then(|s| s.parse().ok()).unwrap_or(8400);
-    let store: Store = Arc::new(Mutex::new(JobStore::default()));
+
+    // Node registry backend: Redis (persistent node identity + liveness).
+    let redis_url = std::env::var("CT_REDIS").unwrap_or_else(|_| "redis://127.0.0.1:6379".into());
+    let rclient = redis::Client::open(redis_url.clone()).expect("redis client");
+    let rconn = loop {
+        match rclient.get_multiplexed_tokio_connection().await {
+            Ok(c) => break c,
+            Err(e) => {
+                eprintln!("[CodecTrans] redis {redis_url} unreachable ({e}) — retrying in 2s");
+                tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+            }
+        }
+    };
+    println!("[CodecTrans] node registry -> redis {redis_url}");
+    let store: Store = Arc::new(Mutex::new(JobStore::new(rconn)));
 
     // mDNS: advertise this server on the LAN + browse for nodes.
     spawn_mdns(&store, port).await;
