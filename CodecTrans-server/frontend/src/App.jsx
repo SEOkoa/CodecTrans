@@ -118,14 +118,10 @@ export default function App() {
   const [health, setHealth] = useState(null);
   const [codecs, setCodecs] = useState(null);
 
-  // tabs: dashboard (default) | library | settings | test (the original screen)
+  // tabs: dashboard | library | logic | settings | test (the original screen)
   const [tab, setTab] = useState("dashboard");
   // dashboard: server host stats, refreshed on the 2s tick
   const [stats, setStats] = useState(null);
-  // library automation settings (persisted server-side in auto.json)
-  const [auto, setAuto] = useState(null);
-  const [autoMsg, setAutoMsg] = useState("");
-  const [autoSaving, setAutoSaving] = useState(false);
 
   // upload
   const [file, setFile] = useState(null);
@@ -160,10 +156,16 @@ export default function App() {
   const [searchPort, setSearchPort] = useState("8401");
   const [searchMsg, setSearchMsg] = useState("");
   const [discovered, setDiscovered] = useState([]);
-  // storage library (server-scanned directory of videos)
+  // storage library (server-scanned folders of videos)
   const [library, setLibrary] = useState({ root: "", entries: [] });
-  const [libRoot, setLibRoot] = useState("");
   const [scanning, setScanning] = useState(false);
+  // registered folders (add/remove list) + per-folder encoding target
+  const [folders, setFolders] = useState([]);
+  const [folderMsg, setFolderMsg] = useState("");
+  const [newFolder, setNewFolder] = useState("");
+  // logic blocks (condition → action automation)
+  const [blocks, setBlocks] = useState([]);
+  const [blockMsg, setBlockMsg] = useState("");
 
   // jobs
   const [jobs, setJobs] = useState([]);
@@ -174,7 +176,8 @@ export default function App() {
   // load catalog + health
   useEffect(() => {
     api.health().then(setHealth).catch(() => setHealth({ status: "down" }));
-    api.autoGet().then(setAuto).catch(() => {});
+    api.foldersGet().then(setFolders).catch(() => {});
+    api.blocksGet().then(setBlocks).catch(() => {});
     api
       .library()
       .then((l) => {
@@ -373,14 +376,15 @@ export default function App() {
     }
   }
 
-  // Scan a storage directory: server walks it (read-only) + ffprobes each video.
+  // Scan all enabled registered folders (read-only); the server auto-queues
+  // newly found videos per the saved automation (logic blocks first, then the
+  // folder default target).
   async function doScan() {
     setScanning(true);
     setError("");
     try {
-      const l = await api.libraryScan(libRoot.trim());
-      setLibrary(l);
-      if (l.root) setLibRoot(l.root);
+      const l = await api.libraryScan();
+      setLibrary({ root: "", entries: l.entries || [] });
     } catch (err) {
       setError(err.message);
     } finally {
@@ -388,22 +392,130 @@ export default function App() {
     }
   }
 
-  // Persist the library-automation settings (server saves them to auto.json
-  // and applies them to newly found videos on the next scan).
-  async function saveAuto() {
-    if (!auto) return;
-    setAutoSaving(true);
-    setAutoMsg("");
+  // ── folders (add/remove list + per-folder target) ──────────────
+  const uid = () =>
+    crypto.randomUUID
+      ? crypto.randomUUID()
+      : "id-" + Date.now() + "-" + Math.random().toString(36).slice(2);
+
+  // ── library re-encode (per-file ⟳ button) ──────────────────────
+  const libKey = (e) => (e.folder ? e.folder + "/" : "") + e.path;
+  const libJob = (e) =>
+    jobs.find((j) => j.libPath === libKey(e) && !["done", "error"].includes(j.status));
+  async function doRequeue(e) {
+    setError("");
     try {
-      await api.autoPost(auto);
-      setAutoMsg("저장됨 ✓");
-      setTimeout(() => setAutoMsg(""), 3000);
+      await api.requeue(libKey(e));
+      await doScan(); // the scan re-queues the now-pending entry
     } catch (err) {
-      setAutoMsg(err.message);
-    } finally {
-      setAutoSaving(false);
+      setError(err.message);
     }
   }
+  const flash = (set) => (m) => {
+    set(m);
+    setTimeout(() => set(""), 2500);
+  };
+  const flashFolder = flash(setFolderMsg);
+  const flashBlock = flash(setBlockMsg);
+  async function saveFolders(next) {
+    setFolders(next);
+    try {
+      await api.foldersPost(next);
+      flashFolder("폴더 저장됨 ✓");
+    } catch (err) {
+      flashFolder(err.message);
+    }
+  }
+  function addFolder() {
+    const p = newFolder.trim();
+    if (!p || folders.some((f) => f.path === p)) return;
+    saveFolders([
+      ...folders,
+      {
+        id: uid(),
+        path: p,
+        enabled: true,
+        target: {
+          videoCodec: "h265",
+          audioCodec: "aac",
+          container: "mp4",
+          mode: "pct",
+          bitratePct: 70,
+        },
+      },
+    ]);
+    setNewFolder("");
+  }
+  const patchFolder = (id, fn) =>
+    saveFolders(folders.map((f) => (f.id === id ? fn(f) : f)));
+  const patchTarget = (id, patch) =>
+    patchFolder(id, (f) => ({ ...f, target: { ...f.target, ...patch } }));
+  const removeFolder = (id) => saveFolders(folders.filter((f) => f.id !== id));
+  const folderPath = (id) => {
+    if (!id) return "(임시 루트)";
+    const f = folders.find((x) => x.id === id);
+    return f ? f.path : "제거됨";
+  };
+  const shortPath = (p) => {
+    const parts = p.split("/").filter(Boolean);
+    return parts.slice(-2).join("/") || p;
+  };
+
+  // ── logic blocks (condition → action) ──────────────────────────
+  async function saveBlocks(next) {
+    setBlocks(next);
+    try {
+      await api.blocksPost(next);
+      flashBlock("블록 저장됨 ✓");
+    } catch (err) {
+      flashBlock(err.message);
+    }
+  }
+  const patchBlock = (id, patch) =>
+    saveBlocks(blocks.map((b) => (b.id === id ? { ...b, ...patch } : b)));
+  const patchCond = (id, patch) =>
+    saveBlocks(
+      blocks.map((b) =>
+        b.id === id ? { ...b, condition: { ...b.condition, ...patch } } : b
+      )
+    );
+  const patchAct = (id, patch) =>
+    saveBlocks(
+      blocks.map((b) => (b.id === id ? { ...b, action: { ...b.action, ...patch } } : b))
+    );
+  const patchActTarget = (id, patch) =>
+    saveBlocks(
+      blocks.map((b) =>
+        b.id === id
+          ? {
+              ...b,
+              action: { ...b.action, target: { ...(b.action.target || {}), ...patch } },
+            }
+          : b
+      )
+    );
+  function addBlock() {
+    saveBlocks([
+      ...blocks,
+      {
+        id: uid(),
+        enabled: true,
+        condition: { kind: "always" },
+        action: {
+          kind: "encode",
+          target: { videoCodec: "av1", container: "mp4", mode: "pct", bitratePct: 70 },
+        },
+      },
+    ]);
+  }
+  function moveBlock(i, dir) {
+    const a = [...blocks];
+    const j = i + dir;
+    if (j < 0 || j >= a.length) return;
+    [a[i], a[j]] = [a[j], a[i]];
+    saveBlocks(a);
+  }
+  const removeBlock = (id) => saveBlocks(blocks.filter((b) => b.id !== id));
 
   return (
     <div className="wrap">
@@ -413,6 +525,7 @@ export default function App() {
           {[
             ["dashboard", "대시보드"],
             ["library", "라이브러리"],
+            ["logic", "로직"],
             ["settings", "세팅"],
             ["test", "테스트"],
           ].map(([id, label]) => (
@@ -875,193 +988,500 @@ export default function App() {
         </>
       )}
 
-      {/* ═══ 라이브러리 — folder + automation ═══ */}
+      {/* ═══ 라이브러리 — folder list + per-folder target ═══ */}
       {tab === "library" && (
         <>
           <section className="card auto">
-            <h2>자동화</h2>
+            <h2>폴더 관리</h2>
             <div className="hint">
-              활성화하면 스캔할 때마다 <b>새로 발견된</b> 영상을 아래 설정으로
-              자동 큐잉합니다. 가장 적합한 노드의 HW 인코더가 자동으로 선택되고,
-              결과는 원본 옆에 저장됩니다 (원본은 건드리지 않음).
+              감시할 폴더를 리스트에 추가/제거하고, 폴더별 <b>기본 인코딩 설정</b>을
+              정하세요. 스캔 시 새로 발견된 영상을 자동 큐잉합니다 — <b>로직 탭의
+              블록 조건이 먼저 적용</b>되고, 안 맞으면 폴더 기본 설정을 씁니다. 결과는
+              원본 옆에 저장되며 원본은 건드리지 않습니다.
             </div>
-            {auto ? (
-              <div className="autoform">
-                <label className="chk">
-                  <input
-                    type="checkbox"
-                    checked={!!auto.enabled}
-                    onChange={(e) => setAuto({ ...auto, enabled: e.target.checked })}
-                  />
-                  새 영상 자동 처리
-                </label>
-                <div className="auto-row">
-                  <label>
-                    비디오 코덱
-                    <select
-                      value={auto.videoCodec || "h264"}
-                      onChange={(e) => setAuto({ ...auto, videoCodec: e.target.value })}
+            <div className="search">
+              <input
+                value={newFolder}
+                onChange={(e) => setNewFolder(e.target.value)}
+                onKeyDown={(e) => e.key === "Enter" && addFolder()}
+                placeholder="폴더 경로 (예: /mnt/nas/Videos)"
+              />
+              <button onClick={addFolder} disabled={!newFolder.trim()}>
+                추가
+              </button>
+            </div>
+            {folders.length === 0 && (
+              <div className="empty">
+                등록된 폴더가 없습니다. 위 입력창에 폴더 경로를 넣고 추가하세요.
+              </div>
+            )}
+            {folders.map((f) => {
+              const mode = f.target.mode || "pct";
+              return (
+                <div key={f.id} className={"folder" + (f.enabled ? "" : " off")}>
+                  <div className="row">
+                    <label className="chk" title="활성/비활성">
+                      <input
+                        type="checkbox"
+                        checked={!!f.enabled}
+                        onChange={() => patchFolder(f.id, (x) => ({ ...x, enabled: !x.enabled }))}
+                      />
+                    </label>
+                    <code className="fpath" title={f.path}>
+                      {f.path}
+                    </code>
+                    <button
+                      className="rm-del"
+                      title="폴더 제거"
+                      onClick={() => removeFolder(f.id)}
                     >
-                      {(codecs?.videoCodecs || [])
-                        .filter((c) => c.id !== "copy")
-                        .map((c) => (
+                      ✕
+                    </button>
+                  </div>
+                  <div className="frow">
+                    <label>
+                      비디오
+                      <select
+                        value={f.target.videoCodec || ""}
+                        onChange={(e) => patchTarget(f.id, { videoCodec: e.target.value || null })}
+                      >
+                        <option value="">코덱 없음 (큐잉 안 함)</option>
+                        {(codecs?.videoCodecs || [])
+                          .filter((c) => c.id !== "copy")
+                          .map((c) => (
+                            <option key={c.id} value={c.id}>
+                              {c.label}
+                            </option>
+                          ))}
+                      </select>
+                    </label>
+                    <label>
+                      오디오
+                      <select
+                        value={f.target.audioCodec || "aac"}
+                        onChange={(e) => patchTarget(f.id, { audioCodec: e.target.value })}
+                      >
+                        {(codecs?.audioCodecs || []).map((c) => (
                           <option key={c.id} value={c.id}>
                             {c.label}
                           </option>
                         ))}
-                    </select>
-                  </label>
-                  <label>
-                    오디오 코덱
-                    <select
-                      value={auto.audioCodec || "aac"}
-                      onChange={(e) => setAuto({ ...auto, audioCodec: e.target.value })}
-                    >
-                      {(codecs?.audioCodecs || []).map((c) => (
-                        <option key={c.id} value={c.id}>
-                          {c.label}
-                        </option>
-                      ))}
-                    </select>
-                  </label>
-                  <label>
-                    컨테이너
-                    <select
-                      value={auto.container || "mp4"}
-                      onChange={(e) => setAuto({ ...auto, container: e.target.value })}
-                    >
-                      {(codecs?.containers || []).map((c) => (
-                        <option key={c.id} value={c.id}>
-                          {c.label}
-                        </option>
-                      ))}
-                    </select>
-                  </label>
-                </div>
-                <div className="auto-row">
-                  <div className="ratemode">
-                    <button
-                      type="button"
-                      className={`rm-opt ${auto.mode === "crf" ? "on" : ""}`}
-                      onClick={() => setAuto({ ...auto, mode: "crf" })}
-                    >
-                      질량 (CRF)
-                    </button>
-                    <button
-                      type="button"
-                      className={`rm-opt ${auto.mode !== "crf" ? "on" : ""}`}
-                      onClick={() => setAuto({ ...auto, mode: "pct" })}
-                    >
-                      원본 비트레이트 %
-                    </button>
-                  </div>
-                  {auto.mode !== "crf" ? (
+                      </select>
+                    </label>
                     <label>
-                      목표: {auto.bitratePct ?? 70}%
+                      컨테이너
+                      <select
+                        value={f.target.container || "mp4"}
+                        onChange={(e) => patchTarget(f.id, { container: e.target.value })}
+                      >
+                        {(codecs?.containers || []).map((c) => (
+                          <option key={c.id} value={c.id}>
+                            {c.label}
+                          </option>
+                        ))}
+                      </select>
+                    </label>
+                    <div className="rateval">
+                      <div className="ratemode">
+                        <button
+                          type="button"
+                          className={`rm-opt ${mode === "crf" ? "on" : ""}`}
+                          onClick={() => patchTarget(f.id, { mode: "crf" })}
+                        >
+                          CRF
+                        </button>
+                        <button
+                          type="button"
+                          className={`rm-opt ${mode !== "crf" ? "on" : ""}`}
+                          onClick={() => patchTarget(f.id, { mode: "pct" })}
+                        >
+                          %
+                        </button>
+                      </div>
                       <input
-                        type="range"
-                        min="10"
-                        max="100"
-                        step="5"
-                        value={auto.bitratePct ?? 70}
+                        type="number"
+                        className="num"
+                        min={mode === "crf" ? 0 : 10}
+                        max={mode === "crf" ? 51 : 100}
+                        value={mode === "crf" ? f.target.crf ?? 23 : f.target.bitratePct ?? 70}
                         onChange={(e) =>
-                          setAuto({ ...auto, bitratePct: Number(e.target.value) })
+                          patchTarget(
+                            f.id,
+                            mode === "crf"
+                              ? { crf: Number(e.target.value) }
+                              : { bitratePct: Number(e.target.value) }
+                          )
                         }
                       />
-                      <div className="rm-scale">
-                        <span>작아짐</span>
-                        <span>50%</span>
-                        <span className="mid">100% = 원본</span>
-                      </div>
-                    </label>
-                  ) : (
-                    <label>
-                      CRF {auto.crf ?? 23} — 낮을수록 선명
-                      <input
-                        type="range"
-                        min="0"
-                        max="51"
-                        value={auto.crf ?? 23}
-                        onChange={(e) => setAuto({ ...auto, crf: Number(e.target.value) })}
-                      />
-                    </label>
-                  )}
+                    </div>
+                  </div>
                 </div>
-                <div className="row">
-                  <button className="primary" onClick={saveAuto} disabled={autoSaving}>
-                    {autoSaving ? "저장 중…" : "자동화 저장"}
-                  </button>
-                  {autoMsg && <span className="meta ok-text">{autoMsg}</span>}
+              );
+            })}
+            {folderMsg && <div className="meta ok-text">{folderMsg}</div>}
+          </section>
+
+          <section className="card lib">
+            <h2>Library</h2>
+            <div className="hint">
+              활성 폴더 전체를 <b>read-only</b>로 스캔합니다 — 파일은 절대
+              건드리지 않습니다. 새로 발견된 영상은 폴더/로직 설정대로 자동 큐잉됩니다.
+            </div>
+            <div className="search">
+              <button
+                onClick={doScan}
+                disabled={scanning || !folders.some((f) => f.enabled)}
+              >
+                {scanning ? "Scanning…" : "전체 다시 스캔"}
+              </button>
+            </div>
+            {library.entries.length > 0 && (
+              <div className="libsummary">
+                {(() => {
+                  const es = library.entries;
+                  const done = es.filter((e) => e.status === "done");
+                  const err = es.filter((e) => e.status === "error");
+                  const act = es.filter((e) => libJob(e));
+                  const saved = done.reduce(
+                    (a, e) => a + Math.max(0, (e.size || 0) - (e.newSize || 0)),
+                    0
+                  );
+                  const shrunk = done.filter((e) => (e.newSize || 0) < (e.size || 0));
+                  return (
+                    <>
+                      <span className="ls-item"><b>{es.length}</b> 파일</span>
+                      <span className="ls-item ok"><b>{done.length}</b> 완료</span>
+                      {act.length > 0 && (
+                        <span className="ls-item run"><b>{act.length}</b> 진행 중</span>
+                      )}
+                      {err.length > 0 && (
+                        <span className="ls-item bad"><b>{err.length}</b> 오류</span>
+                      )}
+                      {saved > 0 && (
+                        <span className="ls-item save" title={`${shrunk.length}개 파일 원본 대비 용량 감소분`}>
+                          💾 <b>{fmtSize(saved)}</b> 절약
+                        </span>
+                      )}
+                    </>
+                  );
+                })()}
+              </div>
+            )}
+            {library.entries.length > 0 ? (
+              <div className="libtable">
+                <div className="libhead row">
+                  <span className="c-name">File</span>
+                  <span className="c-folder">Folder</span>
+                  <span className="c-codec">Codec</span>
+                  <span className="c-spec">Specs</span>
+                  <span className="c-size">Size</span>
+                  <span className="c-dur">Duration</span>
+                  <span className="c-status">Status</span>
                 </div>
+                {library.entries.map((e) => (
+                  <div
+                    key={(e.folder ? e.folder + "/" : "") + e.path}
+                    className="librow row"
+                  >
+                    <span className="c-name jname" title={e.path}>
+                      {e.name}
+                    </span>
+                    <span className="c-folder jmeta" title={folderPath(e.folder)}>
+                      {e.folder ? shortPath(folderPath(e.folder)) : "(임시)"}
+                    </span>
+                    <span className="c-codec">
+                      {e.videoCodec || "?"}
+                      {e.audioCodec ? ` / ${e.audioCodec}` : ""}
+                    </span>
+                    <span className="c-spec jmeta">
+                      {e.width ? `${e.width}×${e.height}` : "—"}
+                      {e.fps ? ` · ${fmtFps(e.fps)}fps` : ""}
+                      {e.videoBitRate ? ` · ${fmtRate(e.videoBitRate)}` : ""}
+                    </span>
+                    <span className="c-size jmeta">{fmtSize(e.size)}</span>
+                    <span className="c-dur jmeta">
+                      {e.duration ? fmtDur(e.duration) : "—"}
+                    </span>
+                    <span className="c-status">
+                      {libJob(e) ? (
+                        (() => {
+                          const j = libJob(e);
+                          const pct = Math.round((j.progress || 0) * 100);
+                          return (
+                            <span
+                              className="progcell"
+                              title={`${j.status} → ${j.effectiveVideoCodec || j.videoCodec} (${j.executedBy || "?"})`}
+                            >
+                              <span className="prog">
+                                <i style={{ width: pct + "%" }} />
+                              </span>
+                              <span className="prog-pct">{pct}%</span>
+                            </span>
+                          );
+                        })()
+                      ) : (
+                        <span className="statusrow">
+                          <span
+                            className={`status ${
+                              e.status === "done"
+                                ? "done"
+                                : e.status === "error"
+                                ? "error"
+                                : e.status === "queued"
+                                ? "running"
+                                : ""
+                            }`}
+                            title={e.status === "error" && e.error ? e.error : undefined}
+                          >
+                            {e.status}
+                          </span>
+                          {(e.status === "done" || e.status === "error") && (
+                            <button
+                              className="mini"
+                              title="재인코딩 — 다시 큐에 넣기"
+                              onClick={() => doRequeue(e)}
+                            >
+                              ⟳
+                            </button>
+                          )}
+                        </span>
+                      )}
+                      {e.status === "error" && e.error && (
+                        <div className="errline" title={e.error}>
+                          {e.error}
+                        </div>
+                      )}
+                    </span>
+                  </div>
+                ))}
               </div>
             ) : (
-              <div className="meta">
-                <span>자동화 설정을 불러오는 중…</span>
+              <div className="empty">
+                활성 폴더에 영상이 없거나 아직 스캔하지 않았습니다.
               </div>
             )}
           </section>
+        </>
+      )}
 
-      {/* storage library (server-scanned directory of videos) */}
-      <section className="card lib">
-        <h2>Library</h2>
-        <div className="hint">
-          Point the server at a folder of videos (a NAS share it can mount, or a
-          local dir). It scans <b>read-only</b> — your files are never touched.
-          Next: pick a target codec and re-encode in place (backed up).
-        </div>
-        <div className="search">
-          <input
-            value={libRoot}
-            onChange={(e) => setLibRoot(e.target.value)}
-            placeholder="storage path (e.g. /mnt/nas/Videos)"
-          />
-          <button onClick={doScan} disabled={scanning || !libRoot.trim()}>
-            {scanning ? "Scanning…" : "Scan"}
-          </button>
-        </div>
-
-        {library.root && (
-          <div className="meta">
-            root: <code>{library.root}</code> · {library.entries.length} videos
-          </div>
-        )}
-
-        {library.entries.length > 0 ? (
-          <div className="libtable">
-            <div className="libhead row">
-              <span className="c-name">File</span>
-              <span className="c-codec">Codec</span>
-              <span className="c-spec">Specs</span>
-              <span className="c-size">Size</span>
-              <span className="c-dur">Duration</span>
-              <span className="c-status">Status</span>
+      {/* ═══ 로직 — block-coding automation (condition → action) ═══ */}
+      {tab === "logic" && (
+        <>
+          <section className="card auto">
+            <h2>자동화 로직</h2>
+            <div className="hint">
+              블록코딩 방식입니다. <b>새로 추가된 영상 하나마다 위에서 아래로
+              조건을 순서대로 확인</b>하고, <b>처음 맞는 블록의 액션을 실행</b>합니다.
+              아무 블록도 안 맞으면 폴더 기본 설정을 씁니다.
             </div>
-            {library.entries.map((e) => (
-              <div key={e.path} className="librow row">
-                <span className="c-name jname" title={e.path}>{e.name}</span>
-                <span className="c-codec">
-                  {e.videoCodec || "?"}
-                  {e.audioCodec ? ` / ${e.audioCodec}` : ""}
-                </span>
-                <span className="c-spec jmeta">
-                  {e.width ? `${e.width}×${e.height}` : "—"}
-                  {e.fps ? ` · ${fmtFps(e.fps)}fps` : ""}
-                  {e.videoBitRate ? ` · ${fmtRate(e.videoBitRate)}` : ""}
-                </span>
-                <span className="c-size jmeta">{fmtSize(e.size)}</span>
-                <span className="c-dur jmeta">{e.duration ? fmtDur(e.duration) : "—"}</span>
-                <span className="c-status">
-                  <span className={`status ${e.status === "done" ? "done" : ""}`}>{e.status}</span>
-                </span>
+            <div className="logic-start">
+              ▶ <b>시작</b> — 스캔에서 새 영상이 발견되면
+            </div>
+            {blocks.length === 0 && (
+              <div className="empty">
+                블록이 없습니다. 아래에서 첫 블록을 추가하세요 — 예:
+                “노드가 AV1 HW 가속을 지원하면 → CRF 30으로 인코딩 시작”.
               </div>
-            ))}
-          </div>
-        ) : (
-          <div className="empty">
-            {library.root ? "No videos found." : "Scan a folder to build the library."}
-          </div>
-        )}
-      </section>
+            )}
+            {blocks.map((b, i) => {
+              const mode = b.action.target?.mode || "pct";
+              return (
+                <div key={b.id} className={"lblock" + (b.enabled ? "" : " off")}>
+                  <div className="lrow">
+                    <label className="chk" title="활성/비활성">
+                      <input
+                        type="checkbox"
+                        checked={!!b.enabled}
+                        onChange={() => patchBlock(b.id, { enabled: !b.enabled })}
+                      />
+                    </label>
+                    <span className="lchip">조건</span>
+                    <select
+                      value={b.condition.kind || "always"}
+                      onChange={(e) => patchCond(b.id, { kind: e.target.value })}
+                    >
+                      <option value="always">항상</option>
+                      <option value="srcCodec">원본 코덱 =</option>
+                      <option value="sizeGt">파일 크기 &gt;</option>
+                      <option value="sizeLt">파일 크기 &lt;</option>
+                      <option value="bitrateGt">원본 비트레이트 &gt;</option>
+                      <option value="bitrateLt">원본 비트레이트 &lt;</option>
+                      <option value="nameContains">이름에 포함</option>
+                      <option value="nodeHasHw">노드가 HW 가속 지원 (코덱)</option>
+                    </select>
+                    {b.condition.kind === "srcCodec" && (
+                      <select
+                        value={b.condition.codec || ""}
+                        onChange={(e) => patchCond(b.id, { codec: e.target.value || null })}
+                      >
+                        <option value="">(어떤 코덱이든)</option>
+                        {(codecs?.videoCodecs || [])
+                          .filter((c) => c.id !== "copy")
+                          .map((c) => (
+                            <option key={c.id} value={c.id}>
+                              {c.label}
+                            </option>
+                          ))}
+                      </select>
+                    )}
+                    {(b.condition.kind === "sizeGt" || b.condition.kind === "sizeLt") && (
+                      <span className="lunit">
+                        <input
+                          type="number"
+                          className="num"
+                          min="0"
+                          value={b.condition.value ?? ""}
+                          onChange={(e) =>
+                            patchCond(b.id, {
+                              value: e.target.value === "" ? null : Number(e.target.value),
+                            })
+                          }
+                        />
+                        MB
+                      </span>
+                    )}
+                    {(b.condition.kind === "bitrateGt" || b.condition.kind === "bitrateLt") && (
+                      <span className="lunit">
+                        <input
+                          type="number"
+                          className="num"
+                          min="0"
+                          value={b.condition.value ?? ""}
+                          onChange={(e) =>
+                            patchCond(b.id, {
+                              value: e.target.value === "" ? null : Number(e.target.value),
+                            })
+                          }
+                        />
+                        Mbps
+                      </span>
+                    )}
+                    {b.condition.kind === "nameContains" && (
+                      <input
+                        type="text"
+                        className="txt"
+                        placeholder="예: 4K, raw, .mkv"
+                        value={b.condition.pattern || ""}
+                        onChange={(e) =>
+                          patchCond(b.id, { pattern: e.target.value || null })
+                        }
+                      />
+                    )}
+                    {b.condition.kind === "nodeHasHw" && (
+                      <select
+                        value={b.condition.hwFamily || "av1"}
+                        onChange={(e) => patchCond(b.id, { hwFamily: e.target.value })}
+                      >
+                        {["h264", "h265", "av1", "vp9"].map((fam) => (
+                          <option key={fam} value={fam}>
+                            {fam}
+                          </option>
+                        ))}
+                      </select>
+                    )}
+                    <span className="larrow">→</span>
+                    <span className="lchip act">액션</span>
+                    <select
+                      value={b.action.kind || "encode"}
+                      onChange={(e) => patchAct(b.id, { kind: e.target.value })}
+                    >
+                      <option value="encode">인코딩 시작</option>
+                      <option value="healthcheck">헬스체크 (노드 온라인 시만)</option>
+                      <option value="skip">건너뛰기</option>
+                    </select>
+                    <span className="ltools">
+                      <button onClick={() => moveBlock(i, -1)} disabled={i === 0} title="위로">
+                        ↑
+                      </button>
+                      <button
+                        onClick={() => moveBlock(i, 1)}
+                        disabled={i === blocks.length - 1}
+                        title="아래로"
+                      >
+                        ↓
+                      </button>
+                      <button className="danger" onClick={() => removeBlock(b.id)} title="삭제">
+                        ✕
+                      </button>
+                    </span>
+                  </div>
+                  {b.action.kind === "encode" && (
+                    <div className="lrow lrow2">
+                      <span className="lchip">타겟</span>
+                      <label>
+                        비디오
+                        <select
+                          value={b.action.target?.videoCodec || ""}
+                          onChange={(e) =>
+                            patchActTarget(b.id, { videoCodec: e.target.value || null })
+                          }
+                        >
+                          <option value="">폴더 기본</option>
+                          {(codecs?.videoCodecs || [])
+                            .filter((c) => c.id !== "copy")
+                            .map((c) => (
+                              <option key={c.id} value={c.id}>
+                                {c.label}
+                              </option>
+                            ))}
+                        </select>
+                      </label>
+                      <label>
+                        컨테이너
+                        <select
+                          value={b.action.target?.container || "mp4"}
+                          onChange={(e) => patchActTarget(b.id, { container: e.target.value })}
+                        >
+                          {(codecs?.containers || []).map((c) => (
+                            <option key={c.id} value={c.id}>
+                              {c.label}
+                            </option>
+                          ))}
+                        </select>
+                      </label>
+                      <div className="rateval">
+                        <div className="ratemode">
+                          <button
+                            type="button"
+                            className={`rm-opt ${mode === "crf" ? "on" : ""}`}
+                            onClick={() => patchActTarget(b.id, { mode: "crf" })}
+                          >
+                            CRF
+                          </button>
+                          <button
+                            type="button"
+                            className={`rm-opt ${mode !== "crf" ? "on" : ""}`}
+                            onClick={() => patchActTarget(b.id, { mode: "pct" })}
+                          >
+                            %
+                          </button>
+                        </div>
+                        <input
+                          type="number"
+                          className="num"
+                          min={mode === "crf" ? 0 : 10}
+                          max={mode === "crf" ? 51 : 100}
+                          value={mode === "crf" ? b.action.target?.crf ?? 23 : b.action.target?.bitratePct ?? 70}
+                          onChange={(e) =>
+                            patchActTarget(
+                              b.id,
+                              mode === "crf"
+                                ? { crf: Number(e.target.value) }
+                                : { bitratePct: Number(e.target.value) }
+                            )
+                          }
+                        />
+                      </div>
+                    </div>
+                  )}
+                </div>
+              );
+            })}
+            <div className="row">
+              <button onClick={addBlock}>+ 블록 추가</button>
+              {blockMsg && <span className="meta ok-text">{blockMsg}</span>}
+            </div>
+          </section>
         </>
       )}
 

@@ -97,13 +97,35 @@ export const api = {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ root: root || undefined, limit }),
     }),
-  // library automation settings (persisted server-side)
+  // library automation settings (persisted server-side; ad-hoc roots)
   autoGet: () => jfetch("/api/library/auto"),
   autoPost: (cfg) =>
     jfetch("/api/library/auto", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(cfg),
+    }),
+  // library folders (add/remove list) + per-folder encoding target
+  foldersGet: () => jfetch("/api/library/folders").then((r) => r.folders || []),
+  requeue: (key) =>
+    jfetch("/api/library/requeue", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ key }),
+    }),
+  foldersPost: (folders) =>
+    jfetch("/api/library/folders", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ folders }),
+    }),
+  // logic blocks (condition → action automation, evaluated top to bottom)
+  blocksGet: () => jfetch("/api/library/blocks").then((r) => r.blocks || []),
+  blocksPost: (blocks) =>
+    jfetch("/api/library/blocks", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ blocks }),
     }),
 };
 

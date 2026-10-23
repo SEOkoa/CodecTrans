@@ -201,11 +201,14 @@ pub struct Discovered {
 }
 
 /// One video in the storage library (scanned by the server, read-only).
-#[derive(Clone, Serialize, Default)]
+#[derive(Clone, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct LibraryEntry {
-    pub path: String,          // relative to storage root
+    pub path: String,          // relative to the folder (or storage root for ad-hoc)
     pub name: String,          // base filename
+    /// Registered folder id this entry belongs to (None = ad-hoc root scan).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub folder: Option<String>,
     pub size: u64,
     pub duration: Option<f64>, // seconds
     pub video_codec: Option<String>,
@@ -221,6 +224,19 @@ pub struct LibraryEntry {
     pub reencoded: Option<String>, // target codec actually applied (e.g. "hevc")
     pub new_size: Option<u64>,
     pub error: Option<String>,
+}
+
+impl LibraryEntry {
+    /// Catalog key: unique across folders ("{folder_id}/{rel}", or the
+    /// relative path itself for ad-hoc root scans). Also stored on the job
+    /// as `lib_path` so the node can fetch the source and the result is
+    /// placed next to it.
+    pub fn key(&self) -> String {
+        match &self.folder {
+            Some(f) => format!("{f}/{}", self.path),
+            None => self.path.clone(),
+        }
+    }
 }
 
 pub struct JobStore {
@@ -318,7 +334,7 @@ impl JobStore {
     pub fn set_library(&mut self, entries: Vec<LibraryEntry>) {
         self.library.clear();
         for e in entries {
-            self.library.insert(e.path.clone(), e);
+            self.library.insert(e.key(), e);
         }
     }
     pub fn get_library_entry(&self, path: &str) -> Option<LibraryEntry> {
@@ -1274,6 +1290,246 @@ fn save_auto(c: &AutoConfig) -> std::io::Result<()> {
     std::fs::write(auto_cfg_path(), serde_json::to_string_pretty(c)?)
 }
 
+// ── folders + logic blocks (persisted in library.json) ──────────
+
+/// Encoding target for a folder or a logic block.
+#[derive(Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct TargetCfg {
+    /// Logical video codec (h264/h265/av1/...); rewritten per-node to the
+    /// actual HW encoder at dispatch time.
+    #[serde(default)]
+    pub video_codec: Option<String>,
+    #[serde(default)]
+    pub audio_codec: Option<String>,
+    #[serde(default)]
+    pub container: Option<String>,
+    /// "crf" | "pct" (percent of source bitrate).
+    #[serde(default)]
+    pub mode: Option<String>,
+    #[serde(default)]
+    pub crf: Option<u32>,
+    #[serde(default)]
+    pub bitrate_pct: Option<u32>,
+}
+
+impl From<AutoConfig> for TargetCfg {
+    fn from(a: AutoConfig) -> Self {
+        TargetCfg {
+            video_codec: a.video_codec,
+            audio_codec: a.audio_codec,
+            container: a.container,
+            mode: a.mode,
+            crf: a.crf,
+            bitrate_pct: a.bitrate_pct,
+        }
+    }
+}
+
+/// A watched library folder + its default encoding target.
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FolderRule {
+    pub id: String,
+    pub path: String,
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    #[serde(default)]
+    pub target: TargetCfg,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+/// Block condition — which newly found files the block applies to.
+#[derive(Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct Condition {
+    /// "always" | "srcCodec" | "sizeGt" | "sizeLt" | "bitrateGt" |
+    /// "bitrateLt" | "nodeHasHw" | "nameContains"
+    #[serde(default)]
+    pub kind: String,
+    /// srcCodec: source codec name to match (h264, hevc, av1, ...)
+    #[serde(default)]
+    pub codec: Option<String>,
+    /// sizeGt/sizeLt: threshold in MB; bitrateGt/bitrateLt: Mbps
+    #[serde(default)]
+    pub value: Option<f64>,
+    /// nameContains: substring the file name must contain (case-insensitive)
+    #[serde(default)]
+    pub pattern: Option<String>,
+    /// nodeHasHw: codec family that must have an HW encoder on some online
+    /// node (h264, h265, av1, vp9)
+    #[serde(default)]
+    pub hw_family: Option<String>,
+}
+
+/// Block action — what to do with matching files.
+#[derive(Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct Action {
+    /// "encode" | "skip" | "healthcheck"
+    #[serde(default)]
+    pub kind: String,
+    /// "encode": the target to use (None = folder default)
+    #[serde(default)]
+    pub target: Option<TargetCfg>,
+}
+
+/// One automation block: condition → action. Blocks are evaluated in order,
+/// top to bottom; the first match wins.
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LogicBlock {
+    pub id: String,
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    #[serde(default)]
+    pub condition: Condition,
+    #[serde(default)]
+    pub action: Action,
+    #[serde(default)]
+    pub label: Option<String>,
+}
+
+#[derive(Clone, Serialize, Deserialize, Default)]
+pub struct LibraryConfig {
+    #[serde(default)]
+    pub folders: Vec<FolderRule>,
+    #[serde(default)]
+    pub blocks: Vec<LogicBlock>,
+    /// Basenames of re-encoded outputs ever produced (tombstone). Skipped by
+    /// rescans so a folder removed+re-added (or a server restart) never
+    /// picks up our own outputs and re-encodes them.
+    #[serde(default)]
+    pub tombstone: Vec<String>,
+}
+
+fn lib_cfg_path() -> PathBuf {
+    base_dir().join("library.json")
+}
+
+fn load_lib_cfg() -> LibraryConfig {
+    std::fs::read_to_string(lib_cfg_path())
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default()
+}
+
+fn save_lib_cfg(c: &LibraryConfig) -> std::io::Result<()> {
+    std::fs::write(lib_cfg_path(), serde_json::to_string_pretty(c)?)
+}
+
+fn catalog_path() -> PathBuf {
+    base_dir().join("catalog.json")
+}
+
+fn load_catalog() -> Vec<LibraryEntry> {
+    std::fs::read_to_string(catalog_path())
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default()
+}
+
+/// Persist the in-memory catalog to disk and grow the re-encoded-name
+/// tombstone (see LibraryConfig::tombstone).
+fn persist_catalog(store: &Store) {
+    let entries = store.lock().unwrap().list_library();
+    let _ = std::fs::write(
+        catalog_path(),
+        serde_json::to_string(&entries).unwrap_or_default(),
+    );
+    let mut c = load_lib_cfg();
+    let mut seen: std::collections::HashSet<String> =
+        c.tombstone.iter().cloned().collect();
+    for e in &entries {
+        if let Some(r) = &e.reencoded {
+            seen.insert(r.clone());
+        }
+    }
+    c.tombstone = seen.into_iter().collect();
+    c.tombstone.sort();
+    let _ = save_lib_cfg(&c);
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct FoldersBody {
+    folders: Vec<FolderRule>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct BlocksBody {
+    blocks: Vec<LogicBlock>,
+}
+
+/// GET /api/library/folders
+pub async fn folders_get(State(_store): State<Store>) -> impl IntoResponse {
+    Json(json!({ "folders": load_lib_cfg().folders }))
+}
+
+/// POST /api/library/folders — save the folder list. Catalog entries of
+/// removed folders are KEPT (marked "제거됨" in the UI) so re-adding the
+/// folder restores their done state instead of re-queuing everything.
+pub async fn folders_post(State(store): State<Store>, Json(b): Json<FoldersBody>) -> Response {
+    let mut c = load_lib_cfg();
+    c.folders = b.folders.clone();
+    if let Err(e) = save_lib_cfg(&c) {
+        return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": e.to_string() }))).into_response();
+    }
+    persist_catalog(&store);
+    Json(json!({ "ok": true, "folders": b.folders })).into_response()
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RequeueReq {
+    key: String,
+}
+
+/// POST /api/library/requeue — reset a catalog entry to "pending" so the
+/// next scan re-queues it (the per-file ⟳ re-encode button).
+pub async fn library_requeue(State(store): State<Store>, Json(req): Json<RequeueReq>) -> Response {
+    let found = {
+        let mut s = store.lock().unwrap();
+        s.update_library_entry(&req.key, |e| {
+            e.status = "pending".into();
+            e.error = None;
+            e.reencoded = None;
+            e.new_size = None;
+        })
+        .is_some()
+    };
+    if !found {
+        return (
+            (
+                StatusCode::NOT_FOUND,
+                Json(json!({ "error": format!("entry not found: {}", req.key) })),
+            )
+                .into_response()
+        );
+    }
+    persist_catalog(&store);
+    Json(json!({ "ok": true })).into_response()
+}
+
+/// GET /api/library/blocks
+pub async fn blocks_get(State(_store): State<Store>) -> impl IntoResponse {
+    Json(json!({ "blocks": load_lib_cfg().blocks }))
+}
+
+/// POST /api/library/blocks — save the block list.
+pub async fn blocks_post(State(_store): State<Store>, Json(b): Json<BlocksBody>) -> Response {
+    let mut c = load_lib_cfg();
+    c.blocks = b.blocks.clone();
+    match save_lib_cfg(&c) {
+        Ok(_) => Json(json!({ "ok": true, "blocks": b.blocks })).into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": e.to_string() }))).into_response(),
+    }
+}
+
 pub async fn auto_get(State(_store): State<Store>) -> impl IntoResponse {
     Json(load_auto())
 }
@@ -1289,28 +1545,48 @@ pub async fn auto_post(State(_store): State<Store>, Json(c): Json<AutoConfig>) -
     }
 }
 
-/// Queue one library entry for re-encoding on a node using the saved auto
-/// config. The node pulls the source straight from the storage root
-/// (node_fetch_file falls back to it) and the finished file is moved back
-/// next to the source (node_result). Returns true when a job was queued;
-/// false leaves the entry pending (e.g. no online node, file missing).
-async fn dispatch_lib_job(store: &Store, e: &LibraryEntry, cfg: &AutoConfig) -> bool {
+/// Resolve the on-disk source for a catalog key ("{folder_id}/{rel}", or a
+/// legacy storage-root-relative path).
+fn resolve_lib_source(lp: &str, store: &Store) -> Option<PathBuf> {
+    if let Some((fid, rel)) = lp.split_once('/') {
+        let cfg = load_lib_cfg();
+        if let Some(f) = cfg.folders.iter().find(|f| f.id == fid) {
+            let p = PathBuf::from(f.path.clone()).join(rel);
+            if p.is_file() {
+                return Some(p);
+            }
+        }
+    }
     let root = store.lock().unwrap().storage_root().to_string();
-    let full = PathBuf::from(root.as_str()).join(e.path.as_str());
-    if !full.is_file() {
+    let p = PathBuf::from(root).join(lp);
+    if p.is_file() {
+        Some(p)
+    } else {
+        None
+    }
+}
+
+/// Queue one library entry for re-encoding on a node with the given target
+/// (folder default or a logic block's). The node pulls the source via
+/// node_fetch_file; the finished file is moved back next to the source
+/// (node_result). Returns true when a job was queued; false leaves the entry
+/// pending (e.g. no online node, file missing).
+async fn dispatch_lib_job(store: &Store, e: &LibraryEntry, t: &TargetCfg) -> bool {
+    let key = e.key();
+    if resolve_lib_source(&key, store).is_none() {
         return false;
     }
-    let vcodec = cfg
+    let vcodec = t
         .video_codec
         .clone()
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| "h264".into());
-    let acodec = cfg
+    let acodec = t
         .audio_codec
         .clone()
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| "aac".into());
-    let container = cfg
+    let container = t
         .container
         .clone()
         .filter(|s| !s.is_empty())
@@ -1331,16 +1607,16 @@ async fn dispatch_lib_job(store: &Store, e: &LibraryEntry, cfg: &AutoConfig) -> 
         container,
         container
     );
-    let pct_mode = cfg.mode.as_deref().unwrap_or("pct") == "pct";
+    let pct_mode = t.mode.as_deref().unwrap_or("pct") == "pct";
     let (crf, video_bitrate, bitrate_pct) = if pct_mode {
-        let pct = cfg.bitrate_pct.unwrap_or(70).clamp(10, 100);
+        let pct = t.bitrate_pct.unwrap_or(70).clamp(10, 100);
         (None, target_kbps(e.video_bit_rate, Some(pct)), Some(pct))
     } else {
-        (cfg.crf, None, None)
+        (t.crf, None, None)
     };
     let job = Job {
         id: uuid::Uuid::new_v4().to_string(),
-        input_file: e.path.clone(),
+        input_file: key.clone(),
         output_file: out_name,
         video_codec: vcodec,
         effective_video_codec: effective,
@@ -1361,10 +1637,33 @@ async fn dispatch_lib_job(store: &Store, e: &LibraryEntry, cfg: &AutoConfig) -> 
         node_id: Some(node_id),
         executed_by: node_name,
         accelerated,
-        lib_path: Some(e.path.clone()),
+        lib_path: Some(key),
     };
     store.lock().unwrap().insert(job);
     true
+}
+
+/// Does a block condition match a newly found library entry?
+fn cond_matches(c: &Condition, e: &LibraryEntry, online: &[Node]) -> bool {
+    let size_mb = e.size as f64 / 1_048_576.0;
+    let br_mbps = e.video_bit_rate.map(|b| b as f64 / 1_000_000.0);
+    match c.kind.as_str() {
+        "always" => true,
+        "srcCodec" => e.video_codec.as_deref() == c.codec.as_deref(),
+        "sizeGt" => size_mb > c.value.unwrap_or(f64::INFINITY),
+        "sizeLt" => size_mb < c.value.unwrap_or(f64::INFINITY),
+        "bitrateGt" => br_mbps.unwrap_or(f64::NEG_INFINITY) > c.value.unwrap_or(f64::INFINITY),
+        "bitrateLt" => br_mbps.unwrap_or(f64::INFINITY) < c.value.unwrap_or(f64::INFINITY),
+        "nodeHasHw" => online.iter().any(|n| {
+            let fam = c.hw_family.as_deref().unwrap_or("");
+            n.hw_encoders.iter().any(|h| codec_family(h) == fam)
+        }),
+        "nameContains" => {
+            let pat = c.pattern.as_deref().unwrap_or("").to_lowercase();
+            !pat.is_empty() && e.name.to_lowercase().contains(&pat)
+        }
+        _ => false,
+    }
 }
 
 // ============================================================
@@ -1492,103 +1791,133 @@ pub async fn library_get(State(store): State<Store>) -> Response {
     Json(json!({"root": root, "count": entries.len(), "entries": entries})).into_response()
 }
 
-/// POST /api/library/scan — walk the storage root, ffprobe each video, build
-/// the in-memory catalog. Read-only: never touches the source files.
+/// POST /api/library/scan — {root} for an ad-hoc one-shot folder, or (no
+/// root) all registered+enabled folders. Builds the in-memory catalog by
+/// ffprobing each video (non-destructive: entries of folders not scanned
+/// this time are kept) and auto-queues newly found files per the saved
+/// automation (logic blocks first, then the folder's default target).
 pub async fn library_scan(State(store): State<Store>, Json(req): Json<ScanReq>) -> Response {
-    // Resolve the root: request > existing > CT_STORAGE.
-    let root = match req.root.filter(|r| !r.trim().is_empty()) {
-        Some(r) => r,
-        None => {
-            let existing = store.lock().unwrap().storage_root().to_string();
-            if !existing.trim().is_empty() {
-                existing
-            } else {
-                std::env::var("CT_STORAGE").unwrap_or_default()
+    // Resolve roots: an explicit {root} wins (ad-hoc, no folder id);
+    // otherwise all enabled registered folders.
+    let libcfg = load_lib_cfg();
+    let roots: Vec<(Option<String>, PathBuf)> =
+        if let Some(r) = req.root.filter(|r| !r.trim().is_empty()) {
+            let r = r.trim().to_string();
+            let p = PathBuf::from(r.clone());
+            if !p.is_dir() {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(json!({ "error": format!("not a directory: {r}") })),
+                )
+                    .into_response();
             }
-        }
-    };
-    if root.trim().is_empty() {
+            vec![(None, p)]
+        } else {
+            libcfg
+                .folders
+                .iter()
+                .filter(|f| f.enabled)
+                .map(|f| (Some(f.id.clone()), PathBuf::from(f.path.clone())))
+                .filter(|(_, p)| p.is_dir())
+                .collect()
+        };
+    if roots.is_empty() {
         return (
             StatusCode::BAD_REQUEST,
-            Json(json!({"error": "no storage root — pass {\"root\":\"/path/to/videos\"} or set CT_STORAGE"})),
-        )
-            .into_response();
-    }
-    let rootp = PathBuf::from(root.trim());
-    if !rootp.is_dir() {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(json!({"error": format!("not a directory: {}", rootp.display())})),
+            Json(json!({
+                "error": "no folders registered — add a folder first (or pass {\"root\":\"/path/to/videos\"})"
+            })),
         )
             .into_response();
     }
     let limit = req.limit.unwrap_or(500).max(1).min(5000);
 
-    // Re-encode outputs land NEXT TO their source inside the scan root — a
-    // naive rescan would discover them as new videos and re-encode them in an
-    // endless cascade. Skip any file whose name is a known re-encoded output
-    // of the current catalog.
-    let out_names: std::collections::HashSet<String> = store
-        .lock()
-        .unwrap()
-        .list_library()
-        .into_iter()
-        .filter_map(|e| e.reencoded)
-        .collect();
+    // Re-encode outputs land NEXT TO their source inside the folder — a
+    // naive rescan would discover them as new videos and re-encode them in
+    // an endless cascade. Skip files whose name is a known re-encoded
+    // output of the current catalog.
+    let out_names: std::collections::HashSet<String> = {
+        let mut n: std::collections::HashSet<String> = store
+            .lock()
+            .unwrap()
+            .list_library()
+            .into_iter()
+            .filter_map(|e| e.reencoded)
+            .collect();
+        n.extend(libcfg.tombstone.clone());
+        n
+    };
 
-    // Walk (blocking, but cheap) — collect relative video paths.
-    let rels = std::thread::scope(|sc| {
-        sc.spawn(|| {
-            let mut v: Vec<PathBuf> = Vec::new();
-            walk_videos(&rootp, &rootp, &mut v, limit);
-            v
-        })
-        .join()
-        .unwrap_or_default()
-    });
-    let rels: Vec<PathBuf> = rels
-        .into_iter()
-        .filter(|rel| {
-            let fname = rel.file_name().and_then(|x| x.to_str()).unwrap_or("");
-            !out_names.contains(fname)
-        })
-        .collect();
-
-    // ffprobe each (sequential; bounded by `limit`). MVP — parallelize later.
-    let mut entries: Vec<LibraryEntry> = Vec::with_capacity(rels.len());
-    for rel in &rels {
-        let full = rootp.join(rel);
-        let pstr = full.to_string_lossy().to_string();
-        let size = std::fs::metadata(&full).map(|m| m.len()).unwrap_or(0);
-        let ext = full.extension().and_then(|x| x.to_str()).unwrap_or("").to_string();
-        let info = probe_full(&pstr).await;
-        entries.push(LibraryEntry {
-            path: rel.to_string_lossy().to_string(),
-            name: full.file_name().and_then(|x| x.to_str()).unwrap_or("").to_string(),
-            size,
-            duration: info.duration,
-            video_codec: info.video_codec,
-            audio_codec: info.audio_codec,
-            container: info.container.clone().or_else(|| if ext.is_empty() { None } else { Some(ext) }),
-            width: info.width,
-            height: info.height,
-            fps: info.fps,
-            video_bit_rate: info.video_bit_rate,
-            pix_fmt: info.pix_fmt,
-            status: "pending".into(),
-            reencoded: None,
-            new_size: None,
-            error: None,
+    // Walk each root (blocking, but cheap) and ffprobe each video.
+    let mut entries: Vec<LibraryEntry> = Vec::new();
+    for (fid, rootp) in &roots {
+        let rels = std::thread::scope(|sc| {
+            sc.spawn(|| {
+                let mut v: Vec<PathBuf> = Vec::new();
+                walk_videos(rootp, rootp, &mut v, limit);
+                v
+            })
+            .join()
+            .unwrap_or_default()
         });
+        let rels: Vec<PathBuf> = rels
+            .into_iter()
+            .filter(|rel| {
+                let fname = rel.file_name().and_then(|x| x.to_str()).unwrap_or("");
+                !out_names.contains(fname)
+            })
+            .collect();
+        for rel in &rels {
+            let full = rootp.join(rel);
+            let pstr = full.to_string_lossy().to_string();
+            let size = std::fs::metadata(&full).map(|m| m.len()).unwrap_or(0);
+            let ext = full.extension().and_then(|x| x.to_str()).unwrap_or("").to_string();
+            let info = probe_full(&pstr).await;
+            entries.push(LibraryEntry {
+                path: rel.to_string_lossy().to_string(),
+                name: full.file_name().and_then(|x| x.to_str()).unwrap_or("").to_string(),
+                size,
+                duration: info.duration,
+                video_codec: info.video_codec,
+                audio_codec: info.audio_codec,
+                container: info
+                    .container
+                    .clone()
+                    .or_else(|| if ext.is_empty() { None } else { Some(ext) }),
+                width: info.width,
+                height: info.height,
+                fps: info.fps,
+                video_bit_rate: info.video_bit_rate,
+                pix_fmt: info.pix_fmt,
+                folder: fid.clone(),
+                status: "pending".into(),
+                reencoded: None,
+                new_size: None,
+                error: None,
+            });
+        }
     }
-    {
-        let mut s = store.lock().unwrap();
-        s.set_storage_root(rootp.to_string_lossy().to_string());
-        // A rescan must not reset files already processed: carry the previous
-        // status/re-encoded info forward before replacing the list.
-        // In-flight statuses (queued/running/...) are only kept when a live
-        // non-terminal library job still exists for the file — otherwise the
-        // entry goes back to "pending" so it can be re-queued.
+
+    // Carry-forward (read-only): a rescan must not reset files already
+    // processed. In-flight statuses are only kept when a live non-terminal
+    // library job still exists for the file — otherwise the entry goes back
+    // to "pending" so it can be re-queued.
+    let (carried, old, live) = {
+        let s = store.lock().unwrap();
+        let scanned_fids: std::collections::HashSet<String> =
+            roots.iter().filter_map(|(f, _)| f.clone()).collect();
+        let adhoc = roots.iter().any(|(f, _)| f.is_none());
+        // Non-destructive catalog: entries of folders that weren't part of
+        // this scan stay untouched (as do ad-hoc entries when registered
+        // folders are being scanned).
+        let carried = s
+            .list_library()
+            .into_iter()
+            .filter(|e| match &e.folder {
+                Some(fid) => !scanned_fids.contains(fid),
+                None => !adhoc,
+            })
+            .collect::<Vec<_>>();
         let old = s.list_library();
         let live: std::collections::HashSet<String> = s
             .list()
@@ -1596,53 +1925,124 @@ pub async fn library_scan(State(store): State<Store>, Json(req): Json<ScanReq>) 
             .filter(|j| j.lib_path.is_some() && !["done", "error"].contains(&j.status.as_str()))
             .map(|j| j.input_file)
             .collect();
-        for e in entries.iter_mut() {
-            if let Some(o) = old.iter().find(|o| o.path == e.path) {
-                let keep = match o.status.as_str() {
-                    "done" => true,
-                    "queued" | "running" | "dispatched" => live.contains(&o.path),
-                    // "error" (and unknown) fall back to pending so a rescan
-                    // retries the file — matches the node_report intent.
-                    _ => false,
-                };
-                if keep {
-                    e.status = o.status.clone();
-                    e.reencoded = o.reencoded.clone();
-                    e.new_size = o.new_size;
-                    e.error = o.error.clone();
-                }
+        (carried, old, live)
+    };
+    for e in entries.iter_mut() {
+        let key = e.key();
+        if let Some(o) = old.iter().find(|o| o.key() == key) {
+            let keep = match o.status.as_str() {
+                "done" => true,
+                "queued" | "running" | "dispatched" => live.contains(&key),
+                // "error" (and unknown) fall back to pending so a rescan
+                // retries the file.
+                _ => false,
+            };
+            if keep {
+                e.status = o.status.clone();
+                e.reencoded = o.reencoded.clone();
+                e.new_size = o.new_size;
+                e.error = o.error.clone();
             }
         }
-        s.set_library(entries.clone());
     }
-    // Library automation: queue anything newly found (pending) when auto is on.
-    let mut queued_paths: Vec<String> = Vec::new();
-    {
-        let cfg = load_auto();
-        if cfg.enabled {
-            for e in &entries {
-                if e.status == "pending" && dispatch_lib_job(&store, e, &cfg).await {
-                    queued_paths.push(e.path.clone());
-                }
-            }
-            if !queued_paths.is_empty() {
-                for e in entries.iter_mut() {
-                    if queued_paths.contains(&e.path) {
-                        e.status = "queued".into();
+
+    // Automation: for each newly found (pending) file, evaluate the logic
+    // blocks top-down (first match wins); fall back to the folder's default
+    // target (or the legacy auto.json for ad-hoc roots).
+    let online: Vec<Node> = {
+        let c = store.lock().unwrap().redis();
+        list_nodes_redis(c, "online", None, None).await
+    };
+    let has_blocks = libcfg.blocks.iter().any(|b| b.enabled);
+    let mut queued: Vec<String> = Vec::new();
+    let mut skipped: Vec<String> = Vec::new();
+    for e in entries.iter_mut() {
+        if e.status != "pending" {
+            continue;
+        }
+        let folder_target: TargetCfg = libcfg
+            .folders
+            .iter()
+            .find(|f| e.folder.as_deref() == Some(f.id.as_str()))
+            .map(|f| f.target.clone())
+            .unwrap_or_default();
+        let decision: Option<(TargetCfg, bool)> = if has_blocks {
+            let mut d: Option<(TargetCfg, bool)> = None;
+            for b in libcfg.blocks.iter().filter(|b| b.enabled) {
+                if cond_matches(&b.condition, e, &online) {
+                    match b.action.kind.as_str() {
+                        "encode" => {
+                            let t = b
+                                .action
+                                .target
+                                .clone()
+                                .unwrap_or_else(|| folder_target.clone());
+                            d = Some((t, true));
+                        }
+                        "skip" => d = Some((TargetCfg::default(), false)),
+                        "healthcheck" => d = if online.iter().any(|n| n.status == "online") {
+                            Some((
+                                folder_target.clone(),
+                                folder_target.video_codec.is_some(),
+                            ))
+                        } else {
+                            Some((TargetCfg::default(), false))
+                        },
+                        _ => d = Some((TargetCfg::default(), false)),
                     }
+                    break;
                 }
-                let mut s = store.lock().unwrap();
-                for p in &queued_paths {
-                    s.update_library_entry(p, |e| e.status = "queued".into());
+            }
+            d.or_else(|| {
+                Some((
+                    folder_target.clone(),
+                    folder_target.video_codec.is_some(),
+                ))
+            })
+        } else if e.folder.is_some() {
+            let has_vc = folder_target.video_codec.is_some();
+            Some((folder_target, has_vc))
+        } else {
+            let ac = load_auto();
+            if ac.enabled {
+                Some((ac.into(), true))
+            } else {
+                None
+            }
+        };
+        if let Some((t, do_encode)) = decision {
+            if do_encode {
+                // Never create a second job for a file that already has a
+                // live (queued/dispatched/running) one — requeue+scan races
+                // would otherwise double-encode the same file.
+                if live.contains(&e.key()) {
+                    e.status = "queued".into();
+                    queued.push(e.key());
+                    continue;
                 }
+                if dispatch_lib_job(&store, e, &t).await {
+                    e.status = "queued".into();
+                    queued.push(e.key());
+                }
+            } else {
+                e.status = "skipped".into();
+                skipped.push(e.key());
             }
         }
     }
+    let all = {
+        let mut v = entries.clone();
+        v.extend(carried);
+        let mut s = store.lock().unwrap();
+        s.set_library(v.clone());
+        v
+    };
+    persist_catalog(&store);
     Json(json!({
-        "root": rootp.to_string_lossy(),
-        "count": entries.len(),
-        "queued": queued_paths.len(),
-        "entries": entries,
+        "count": all.len(),
+        "queued": queued,
+        "skipped": skipped,
+        "entries": all,
     }))
     .into_response()
 }
@@ -2028,11 +2428,15 @@ pub async fn node_report(State(store): State<Store>, UrlPath(id): UrlPath<String
     if req.status == "error" {
         let lp = store.lock().unwrap().jobs.get(&req.job_id).and_then(|j| j.lib_path.clone());
         if let Some(lp) = lp {
-            let mut s = store.lock().unwrap();
-            s.update_library_entry(&lp, |e| {
-                e.status = "error".into();
-                e.error = req_error;
-            });
+            {
+                let mut s = store.lock().unwrap();
+                s.update_library_entry(&lp, |e| {
+                    e.status = "error".into();
+                    e.error = req_error;
+                });
+            }
+            // (lock dropped — persist_catalog re-acquires it)
+            persist_catalog(&store);
         }
     }
     Json(json!({"ok": true})).into_response()
@@ -2042,24 +2446,57 @@ pub async fn node_report(State(store): State<Store>, UrlPath(id): UrlPath<String
 /// fetches an input file from the server. Uploads first; library jobs pull
 /// straight from the storage root (name is then a relative path with slashes).
 pub async fn node_fetch_file(State(store): State<Store>, UrlPath((_id, name)): UrlPath<(String, String)>) -> Response {
-    if name.contains("..") {
+    let _ = _id;
+    if name.is_empty() || name.contains("..") {
         return (StatusCode::BAD_REQUEST, Json(json!({"error": "bad filename"}))).into_response();
     }
-    let up = uploads_dir().join(&name);
-    let path = if up.exists() {
-        up
-    } else {
-        let root = store.lock().unwrap().storage_root().to_string();
-        let rp = PathBuf::from(root).join(&name);
-        if !rp.exists() {
-            return (StatusCode::NOT_FOUND, Json(json!({"error": "not found"}))).into_response();
+    let path = {
+        // 1) uploads (manual test flow)
+        let up = uploads_dir().join(&name);
+        if up.is_file() {
+            Some(up)
+        } else {
+            // 2) catalog key "{folder_id}/{rel}" -> registered folder
+            name.split_once('/')
+                .and_then(|(fid, rel)| {
+                    load_lib_cfg()
+                        .folders
+                        .iter()
+                        .find(|f| f.id == fid)
+                        .map(|f| PathBuf::from(f.path.clone()).join(rel))
+                })
+                .filter(|p| p.is_file())
+                .or_else(|| {
+                    // 3) legacy: relative to the storage root
+                    let root = store.lock().unwrap().storage_root().to_string();
+                    let rp = PathBuf::from(root).join(&name);
+                    rp.is_file().then_some(rp)
+                })
         }
-        rp
     };
-    match std::fs::read(&path) {
-        Ok(b) => (StatusCode::OK, [("content-type", "application/octet-stream")], b).into_response(),
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e.to_string()}))).into_response(),
+    match path {
+        Some(p) => match std::fs::read(&p) {
+            Ok(b) => (StatusCode::OK, [("content-type", "application/octet-stream")], b).into_response(),
+            Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e.to_string()}))).into_response(),
+        },
+        None => (StatusCode::NOT_FOUND, Json(json!({"error": "not found"}))).into_response(),
     }
+}
+
+/// Wait until a file's on-disk size equals `expected`. This host shows
+/// write-size metadata lag after buffered writes (write() returns Ok before
+/// the size catches up — reproducible with `examples/fstest`), so stat once
+/// more for up to ~2s after rename/copy before trusting the size.
+fn wait_file_size(path: &std::path::Path, expected: u64) -> u64 {
+    for _ in 0..40 {
+        if let Some(len) = std::fs::metadata(path).map(|m| m.len()).ok() {
+            if len == expected {
+                return len;
+            }
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    std::fs::metadata(path).map(|m| m.len()).unwrap_or(0)
 }
 
 /// POST /api/nodes/:id/result — a node uploads a finished output (multipart:
@@ -2104,7 +2541,22 @@ pub async fn node_result(State(store): State<Store>, UrlPath(id): UrlPath<String
                 }
                 if !ok {
                     let _ = std::fs::remove_file(&tmp_path);
-                    return (StatusCode::BAD_REQUEST, Json(json!({"error": "failed to store file"}))).into_response();
+                    return (StatusCode::BAD_REQUEST, Json(json!({ "error": "failed to store file" }))).into_response();
+                }
+                // A torn connection can deliver a file part with an empty
+                // body (clean EOF at the part boundary) — never accept a
+                // 0-byte output: it would be "moved next to the source" and
+                // marked done with a corrupt artifact.
+                if tmp_size == 0 {
+                    let _ = std::fs::remove_file(&tmp_path);
+                    return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": "uploaded file is empty (torn upload)" }))).into_response();
+                }
+                // This host shows write-size metadata lag after buffered
+                // writes (write() returns Ok before the on-disk size
+                // catches up — reproducible with examples/fstest). Force the
+                // size to be committed before we rename + stat the file.
+                if let Err(e) = file.sync_all().await {
+                    eprintln!("[node_result] sync {id}: {e}");
                 }
                 got_file = true;
             }
@@ -2140,43 +2592,85 @@ pub async fn node_result(State(store): State<Store>, UrlPath(id): UrlPath<String
     let path = outputs_dir().join(&out_name);
     if let Err(e) = std::fs::rename(&tmp_path, &path) {
         let _ = std::fs::remove_file(&tmp_path);
-        return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": format!("write {e}")}))).into_response();
+        return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": format!("write {e}") }))).into_response();
+    }
+    // Verify the on-disk size actually reached tmp_size before trusting the
+    // artifact (write-size metadata lag on this host — see wait_file_size).
+    let sz_on_disk = wait_file_size(&path, tmp_size);
+    if sz_on_disk != tmp_size {
+        eprintln!("[node_result] VERIFY FAIL {out_name}: expected {tmp_size} on-disk={sz_on_disk} job={job_id}");
+        let _ = std::fs::remove_file(&path);
+        return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": "uploaded file size mismatch (corrupt upload)" }))).into_response();
     }
     let size = tmp_size;
     // Library-automation jobs land next to the source file, not in outputs/.
-    let lib = {
+    let lp = {
         let mut s = store.lock().unwrap();
         let lp = s.jobs.get(&job_id).and_then(|j| j.lib_path.clone());
         if let Some(j) = s.jobs.get_mut(&job_id) {
             j.output_file = out_name.clone();
             j.output_size = Some(size);
         }
-        (s.storage_root().to_string(), lp)
+        lp
     };
-    if let (root, Some(lp)) = (&lib.0, &lib.1) {
-        if !root.is_empty() {
-            let src = PathBuf::from(root).join(&lp);
-            if let Some(dir) = src.parent() {
-                let _ = std::fs::create_dir_all(dir);
-            }
-            let dest = src.with_file_name(&out_name);
-            // rename fails across devices (e.g. outputs on /, storage on
-            // /tmp or a NAS mount) — fall back to copy + delete.
-            let moved = std::fs::rename(&path, &dest).is_ok() || {
-                let ok = std::fs::copy(&path, &dest).is_ok();
-                if ok {
-                    let _ = std::fs::remove_file(&path);
+    if let Some(lp) = &lp {
+        if !lp.is_empty() {
+            // Resolve the real source from the catalog (registered
+            // folder, or legacy storage root).
+            if let Some(src) = resolve_lib_source(lp, &store) {
+                let dest = src
+                    .parent()
+                    .map(|d| d.join(out_name.clone()))
+                    .unwrap_or_else(|| PathBuf::from(out_name.clone()));
+                if let Some(dir) = dest.parent() {
+                    let _ = std::fs::create_dir_all(dir);
                 }
-                ok
-            };
-            if moved {
-                let mut s = store.lock().unwrap();
-                s.update_library_entry(&lp, |e| {
-                    e.status = "done".into();
-                    e.reencoded = Some(out_name.clone());
-                    e.new_size = Some(size);
-                    e.error = None;
-                });
+                // rename fails across devices (e.g. outputs on /, storage on
+                // /tmp or a NAS mount) — fall back to copy + delete.
+                let renamed = std::fs::rename(&path, &dest).is_ok();
+                let moved = renamed || {
+                    let ok = std::fs::copy(&path, &dest).is_ok();
+                    if ok {
+                        let _ = std::fs::remove_file(&path);
+                    }
+                    ok
+                };
+                // The artifact is only "done" when the DEST file's size is
+                // verified equal to the uploaded size — never before.
+                let dsize = wait_file_size(&dest, size);
+                if !moved || dsize != size {
+                    eprintln!("[node_result] VERIFY FAIL dest {out_name}: moved={moved} dest_size={dsize} expected={size} job={job_id}");
+                    let _ = std::fs::remove_file(&dest);
+                    let _ = std::fs::remove_file(&path);
+                    let msg = format!("output file failed size verification (got {dsize}, expected {size})");
+                    {
+                        let mut s = store.lock().unwrap();
+                        s.update_library_entry(lp, |e| {
+                            e.status = "error".into();
+                            e.error = Some(msg.clone());
+                            e.reencoded = None;
+                            e.new_size = None;
+                        });
+                        if let Some(j) = s.jobs.get_mut(&job_id) {
+                            j.status = "error".into();
+                            j.error = Some(msg.clone());
+                            j.output_size = None;
+                        }
+                    }
+                    persist_catalog(&store);
+                    return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": msg }))).into_response();
+                }
+                {
+                    let mut s = store.lock().unwrap();
+                    s.update_library_entry(lp, |e| {
+                        e.status = "done".into();
+                        e.reencoded = Some(out_name.clone());
+                        e.new_size = Some(size);
+                        e.error = None;
+                    });
+                }
+                // (lock dropped — persist_catalog re-acquires it)
+                persist_catalog(&store);
             }
         }
     }
@@ -2309,6 +2803,17 @@ async fn main() {
     println!("[CodecTrans] node registry -> redis {redis_url}");
     let store: Store = Arc::new(Mutex::new(JobStore::new(rconn)));
 
+    // Restore the persisted library catalog (survives restarts — a rescan
+    // must not re-queue finished files).
+    {
+        let mut s = store.lock().unwrap();
+        s.set_library(load_catalog());
+    }
+    println!(
+        "[CodecTrans] library catalog: {} entries",
+        store.lock().unwrap().list_library().len()
+    );
+
     // mDNS: advertise this server on the LAN + browse for nodes.
     spawn_mdns(&store, port).await;
 
@@ -2319,6 +2824,9 @@ async fn main() {
         .route("/api/library", get(library_get))
         .route("/api/library/scan", post(library_scan))
         .route("/api/library/auto", get(auto_get).post(auto_post))
+        .route("/api/library/folders", get(folders_get).post(folders_post))
+        .route("/api/library/blocks", get(blocks_get).post(blocks_post))
+        .route("/api/library/requeue", post(library_requeue))
         .route("/api/upload", post(upload))
         .route("/api/media/analyze", get(media_analyze))
         .route("/api/transcode", post(transcode))
@@ -2456,6 +2964,28 @@ async fn spawn_mdns(store: &Store, port: u16) {
             loop {
                 tokio::time::sleep(std::time::Duration::from_secs(5)).await;
                 store.lock().unwrap().prune_discovered(15_000);
+            }
+        });
+    }
+
+    // 4. Self-heal stuck jobs: a job stuck in "dispatched" for 10+ minutes
+    //    (node died during claim/download before ever reporting "running")
+    //    goes back to the queue so another node (or the same one, later)
+    //    can pick it up instead of the file being stranded forever.
+    {
+        let store = store.clone();
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+                let now = now_ms();
+                let mut s = store.lock().unwrap();
+                for j in s.jobs.values_mut() {
+                    if j.status == "dispatched" && now - j.created_at > 600_000 {
+                        j.status = "queued".to_string();
+                        j.node_id = None;
+                        eprintln!("[CodecTrans] job {} stuck dispatched 10m — requeued", j.id);
+                    }
+                }
             }
         });
     }

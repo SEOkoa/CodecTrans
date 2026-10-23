@@ -832,13 +832,39 @@ async fn run_job(client: &reqwest::Client, state: &NState, server: &str, node_id
             return;
         }
     };
-    if let Ok(bytes) = dl.bytes().await {
-        // input_file may be a library-relative path with subdirectories
-        // (e.g. "subdir/movie.mp4") — make sure the parent exists first.
-        if let Some(p) = in_path.parent() {
-            let _ = std::fs::create_dir_all(p);
+    // A failed body download (torn connection) must abort the job —
+    // proceeding would encode a missing or STALE input left in in/ by a
+    // previous run and upload a bogus "done" result.
+    match dl.bytes().await {
+        Ok(bytes) => {
+            // input_file may be a library-relative path with subdirectories
+            // (e.g. "subdir/movie.mp4") — make sure the parent exists first.
+            if let Some(p) = in_path.parent() {
+                let _ = std::fs::create_dir_all(p);
+            }
+            if let Err(e) = std::fs::write(&in_path, &bytes) {
+                let msg = format!("failed to write input to disk: {e}");
+                let _ = client
+                    .post(format!("{}/api/nodes/{}/report", server, node_id))
+                    .json(&json!({"jobId": job.id, "status": "error", "error": msg}))
+                    .send()
+                    .await;
+                let mut st = state.lock().unwrap();
+                update_job(&mut st, &job.id, |j| { j.status = "error".into(); j.error = Some(msg); j.finished_at = Some(now_ms()); });
+                return;
+            }
         }
-        let _ = std::fs::write(&in_path, &bytes);
+        Err(e) => {
+            let msg = format!("failed to download input body: {e}");
+            let _ = client
+                .post(format!("{}/api/nodes/{}/report", server, node_id))
+                .json(&json!({"jobId": job.id, "status": "error", "error": msg}))
+                .send()
+                .await;
+            let mut st = state.lock().unwrap();
+            update_job(&mut st, &job.id, |j| { j.status = "error".into(); j.error = Some(msg); j.finished_at = Some(now_ms()); });
+            return;
+        }
     }
 
     // track locally + report running
@@ -1022,6 +1048,28 @@ async fn run_job(client: &reqwest::Client, state: &NState, server: &str, node_id
         }
     }
     let ok = child.wait().await.map(|s| s.success()).unwrap_or(false);
+
+    // Wait for the output file's size to stabilize before reading it:
+    // some hosts report a lagging on-disk size right after ffmpeg closes
+    // the file (write-size metadata lag) — reading too early would upload
+    // a truncated artifact.
+    if ok {
+        let mut last = 0u64;
+        let mut stable = 0u32;
+        for _ in 0..40 {
+            let s = std::fs::metadata(&out_path).map(|m| m.len()).unwrap_or(0);
+            if s > 0 && s == last {
+                stable += 1;
+                if stable >= 2 {
+                    break;
+                }
+            } else {
+                stable = 0;
+            }
+            last = s;
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+    }
 
     // 4. upload result + report
     if ok {

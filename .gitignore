@@ -15,3 +15,7 @@ CodecTrans-node/out/
 
 # library automation config (runtime, per-host)
 CodecTrans-server/auto.json
+
+# runtime artifacts
+CodecTrans-server/catalog.json
+CodecTrans-server/library.json

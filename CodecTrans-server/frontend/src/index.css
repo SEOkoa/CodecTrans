@@ -20,7 +20,7 @@ body {
   margin: 0;
   background: radial-gradient(1200px 600px at 20% -10%, #16202e 0%, var(--bg) 55%);
   color: var(--text);
-  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Apple SD Gothic Neo", "Noto Sans KR", "Malgun Gothic", "Pretendard", Helvetica, Arial, sans-serif;
   min-height: 100vh;
 }
 
@@ -511,9 +511,13 @@ code {
   margin-top: 10px;
   border: 1px solid var(--border);
   border-radius: 10px;
-  overflow: hidden;
+  overflow-x: auto;
   max-height: 420px;
   overflow-y: auto;
+}
+.libhead,
+.librow {
+  min-width: 780px;
 }
 .libhead {
   background: var(--panel);
@@ -561,7 +565,58 @@ code {
 }
 .c-status {
   flex: 0 0 auto;
+  min-width: 118px;
   text-align: right;
+}
+/* live progress cell (library table, non-terminal lib jobs) */
+.progcell {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 96px;
+}
+.prog {
+  flex: 1;
+  height: 6px;
+  border-radius: 3px;
+  background: var(--panel);
+  border: 1px solid var(--border);
+  overflow: hidden;
+  min-width: 44px;
+}
+.prog i {
+  display: block;
+  height: 100%;
+  background: var(--accent);
+  border-radius: 3px;
+  transition: width 0.4s ease;
+}
+.prog-pct {
+  font-size: 11px;
+  color: var(--muted);
+  min-width: 28px;
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+}
+.statusrow {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+.mini {
+  background: none;
+  border: 1px solid var(--border);
+  color: var(--muted);
+  border-radius: 6px;
+  font-size: 12px;
+  line-height: 1;
+  padding: 3px 6px;
+  cursor: pointer;
+  transition: color 0.15s, border-color 0.15s;
+}
+.mini:hover {
+  color: var(--accent);
+  border-color: var(--accent2);
 }
 
 /* drag-and-drop upload zone */
@@ -788,3 +843,251 @@ code {
   width: 52px;
   flex: 0 0 auto;
 }
+
+/* ── layout fixes (screenshot review pass) ─────────────────── */
+header .pill {
+  margin-left: auto; /* push the status pill to the right edge */
+}
+header + .sub {
+  margin-top: 10px;
+  margin-bottom: 20px;
+}
+.nodefilters select {
+  flex: 1 1 160px;
+  max-width: 260px;
+  min-width: 150px;
+}
+.rm-opt {
+  white-space: nowrap;
+}
+.num {
+  width: 72px;
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  color: var(--text);
+  padding: 7px 8px;
+  font-size: 13px;
+}
+.num:focus {
+  outline: none;
+  border-color: var(--accent);
+}
+
+/* small utility buttons (folder ✕, block ↑↓✕, add-block) */
+button.rm-del,
+button.ltools,
+.ltools button,
+button.addblk {
+  background: var(--panel2);
+  border: 1px solid var(--border);
+  color: var(--muted);
+  border-radius: 7px;
+  padding: 5px 10px;
+  font-size: 12px;
+  cursor: pointer;
+}
+button.rm-del:hover,
+.ltools button:hover {
+  border-color: var(--bad);
+  color: var(--bad);
+}
+.ltools {
+  margin-left: auto;
+  display: inline-flex;
+  gap: 4px;
+}
+button.addblk {
+  padding: 8px 14px;
+  font-size: 13px;
+  font-weight: 600;
+}
+button.addblk:hover {
+  border-color: var(--accent);
+  color: var(--accent);
+}
+button:disabled {
+  opacity: 0.4;
+  cursor: default;
+}
+
+/* ── library: folder list ──────────────────────────────────── */
+.folder {
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 10px 12px;
+  margin: 10px 0;
+  background: var(--panel2);
+}
+.folder.off {
+  opacity: 0.55;
+}
+.fpath {
+  flex: 1;
+  font-size: 12.5px;
+  word-break: break-all;
+}
+.frow {
+  display: flex;
+  gap: 10px;
+  align-items: flex-end;
+  flex-wrap: wrap;
+  margin-top: 6px;
+}
+.frow label {
+  flex: 1 1 150px;
+  font-size: 12px;
+  color: var(--muted);
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+/* CRF/% mode switch + value input as one unit (not a 4th form column) */
+.rateval {
+  display: flex;
+  align-items: flex-end;
+  gap: 8px;
+  flex: 0 0 auto;
+}
+
+/* ── logic tab: block-coding rows ──────────────────────────── */
+.logic-start {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  margin: 12px 0 4px;
+  padding: 9px 14px;
+  border: 1px solid var(--ok);
+  border-radius: 10px;
+  background: rgba(63, 185, 80, 0.08);
+  font-size: 13px;
+  color: var(--text);
+}
+.lblock {
+  position: relative;
+  border: 1px solid var(--border);
+  border-left: 3px solid var(--accent);
+  border-radius: 10px;
+  padding: 10px 12px;
+  margin: 10px 0;
+  background: var(--panel2);
+}
+/* flow arrow into the gap above each block — the "puzzle connection" */
+.lblock::before {
+  content: "▾";
+  position: absolute;
+  left: 50%;
+  top: -16px;
+  transform: translateX(-50%);
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1;
+}
+.lblock.off {
+  opacity: 0.5;
+  border-left-color: var(--muted);
+}
+.lrow {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  flex-wrap: wrap;
+}
+.lrow2 {
+  margin-top: 8px;
+  padding-top: 8px;
+  border-top: 1px dashed var(--border);
+}
+.lrow label {
+  font-size: 12px;
+  color: var(--muted);
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+.lchip {
+  font-size: 11px;
+  padding: 3px 9px;
+  border-radius: 6px;
+  background: var(--panel);
+  border: 1px solid var(--border);
+  color: var(--muted);
+}
+.lchip.act {
+  color: var(--accent);
+  border-color: var(--accent2);
+}
+.larrow {
+  color: var(--muted);
+  font-size: 15px;
+}
+.lunit {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12px;
+  color: var(--muted);
+}
+
+/* library table: folder column */
+.c-folder {
+  flex: 0 0 130px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* ── Library summary chips ─────────────────────────────── */
+.libsummary {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin: 4px 0 12px;
+}
+.ls-item {
+  font-size: 12.5px;
+  background: var(--panel2);
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  padding: 4px 12px;
+  color: var(--muted-foreground);
+}
+.ls-item b {
+  color: var(--foreground);
+  font-weight: 700;
+  margin-right: 2px;
+}
+.ls-item.ok b { color: var(--ok); }
+.ls-item.run b { color: var(--accent); }
+.ls-item.bad b { color: var(--bad); }
+.ls-item.save {
+  border-color: color-mix(in srgb, var(--ok) 45%, var(--border));
+  background: color-mix(in srgb, var(--ok) 10%, var(--panel2));
+}
+.ls-item.save b { color: var(--ok); }
+
+/* ── Error detail under status ─────────────────────────── */
+.errline {
+  margin-top: 4px;
+  font-size: 11.5px;
+  color: var(--bad);
+  max-width: 190px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  word-break: break-all;
+}
+
+/* ── Text input in logic blocks ────────────────────────── */
+.txt {
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 7px;
+  color: var(--foreground);
+  font-size: 13px;
+  padding: 6px 9px;
+  min-width: 150px;
+  outline: none;
+}
+.txt:focus { border-color: var(--accent); }
+.txt::placeholder { color: var(--muted-foreground); opacity: .6; }
