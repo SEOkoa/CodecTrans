@@ -1,0 +1,14 @@
+# rust build artifacts
+**/target/
+
+# frontend deps (dist/ IS committed so a fresh clone runs without node/npm)
+CodecTrans-server/frontend/node_modules/
+
+# runtime data
+CodecTrans-server/uploads/
+CodecTrans-server/outputs/
+CodecTrans-node/in/
+CodecTrans-node/out/
+
+# logs
+*.log

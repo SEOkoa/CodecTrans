@@ -1,0 +1,754 @@
+import React, { useEffect, useRef, useState } from "react";
+import { api, fmtSize, fmtDur, fmtRate } from "./api.js";
+
+const STATUS_LABEL = {
+  queued: "Queued",
+  dispatched: "Dispatched",
+  running: "Transcoding…",
+  done: "Done",
+  error: "Error",
+};
+
+// Map an HW encoder name (h264_nvenc, hevc_vaapi, av1_qsv, …) to a short
+// family label + a color class, so a node's accelerators render as colored
+// chips instead of a raw list.
+const CODEC_CHIPS = {
+  h264: { label: "h264", cls: "c-h264" },
+  h265: { label: "hevc", cls: "c-h265" },
+  vp9: { label: "vp9", cls: "c-vp9" },
+  vp8: { label: "vp8", cls: "c-vp8" },
+  av1: { label: "av1", cls: "c-av1" },
+  mpeg4: { label: "mpeg4", cls: "c-mpeg4" },
+};
+function chipFor(enc) {
+  const e = enc.toLowerCase();
+  let fam;
+  if (e.includes("h264") || e.includes("x264") || e.includes("avc")) fam = "h264";
+  else if (e.includes("hevc") || e.includes("h265") || e.includes("x265")) fam = "h265";
+  else if (e.includes("vp9")) fam = "vp9";
+  else if (e.includes("vp8")) fam = "vp8";
+  else if (e.includes("av1")) fam = "av1";
+  else if (e.includes("mpeg4")) fam = "mpeg4";
+  return (fam && CODEC_CHIPS[fam]) || { label: enc, cls: "c-other" };
+}
+// fps -> "29.97" style label (trim trailing zeros)
+function fmtFps(f) {
+  if (f == null || !isFinite(f)) return "";
+  const r = Math.round(f * 100) / 100;
+  return String(r);
+}
+
+function HwChips({ encs }) {
+  if (!encs || encs.length === 0) return <span className="cpu-only">CPU only</span>;
+  return (
+    <span className="chips">
+      <span className="chips-label">⚡ HW</span>
+      {encs.map((e) => {
+        const c = chipFor(e);
+        return (
+          <span key={e} className={`chip ${c.cls}`} title={e}>
+            {c.label}
+          </span>
+        );
+      })}
+    </span>
+  );
+}
+
+// Group a node's accelerator entries by physical device and render
+// "GPU #0 · name" / "CPU #0 · name" with per-backend codec chips, so a
+// box with a dGPU + iGPU (or several of either) is obvious at a glance.
+function AccelPanel({ accels, flat }) {
+  if (!accels || accels.length === 0) {
+    return (
+      <div className="meta">
+        <span>
+          <HwChips encs={flat} />
+        </span>
+      </div>
+    );
+  }
+  const groups = new Map();
+  for (const a of accels) {
+    const key = `${a.kind}-${a.device}`;
+    if (!groups.has(key)) {
+      groups.set(key, { kind: a.kind, device: a.device, name: a.name, backends: new Map() });
+    }
+    const g = groups.get(key);
+    if (!g.backends.has(a.backend)) g.backends.set(a.backend, []);
+    for (const e of a.encoders) {
+      if (!g.backends.get(a.backend).includes(e)) g.backends.get(a.backend).push(e);
+    }
+  }
+  return (
+    <div className="accels">
+      {[...groups.values()].map((g) => (
+        <div className="accel-group" key={`${g.kind}-${g.device}`}>
+          <div className="accel-head">
+            <span className="accel-kind">{g.kind === "gpu" ? "🖥" : "⚙️"}</span>
+            <b>{g.kind.toUpperCase()} #{g.device}</b>
+            <span className="accel-name" title={g.name}>{g.name}</span>
+          </div>
+          {[...g.backends.entries()].map(([backend, encs]) => (
+            <div className="accel-row" key={backend}>
+              <span className="accel-backend">{backend}</span>
+              <HwChips encs={encs} />
+            </div>
+          ))}
+        </div>
+      ))}
+    </div>
+  );
+}
+
+export default function App() {
+  const [health, setHealth] = useState(null);
+  const [codecs, setCodecs] = useState(null);
+
+  // upload
+  const [file, setFile] = useState(null);
+  const [uploadedFile, setUploadedFile] = useState(null);
+  const [uploading, setUploading] = useState(false);
+  const [uploadProgress, setUploadProgress] = useState(0);
+  const [dragActive, setDragActive] = useState(false);
+  const dragCounter = useRef(0);
+  const fileRef = useRef(null);
+  // Live-ref to the active job so the periodic refresher (a stable closure)
+  // can keep its progress current without re-subscribing on every change.
+  const activeJobRef = useRef(null);
+
+  // settings
+  const [videoCodec, setVideoCodec] = useState("h264");
+  const [audioCodec, setAudioCodec] = useState("aac");
+  const [container, setContainer] = useState("mp4");
+  const [crf, setCrf] = useState(23);
+  const [rateMode, setRateMode] = useState("crf"); // "crf" | "pct"
+  const [bitratePct, setBitratePct] = useState(70); // % of source video bitrate (100 = original)
+  const [target, setTarget] = useState("server"); // server | auto | <nodeId>
+  // source analysis (from the upload response's ffprobe)
+  const [analysis, setAnalysis] = useState(null);
+
+  // nodes
+  const [nodes, setNodes] = useState([]);
+  // node search (server finds a node by the IP:port it printed)
+  const [searchIp, setSearchIp] = useState("");
+  const [searchPort, setSearchPort] = useState("8401");
+  const [searchMsg, setSearchMsg] = useState("");
+  const [discovered, setDiscovered] = useState([]);
+  // storage library (server-scanned directory of videos)
+  const [library, setLibrary] = useState({ root: "", entries: [] });
+  const [libRoot, setLibRoot] = useState("");
+  const [scanning, setScanning] = useState(false);
+
+  // jobs
+  const [jobs, setJobs] = useState([]);
+  const [activeJob, setActiveJob] = useState(null);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState("");
+
+  // load catalog + health
+  useEffect(() => {
+    api.health().then(setHealth).catch(() => setHealth({ status: "down" }));
+    api
+      .library()
+      .then((l) => {
+        setLibrary(l);
+        if (l.root) setLibRoot(l.root);
+      })
+      .catch(() => {});
+    api
+      .codecs()
+      .then((c) => {
+        setCodecs(c);
+        if (c.videoCodecs?.length) setVideoCodec(c.videoCodecs[0].id);
+        if (c.audioCodecs?.length) setAudioCodec(c.audioCodecs[0].id);
+        if (c.containers?.length) setContainer(c.containers[0].id);
+      })
+      .catch(() => {});
+  }, []);
+
+  // refresh jobs + nodes periodically
+  useEffect(() => {
+    const t = setInterval(() => {
+      api.jobs().then(setJobs).catch(() => {});
+      api.nodes().then(setNodes).catch(() => {});
+      api.discoveredNodes().then(setDiscovered).catch(() => {});
+      api.library().then(setLibrary).catch(() => {});
+      // keep the active job's progress bar live until it's terminal
+      const aj = activeJobRef.current;
+      if (aj && !["done", "error"].includes(aj.status)) {
+        api
+          .job(aj.id)
+          .then((latest) => {
+            activeJobRef.current = latest;
+            setActiveJob(latest);
+          })
+          .catch(() => {});
+      }
+    }, 2000);
+    return () => clearInterval(t);
+  }, []);
+
+  // poll the active job for a smooth progress bar (500ms). Depend only on the
+  // job id so the interval isn't torn down on every progress tick.
+  useEffect(() => {
+    const jid = activeJob?.id;
+    if (!jid) return;
+    const t = setInterval(async () => {
+      try {
+        const j = await api.job(jid);
+        activeJobRef.current = j;
+        setActiveJob(j);
+        if (j.status === "done" || j.status === "error") {
+          clearInterval(t);
+          setJobs(await api.jobs());
+          setBusy(false);
+        }
+      } catch {}
+    }, 500);
+    return () => clearInterval(t);
+  }, [activeJob?.id]);
+
+  // Shared upload path for both the file picker and drag-and-drop.
+  async function handleFile(f) {
+    if (!f) return;
+    setFile(f);
+    setUploadedFile(null);
+    setError("");
+    setUploading(true);
+    setUploadProgress(0);
+    try {
+      const r = await api.upload(f, (p) => setUploadProgress(p));
+      setUploadedFile(r.file);
+      setAnalysis(r.analysis || null);
+      setUploadProgress(1);
+    } catch (err) {
+      setError(err.message);
+    } finally {
+      setUploading(false);
+    }
+  }
+
+  // File-picker change. Reset the input value so re-selecting the same file
+  // still fires onChange.
+  function onUpload(e) {
+    handleFile(e.target.files?.[0]);
+    e.target.value = "";
+  }
+
+  // Drag-and-drop: use a counter so entering/leaving child elements doesn't
+  // flicker the highlight.
+  function onDragEnter(e) {
+    e.preventDefault();
+    dragCounter.current += 1;
+    if (e.dataTransfer?.types?.includes("Files")) setDragActive(true);
+  }
+  function onDragLeave(e) {
+    e.preventDefault();
+    dragCounter.current -= 1;
+    if (dragCounter.current <= 0) {
+      dragCounter.current = 0;
+      setDragActive(false);
+    }
+  }
+  function onDrop(e) {
+    e.preventDefault();
+    dragCounter.current = 0;
+    setDragActive(false);
+    handleFile(e.dataTransfer?.files?.[0]);
+  }
+
+  async function onStart() {
+    if (!uploadedFile) {
+      setError("Upload a file first.");
+      return;
+    }
+    setBusy(true);
+    setError("");
+    const usePct = videoCodec !== "copy" && rateMode === "pct";
+    const base = {
+      file: uploadedFile,
+      videoCodec,
+      audioCodec,
+      container,
+      crf: videoCodec === "copy" || usePct ? undefined : crf,
+      // capped-VBR mode: server computes kbps from the source's bitrate
+      bitratePct: usePct ? bitratePct : undefined,
+    };
+    try {
+      let id;
+      if (target === "server") {
+        id = (await api.transcode(base)).id;
+      } else if (target === "auto") {
+        id = (await api.dispatch(base)).id; // server auto-picks node + accelerates
+      } else {
+        id = (await api.dispatch({ ...base, nodeId: target })).id;
+      }
+      const j = await api.job(id);
+      activeJobRef.current = j;
+      setActiveJob(j);
+      setJobs(await api.jobs());
+    } catch (err) {
+      setError(err.message);
+    } finally {
+      // `busy` only covers the submit call itself. The button is NOT locked
+      // while a job runs — the user can queue more jobs (the progress bar in
+      // "3 · Jobs" tracks the active job independently).
+      setBusy(false);
+    }
+  }
+
+  const progress = activeJob ? Math.round((activeJob.progress || 0) * 100) : 0;
+  // Estimated target kbps for "% of source" mode — mirrors the server math so
+  // the user sees the number before hitting Start.
+  const estKbps =
+    analysis?.videoBitRate != null
+      ? Math.max(100, Math.round((analysis.videoBitRate * bitratePct) / 100 / 1000))
+      : null;
+  const onlineNodes = nodes.filter((n) => n.status === "online");
+
+  // "Server finds a node": probe the IP:port the node printed in its terminal.
+  async function doSearch() {
+    const ip = searchIp.trim();
+    if (!ip) return;
+    setError("");
+    setSearchMsg("");
+    try {
+      const n = await api.searchNode(ip, searchPort);
+      setNodes(await api.nodes());
+      setSearchMsg(
+        `Found '${n.name}' — ${
+          n.hwEncoders?.length ? "⚡ " + n.hwEncoders.join(", ") : "CPU only"
+        }`
+      );
+    } catch (err) {
+      setError(err.message);
+    }
+  }
+
+  // Scan a storage directory: server walks it (read-only) + ffprobes each video.
+  async function doScan() {
+    setScanning(true);
+    setError("");
+    try {
+      const l = await api.libraryScan(libRoot.trim());
+      setLibrary(l);
+      if (l.root) setLibRoot(l.root);
+    } catch (err) {
+      setError(err.message);
+    } finally {
+      setScanning(false);
+    }
+  }
+
+  return (
+    <div className="wrap">
+      <header>
+        <h1>CodecTrans</h1>
+        <div className={`pill ${health?.status === "ok" ? "ok" : "bad"}`}>
+          {health?.status === "ok" ? "backend online" : "backend offline"}
+        </div>
+      </header>
+      {health?.ffmpeg && <div className="sub">{health.ffmpeg}</div>}
+
+      <div className="grid">
+        {/* left: upload + settings */}
+        <section className="card">
+          <h2>1 · Source</h2>
+          <div
+            className={`dropzone ${dragActive ? "active" : ""}`}
+            onDragEnter={onDragEnter}
+            onDragOver={(e) => e.preventDefault()}
+            onDragLeave={onDragLeave}
+            onDrop={onDrop}
+            onClick={() => fileRef.current?.click()}
+            role="button"
+            tabIndex={0}
+            onKeyDown={(e) => {
+              if (e.key === "Enter" || e.key === " ") fileRef.current?.click();
+            }}
+          >
+            <input
+              ref={fileRef}
+              type="file"
+              accept="video/*,audio/*"
+              onChange={onUpload}
+              className="file-hidden"
+            />
+            <div className="dz-ico">🎬</div>
+            <div className="dz-text">
+              <b>{dragActive ? "Drop it here" : "Drag a video here"}</b>
+              <span>or click to browse your files</span>
+            </div>
+          </div>
+          {file && (
+            <div className="meta">
+              <span>{file.name}</span>
+              <span>{fmtSize(file.size)}</span>
+            </div>
+          )}
+          {uploading && (
+            <div className="meta">
+              <div className="prog-row">
+                <span>Uploading… {Math.round(uploadProgress * 100)}%</span>
+                <span>{file ? fmtSize(file.size) : ""}</span>
+              </div>
+              <div className="bar">
+                <div className="bar-fill" style={{ width: `${uploadProgress * 100}%` }} />
+              </div>
+            </div>
+          )}
+          {uploadedFile && <div className="meta ok-text">Uploaded: {uploadedFile}</div>}
+
+          {/* source analysis — what ffprobe found in the uploaded file */}
+          {analysis && (
+            <div className="analysis">
+              <div className="an-title">🔎 Source</div>
+              <div className="an-grid">
+                <span>
+                  <b>Video</b>{" "}
+                  {analysis.videoCodec || "?"}
+                  {analysis.videoProfile ? ` (${analysis.videoProfile})` : ""}
+                </span>
+                <span>
+                  <b>Size</b>{" "}
+                  {analysis.width ? `${analysis.width}×${analysis.height}` : "?"}
+                  {analysis.fps ? ` @ ${fmtFps(analysis.fps)}` : ""} fps
+                </span>
+                <span>
+                  <b>Length</b> {fmtDur(analysis.duration) || "?"}
+                </span>
+                <span>
+                  <b>Bitrate</b> {fmtRate(analysis.videoBitRate) || "?"}
+                </span>
+                <span>
+                  <b>Audio</b>{" "}
+                  {analysis.audioCodec
+                    ? `${analysis.audioCodec} · ${analysis.audioSampleRate
+                        ? analysis.audioSampleRate / 1000 + " kHz"
+                        : ""}${analysis.audioChannels ? " · " + analysis.audioChannels + "ch" : ""}`
+                    : "none"}
+                </span>
+                <span>
+                  <b>Pixel</b> {analysis.pixFmt || "?"} · {analysis.container || "?"}
+                </span>
+              </div>
+            </div>
+          )}
+
+          <h2>2 · Target</h2>
+          <label>
+            Video codec
+            <select value={videoCodec} onChange={(e) => setVideoCodec(e.target.value)}>
+              {codecs?.videoCodecs.map((c) => (
+                <option key={c.id} value={c.id}>
+                  {c.label}
+                </option>
+              ))}
+            </select>
+          </label>
+          <label>
+            Audio codec
+            <select value={audioCodec} onChange={(e) => setAudioCodec(e.target.value)}>
+              {codecs?.audioCodecs.map((c) => (
+                <option key={c.id} value={c.id}>
+                  {c.label}
+                </option>
+              ))}
+            </select>
+          </label>
+          <label>
+            Container
+            <select value={container} onChange={(e) => setContainer(e.target.value)}>
+              {codecs?.containers.map((c) => (
+                <option key={c.id} value={c.id}>
+                  {c.label}
+                </option>
+              ))}
+            </select>
+          </label>
+          {videoCodec !== "copy" && (
+            <>
+              <div className="ratemode">
+                <button
+                  type="button"
+                  className={`rm-opt ${rateMode === "crf" ? "on" : ""}`}
+                  onClick={() => setRateMode("crf")}
+                >
+                  Quality (CRF)
+                </button>
+                <button
+                  type="button"
+                  className={`rm-opt ${rateMode === "pct" ? "on" : ""}`}
+                  onClick={() => setRateMode("pct")}
+                >
+                  % of source bitrate
+                </button>
+              </div>
+              {rateMode === "crf" ? (
+                <label>
+                  Quality (CRF {crf}) — lower is better
+                  <input
+                    type="range"
+                    min="0"
+                    max="51"
+                    value={crf}
+                    onChange={(e) => setCrf(Number(e.target.value))}
+                  />
+                </label>
+              ) : (
+                <label>
+                  Target: {bitratePct}% of source bitrate
+                  {estKbps != null && (
+                    <span className="est">
+                      ≈ {fmtRate(estKbps * 1000)}
+                      {analysis?.videoBitRate
+                        ? ` (source ${fmtRate(analysis.videoBitRate)})`
+                        : ""}{" "}
+                      · capped at {fmtRate(estKbps * 1200)}
+                    </span>
+                  )}
+                  {estKbps == null && (
+                    <span className="est">
+                      source bitrate unknown — the server will estimate from the
+                      file size
+                    </span>
+                  )}
+                  <input
+                    type="range"
+                    min="10"
+                    max="100"
+                    step="5"
+                    value={bitratePct}
+                    onChange={(e) => setBitratePct(Number(e.target.value))}
+                  />
+                  <div className="rm-scale">
+                    <span>smaller file</span>
+                    <span>50%</span>
+                    <span className="mid">100% = original</span>
+                  </div>
+                </label>
+              )}
+            </>
+          )}
+
+          <label>
+            Run on
+            <select value={target} onChange={(e) => setTarget(e.target.value)}>
+              <option value="server">Server (local CPU)</option>
+              <option value="auto">Auto — best node (HW accel)</option>
+              {onlineNodes.map((n) => (
+                <option key={n.id} value={n.id}>
+                  Node: {n.name}
+                </option>
+              ))}
+            </select>
+          </label>
+          {target !== "server" && onlineNodes.length === 0 && (
+            <div className="err">No nodes online — start a CodecTrans-node.</div>
+          )}
+
+          <button
+            className="primary"
+            onClick={onStart}
+            disabled={busy || uploading || !uploadedFile}
+          >
+            {busy
+              ? "Working…"
+              : target === "server"
+              ? "Transcode"
+              : "Dispatch"}
+          </button>
+          {error && <div className="err">{error}</div>}
+        </section>
+
+        {/* right: progress + history */}
+        <section className="card">
+          <h2>3 · Jobs</h2>
+          {activeJob && (
+            <div className="active">
+              <div className="row">
+                <span className={`status ${activeJob.status}`}>{STATUS_LABEL[activeJob.status] || activeJob.status}</span>
+                {activeJob.accelerated && (
+                  <span className="accel" title={`HW: ${activeJob.effectiveVideoCodec}`}>
+                    ⚡ {activeJob.effectiveVideoCodec}
+                  </span>
+                )}
+                <span className="pct">{progress}%</span>
+              </div>
+              <div className="bar">
+                <div
+                  className={`fill ${activeJob.status === "error" ? "bad" : ""}`}
+                  style={{ width: `${activeJob.status === "error" ? 100 : progress}%` }}
+                />
+              </div>
+              <div className="meta">
+                <span>by {activeJob.executedBy || "server"}</span>
+                {activeJob.outputFile && (activeJob.status === "done" || activeJob.status === "error") && (
+                  <span>
+                    {activeJob.outputFile} · {fmtSize(activeJob.outputSize)}
+                  </span>
+                )}
+              </div>
+              {activeJob.error && <div className="err">{activeJob.error}</div>}
+            </div>
+          )}
+
+          <div className="history">
+            {jobs.length === 0 && <div className="empty">No jobs yet.</div>}
+            {jobs.map((j) => (
+              <div key={j.id} className="job">
+                <div className="row">
+                  <span className={`status ${j.status}`}>{STATUS_LABEL[j.status] || j.status}</span>
+                  {j.accelerated && <span className="accel" title={`HW: ${j.effectiveVideoCodec}`}>⚡</span>}
+                  <span className="jname">{j.outputFile || j.inputFile}</span>
+                  <span className="jmeta">
+                    {j.executedBy} · {j.effectiveVideoCodec} → {j.container}
+                    {j.outputSize != null ? ` · ${fmtSize(j.outputSize)}` : ""}
+                  </span>
+                </div>
+                {j.status === "done" && (
+                  <a className="dl" href={api.downloadUrl(j.outputFile)} download>
+                    ⬇ download
+                  </a>
+                )}
+                {j.error && <div className="err">{j.error}</div>}
+              </div>
+            ))}
+          </div>
+        </section>
+      </div>
+
+      {/* nodes */}
+      <section className="card nodes">
+        <h2>Nodes ({nodes.length})</h2>
+
+        {/* server finds a node: enter the IP:port it printed in its terminal */}
+        <div className="search">
+          <input
+            value={searchIp}
+            onChange={(e) => setSearchIp(e.target.value)}
+            placeholder="node IP (e.g. 192.168.x.x)"
+          />
+          <input
+            value={searchPort}
+            onChange={(e) => setSearchPort(e.target.value)}
+            placeholder="port"
+            className="port"
+          />
+          <button onClick={doSearch} disabled={!searchIp.trim()}>
+            Search
+          </button>
+        </div>
+        {searchMsg && <div className="meta ok-text">{searchMsg}</div>}
+        <div className="hint">
+          A node prints its <code>IP:port</code> on start (e.g.
+          <code> http://192.168.x.x:8401</code>). Enter it here — the server
+          verifies and registers it. Or set <code>CT_SERVER</code> on the node
+          and it connects itself.
+        </div>
+
+        {nodes.length === 0 && (
+          <div className="empty">
+            No nodes yet. Run <code>CodecTransNode</code> and search it above.
+          </div>
+        )}
+        {nodes.map((n) => (
+          <div key={n.id} className="node">
+            <div className="row">
+              <span className={`status ${n.status === "online" ? "done" : ""}`}>{n.status}</span>
+              <span className="jname">{n.name}</span>
+              {n.currentJob && <span className="jmeta">busy: {n.currentJob.slice(0, 8)}…</span>}
+              <span className="jmeta">{n.ffmpegVersion.split(" ").slice(0, 3).join(" ")}</span>
+            </div>
+            <AccelPanel accels={n.accels} flat={n.hwEncoders} />
+          </div>
+        ))}
+
+        {discovered.length > 0 && (
+          <>
+            <h3>Seen on the LAN (mDNS, not yet registered)</h3>
+            {discovered.map((d) => (
+              <div key={d.name} className="node">
+                <div className="row">
+                  <span className="status done">seen</span>
+                  <span className="jname">{d.name}</span>
+                  <span className="jmeta">
+                    {d.ip}:{d.port}
+                  </span>
+                </div>
+                <div className="meta">
+                  <span>
+                    <HwChips encs={d.hwEncoders} />
+                  </span>
+                </div>
+              </div>
+            ))}
+          </>
+        )}
+      </section>
+
+      {/* storage library (server-scanned directory of videos) */}
+      <section className="card lib">
+        <h2>Library</h2>
+        <div className="hint">
+          Point the server at a folder of videos (a NAS share it can mount, or a
+          local dir). It scans <b>read-only</b> — your files are never touched.
+          Next: pick a target codec and re-encode in place (backed up).
+        </div>
+        <div className="search">
+          <input
+            value={libRoot}
+            onChange={(e) => setLibRoot(e.target.value)}
+            placeholder="storage path (e.g. /mnt/nas/Videos)"
+          />
+          <button onClick={doScan} disabled={scanning || !libRoot.trim()}>
+            {scanning ? "Scanning…" : "Scan"}
+          </button>
+        </div>
+
+        {library.root && (
+          <div className="meta">
+            root: <code>{library.root}</code> · {library.entries.length} videos
+          </div>
+        )}
+
+        {library.entries.length > 0 ? (
+          <div className="libtable">
+            <div className="libhead row">
+              <span className="c-name">File</span>
+              <span className="c-codec">Codec</span>
+              <span className="c-spec">Specs</span>
+              <span className="c-size">Size</span>
+              <span className="c-dur">Duration</span>
+              <span className="c-status">Status</span>
+            </div>
+            {library.entries.map((e) => (
+              <div key={e.path} className="librow row">
+                <span className="c-name jname" title={e.path}>{e.name}</span>
+                <span className="c-codec">
+                  {e.videoCodec || "?"}
+                  {e.audioCodec ? ` / ${e.audioCodec}` : ""}
+                </span>
+                <span className="c-spec jmeta">
+                  {e.width ? `${e.width}×${e.height}` : "—"}
+                  {e.fps ? ` · ${fmtFps(e.fps)}fps` : ""}
+                  {e.videoBitRate ? ` · ${fmtRate(e.videoBitRate)}` : ""}
+                </span>
+                <span className="c-size jmeta">{fmtSize(e.size)}</span>
+                <span className="c-dur jmeta">{e.duration ? fmtDur(e.duration) : "—"}</span>
+                <span className="c-status">
+                  <span className={`status ${e.status === "done" ? "done" : ""}`}>{e.status}</span>
+                </span>
+              </div>
+            ))}
+          </div>
+        ) : (
+          <div className="empty">
+            {library.root ? "No videos found." : "Scan a folder to build the library."}
+          </div>
+        )}
+      </section>
+    </div>
+  );
+}
