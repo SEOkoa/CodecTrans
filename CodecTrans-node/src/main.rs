@@ -1093,7 +1093,15 @@ async fn do_register(client: &reqwest::Client, server: &str, name: &str, caps: &
             }
             true
         }
-        _ => false,
+        Ok(r) => {
+            let txt = r.text().await.unwrap_or_default();
+            println!("[node] register HTTP {}: {}", r.status(), txt.chars().take(300).collect::<String>());
+            false
+        }
+        Err(e) => {
+            println!("[node] register transport error: {}", e);
+            false
+        }
     }
 }
 
