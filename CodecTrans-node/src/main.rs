@@ -1204,7 +1204,13 @@ async fn poll_loop(mut client: reqwest::Client, server: String, name: String, ca
                 }
             }
             Err(e) => {
-                println!("[node] poll error: {e} (retrying)");
+                let mut chain = String::new();
+                let mut src = std::error::Error::source(&e);
+                while let Some(s) = src {
+                    chain.push_str(&format!(" <- {}", s));
+                    src = s.source();
+                }
+                println!("[node] poll error: {} (retrying){}", e, chain);
                 // Swap in a fresh client (new pool) — a stale keep-alive /
                 // long-poll connection from a restarted server would
                 // otherwise be reused by every retry and keep timing out.
