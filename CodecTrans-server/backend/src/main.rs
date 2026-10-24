@@ -1292,14 +1292,23 @@ fn save_auto(c: &AutoConfig) -> std::io::Result<()> {
 
 // ── folders + logic blocks (persisted in library.json) ──────────
 
-/// Encoding target for a folder or a logic block.
+/// One entry of an ordered encoder-preference list (`TargetCfg.choices`).
+/// The server walks the list in order and uses the FIRST choice the selected
+/// node can actually run (HW), so a folder can say "av1 on the GPU, else
+/// hevc" or "hevc on the nvenc box, h264 on the Mac" without per-node graphs.
 #[derive(Clone, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
-pub struct TargetCfg {
-    /// Logical video codec (h264/h265/av1/...); rewritten per-node to the
-    /// actual HW encoder at dispatch time.
+pub struct TargetChoice {
+    /// Logical video codec (h264/h265/av1/...).
     #[serde(default)]
     pub video_codec: Option<String>,
+    /// Accelerator constraint for this choice:
+    ///  - a specific backend: "nvenc" | "vaapi" | "qsv" | "amf" | "mft" |
+    ///    "videotoolbox" (alias "vt")
+    ///  - a device class: "gpu" | "cpu"
+    ///  - None = any HW accelerator that can do the codec.
+    #[serde(default)]
+    pub accel: Option<String>,
     #[serde(default)]
     pub audio_codec: Option<String>,
     #[serde(default)]
@@ -1313,6 +1322,32 @@ pub struct TargetCfg {
     pub bitrate_pct: Option<u32>,
 }
 
+/// Encoding target for a folder or a logic block.
+#[derive(Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct TargetCfg {
+    /// Logical video codec (h264/h265/av1/...); rewritten per-node to the
+    /// actual HW encoder at dispatch time. Ignored when `choices` is set.
+    #[serde(default)]
+    pub video_codec: Option<String>,
+    #[serde(default)]
+    pub audio_codec: Option<String>,
+    #[serde(default)]
+    pub container: Option<String>,
+    /// "crf" | "pct" (percent of source bitrate).
+    #[serde(default)]
+    pub mode: Option<String>,
+    #[serde(default)]
+    pub crf: Option<u32>,
+    #[serde(default)]
+    pub bitrate_pct: Option<u32>,
+    /// Ordered encoder preferences. When non-empty this takes precedence over
+    /// the single `video_codec`: the server picks a node that can run at least
+    /// one choice, then resolves the first choice that node can run.
+    #[serde(default)]
+    pub choices: Vec<TargetChoice>,
+}
+
 impl From<AutoConfig> for TargetCfg {
     fn from(a: AutoConfig) -> Self {
         TargetCfg {
@@ -1322,6 +1357,7 @@ impl From<AutoConfig> for TargetCfg {
             mode: a.mode,
             crf: a.crf,
             bitrate_pct: a.bitrate_pct,
+            choices: Vec::new(),
         }
     }
 }
@@ -1336,6 +1372,10 @@ pub struct FolderRule {
     pub enabled: bool,
     #[serde(default)]
     pub target: TargetCfg,
+    /// Per-folder node graph — takes precedence over the global library
+    /// graph when it has condition/action nodes (empty = inherit global).
+    #[serde(default)]
+    pub graph: WorkflowGraph,
 }
 
 fn default_true() -> bool {
@@ -1597,6 +1637,48 @@ pub async fn blocks_post(State(_store): State<Store>, Json(b): Json<BlocksBody>)
     }
 }
 
+/// GET /api/library/folders/:id/blocks — the per-folder node graph (empty =
+/// inherit the global library graph).
+pub async fn folder_blocks_get(
+    State(_store): State<Store>,
+    UrlPath(id): UrlPath<String>,
+) -> Response {
+    let c = load_lib_cfg();
+    match c.folders.iter().find(|f| f.id == id) {
+        Some(f) => Json(json!({ "blocks": Vec::<LogicBlock>::new(), "graph": f.graph })).into_response(),
+        None => (StatusCode::NOT_FOUND, Json(json!({ "error": "folder not found" })))
+            .into_response(),
+    }
+}
+
+/// POST /api/library/folders/:id/blocks — save a folder's own node graph.
+/// An empty graph clears the override (the folder inherits the global graph).
+pub async fn folder_blocks_post(
+    State(_store): State<Store>,
+    UrlPath(id): UrlPath<String>,
+    Json(b): Json<BlocksBody>,
+) -> Response {
+    let mut c = load_lib_cfg();
+    match c.folders.iter_mut().find(|f| f.id == id) {
+        Some(f) => {
+            if let Some(graph) = b.graph {
+                f.graph = graph;
+            }
+            let g_saved = f.graph.clone();
+            match save_lib_cfg(&c) {
+                Ok(_) => Json(json!({ "ok": true, "graph": g_saved })).into_response(),
+                Err(e) => (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(json!({ "error": e.to_string() })),
+                )
+                    .into_response(),
+            }
+        }
+        None => (StatusCode::NOT_FOUND, Json(json!({ "error": "folder not found" })))
+            .into_response(),
+    }
+}
+
 /// GET /api/library/folders
 pub async fn folders_get(State(_store): State<Store>) -> impl IntoResponse {
     Json(json!({ "folders": load_lib_cfg().folders }))
@@ -1605,8 +1687,21 @@ pub async fn folders_get(State(_store): State<Store>) -> impl IntoResponse {
 /// POST /api/library/folders — save the folder list. Catalog entries of
 /// removed folders are KEPT (marked "제거됨" in the UI) so re-adding the
 /// folder restores their done state instead of re-queueing everything.
-pub async fn folders_post(State(store): State<Store>, Json(b): Json<FoldersBody>) -> Response {
+pub async fn folders_post(State(store): State<Store>, Json(mut b): Json<FoldersBody>) -> Response {
     let mut c = load_lib_cfg();
+    // Preserve per-folder graphs: the frontend's folder list is loaded at tab
+    // open and may predate a later graph edit, so an empty incoming graph
+    // must not wipe a stored one (graphs are managed via the
+    // /folders/:id/blocks endpoint).
+    for f in b.folders.iter_mut() {
+        if f.graph.nodes.is_empty() {
+            if let Some(existing) = c.folders.iter().find(|e| e.id == f.id) {
+                if !existing.graph.nodes.is_empty() {
+                    f.graph = existing.graph.clone();
+                }
+            }
+        }
+    }
     c.folders = b.folders.clone();
     if let Err(e) = save_lib_cfg(&c) {
         return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": e.to_string() }))).into_response();
@@ -1683,6 +1778,148 @@ fn resolve_lib_source(lp: &str, store: &Store) -> Option<PathBuf> {
     }
 }
 
+/// Concrete HW encoder for `family` on `node` satisfying the `accel`
+/// constraint — a specific backend ("nvenc", "videotoolbox", "vaapi", …) or
+/// a device class ("gpu"/"cpu"). `None` constraint = best HW encoder for the
+/// family overall. Returns `None` when no HW encoder fits.
+fn node_accel_encoder(node: &Node, family: &str, accel: Option<&str>) -> Option<String> {
+    let accel = accel.map(|a| a.to_lowercase());
+    if let Some(a) = accel {
+        let is_class = a == "gpu" || a == "cpu";
+        for acc in &node.accels {
+            let ok = if is_class {
+                acc.kind == a
+            } else if a == "vt" {
+                acc.backend.contains("video") || acc.backend == "vt"
+            } else {
+                acc.backend == a
+            };
+            if ok {
+                if let Some(enc) = best_hw_encoder(&acc.encoders, family) {
+                    return Some(enc);
+                }
+            }
+        }
+        return None;
+    }
+    best_hw_encoder(&node.hw_encoders, family)
+}
+
+/// Walk an encoder-preference list on ONE node: the first choice the node can
+/// run (HW) wins. Returns (choice index, concrete encoder, accelerated). When
+/// no choice is HW-satisfiable, the first choice runs on a software encoder.
+fn resolve_choices_on_node(node: &Node, choices: &[TargetChoice]) -> (usize, String, bool) {
+    if choices.is_empty() {
+        return (0, "libx264".into(), false);
+    }
+    for (i, ch) in choices.iter().enumerate() {
+        let fam = codec_family(ch.video_codec.as_deref().unwrap_or("h264"));
+        if let Some(enc) = node_accel_encoder(node, &fam, ch.accel.as_deref()) {
+            return (i, enc, true);
+        }
+    }
+    let fam = codec_family(choices[0].video_codec.as_deref().unwrap_or("h264"));
+    let sw = family_default_encoder(&fam)
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| choices[0].video_codec.clone().unwrap_or_else(|| "libx264".into()));
+    (0, sw, false)
+}
+
+/// Active (queued/dispatched/running) jobs per node id — used to spread a
+/// batch of files over the capable nodes. When `prefix` is given (a folder
+/// key), only that folder's jobs count — one folder's batch must not crowd
+/// the others off a node.
+fn active_jobs_by_node(store: &Store, prefix: Option<&str>) -> std::collections::HashMap<String, u32> {
+    let s = store.lock().unwrap();
+    let mut m: std::collections::HashMap<String, u32> = std::collections::HashMap::new();
+    for j in s.jobs.values() {
+        if matches!(j.status.as_str(), "queued" | "dispatched" | "running") {
+            if let Some(nid) = &j.node_id {
+                if let Some(p) = prefix {
+                    match &j.lib_path {
+                        Some(lp) if lp.starts_with(p) => {}
+                        _ => continue,
+                    }
+                }
+                *m.entry(nid.clone()).or_insert(0) += 1;
+            }
+        }
+    }
+    m
+}
+
+/// Resolve node + concrete encoder + effective target params for a target
+/// carrying an encoder-preference list. Among ONLINE nodes able to run at
+/// least one choice (HW), the LEAST BUSY one wins (load counts only THIS
+/// folder's jobs), ties going to the node that fits the EARLIEST choice —
+/// so a batch spreads over every capable node while the primary codec stays
+/// primary. When no node can run any choice in HW, the least-busy online
+/// node takes the first choice on software.
+async fn resolve_choice_dispatch(
+    store: &Store,
+    t: &TargetCfg,
+    folder_key: Option<&str>,
+) -> Option<(String, String, String, bool, TargetCfg)> {
+    let c = store.lock().unwrap().redis();
+    let online = list_nodes_redis(c, "online", None, None).await;
+    if online.is_empty() {
+        return None;
+    }
+    // cap[i] = index of the earliest choice node i can run (HW).
+    let caps: Vec<Option<usize>> = online
+        .iter()
+        .map(|n| {
+            t.choices.iter().position(|ch| {
+                let fam = codec_family(ch.video_codec.as_deref().unwrap_or("h264"));
+                node_accel_encoder(n, &fam, ch.accel.as_deref()).is_some()
+            })
+        })
+        .collect();
+    let prefix = folder_key.map(|k| format!("{k}/"));
+    let counts = active_jobs_by_node(store, prefix.as_deref());
+    let all_idx: Box<[usize]> = (0..online.len()).collect::<Vec<_>>().into_boxed_slice();
+    let hw_idx: Box<[usize]> = (0..online.len())
+        .filter(|i| caps[*i].is_some())
+        .collect::<Vec<_>>()
+        .into_boxed_slice();
+    let pool: &[usize] = if hw_idx.is_empty() {
+        // No HW fit anywhere: any online node, software fallback.
+        &all_idx
+    } else {
+        &hw_idx
+    };
+    // (load, earliest-choice-index) — lowest wins; list order breaks the rest.
+    let mut best = pool[0];
+    for &i in &pool[1..] {
+        let cur = (
+            counts.get(&online[i].id).copied().unwrap_or(0),
+            caps[i].unwrap_or(usize::MAX),
+        );
+        let bst = (
+            counts.get(&online[best].id).copied().unwrap_or(0),
+            caps[best].unwrap_or(usize::MAX),
+        );
+        if cur < bst {
+            best = i;
+        }
+    }
+    let node = online[best].clone();
+    let (ci, effective, accelerated) = resolve_choices_on_node(&node, &t.choices);
+    let ch = &t.choices[ci];
+    // Choice fields override target-level defaults (container/mode/crf are
+    // usually set once at the target; per-choice codec+accel differ).
+    let eff = TargetCfg {
+        video_codec: ch.video_codec.clone().or_else(|| t.video_codec.clone()),
+        audio_codec: ch.audio_codec.clone().or_else(|| t.audio_codec.clone()),
+        container: ch.container.clone().or_else(|| t.container.clone()),
+        mode: ch.mode.clone().or_else(|| t.mode.clone()),
+        crf: ch.crf.or(t.crf),
+        bitrate_pct: ch.bitrate_pct.or(t.bitrate_pct),
+        choices: Vec::new(),
+    };
+    Some((node.id, node.name, effective, accelerated, eff))
+}
+
 /// Queue one library entry for re-encoding on a node with the given target
 /// (folder default or a logic block's). The node pulls the source via
 /// node_fetch_file; the finished file is moved back next to the source
@@ -1693,30 +1930,57 @@ async fn dispatch_lib_job(store: &Store, e: &LibraryEntry, t: &TargetCfg) -> boo
     if resolve_lib_source(&key, store).is_none() {
         return false;
     }
-    let vcodec = t
+    // Resolve (node, concrete encoder, effective target params).
+    // Encoder-preference list -> capability-based least-busy node; single
+    // codec -> legacy first-node-with-that-family.
+    let eff_owned: Option<TargetCfg>;
+    let (node_id, node_name, effective, accelerated, eff): (String, String, String, bool, &TargetCfg) =
+        if t.choices.is_empty() {
+            let vcodec = t
+                .video_codec
+                .clone()
+                .filter(|s| !s.is_empty())
+                .unwrap_or_else(|| "h264".into());
+            let node = {
+                let c = store.lock().unwrap().redis();
+                match pick_node_redis(c, &codec_family(&vcodec)).await {
+                    Some(n) => n,
+                    None => return false,
+                }
+            };
+            let (effective, accelerated) = resolve_video_codec(&vcodec, &node.hw_encoders);
+            eff_owned = None;
+            (node.id, node.name, effective, accelerated, t)
+        } else {
+            let (node_id, node_name, effective, accelerated, eff) =
+                match resolve_choice_dispatch(store, t, e.folder.as_deref()).await {
+                    Some(r) => r,
+                    None => return false,
+                };
+            eff_owned = Some(eff);
+            (
+                node_id,
+                node_name,
+                effective,
+                accelerated,
+                eff_owned.as_ref().unwrap(),
+            )
+        };
+    let vcodec = eff
         .video_codec
         .clone()
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| "h264".into());
-    let acodec = t
+    let acodec = eff
         .audio_codec
         .clone()
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| "aac".into());
-    let container = t
+    let container = eff
         .container
         .clone()
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| "mp4".into());
-    let (node_id, node_name, effective, accelerated) = {
-        let c = store.lock().unwrap().redis();
-        let node = match pick_node_redis(c, &codec_family(&vcodec)).await {
-            Some(n) => n,
-            None => return false,
-        };
-        let (effective, accelerated) = resolve_video_codec(&vcodec, &node.hw_encoders);
-        (node.id.clone(), node.name.clone(), effective, accelerated)
-    };
     let out_name = format!(
         "{}_{}_{}.{}",
         safe_base(&e.path),
@@ -1724,12 +1988,12 @@ async fn dispatch_lib_job(store: &Store, e: &LibraryEntry, t: &TargetCfg) -> boo
         container,
         container
     );
-    let pct_mode = t.mode.as_deref().unwrap_or("pct") == "pct";
+    let pct_mode = eff.mode.as_deref().unwrap_or("pct") == "pct";
     let (crf, video_bitrate, bitrate_pct) = if pct_mode {
-        let pct = t.bitrate_pct.unwrap_or(70).clamp(10, 100);
+        let pct = eff.bitrate_pct.unwrap_or(70).clamp(10, 100);
         (None, target_kbps(e.video_bit_rate, Some(pct)), Some(pct))
     } else {
-        (t.crf, None, None)
+        (eff.crf, None, None)
     };
     let job = Job {
         id: uuid::Uuid::new_v4().to_string(),
@@ -2210,23 +2474,38 @@ pub async fn library_scan(State(store): State<Store>, Json(req): Json<ScanReq>) 
             .find(|f| e.folder.as_deref() == Some(f.id.as_str()))
             .map(|f| f.target.clone())
             .unwrap_or_default();
-        let decision: Option<(TargetCfg, bool)> = if let Some(g) = &eff_graph {
-            // Walk the node graph; first action reached wins.
-            eval_graph(g, e, &online, &folder_target).or_else(|| {
-                Some((
-                    folder_target.clone(),
-                    folder_target.video_codec.is_some(),
-                ))
+        // Per-folder graph takes precedence over the global library graph.
+        let folder_graph: Option<&WorkflowGraph> = libcfg
+            .folders
+            .iter()
+            .find(|f| e.folder.as_deref() == Some(f.id.as_str()))
+            .filter(|f| {
+                f.graph
+                    .nodes
+                    .iter()
+                    .any(|n| n.kind == "condition" || n.kind == "action")
             })
-        } else if e.folder.is_some() {
-            let has_vc = folder_target.video_codec.is_some();
-            Some((folder_target, has_vc))
-        } else {
-            let ac = load_auto();
-            if ac.enabled {
-                Some((ac.into(), true))
+            .map(|f| &f.graph);
+        let decision: Option<(TargetCfg, bool)> = {
+            let g = folder_graph.or(eff_graph.as_ref());
+            if let Some(g) = g {
+                // Walk the node graph; first action reached wins.
+                eval_graph(g, e, &online, &folder_target).or_else(|| {
+                    Some((
+                        folder_target.clone(),
+                        folder_target.video_codec.is_some(),
+                    ))
+                })
+            } else if e.folder.is_some() {
+                let has_vc = folder_target.video_codec.is_some();
+                Some((folder_target, has_vc))
             } else {
-                None
+                let ac = load_auto();
+                if ac.enabled {
+                    Some((ac.into(), true))
+                } else {
+                    None
+                }
             }
         };
         if let Some((t, do_encode)) = decision {
@@ -3045,6 +3324,10 @@ async fn main() {
         .route("/api/library/auto", get(auto_get).post(auto_post))
         .route("/api/library/folders", get(folders_get).post(folders_post))
         .route("/api/library/blocks", get(blocks_get).post(blocks_post))
+        .route(
+            "/api/library/folders/:id/blocks",
+            get(folder_blocks_get).post(folder_blocks_post),
+        )
         .route("/api/library/requeue", post(library_requeue))
         .route("/api/upload", post(upload))
         .route("/api/media/analyze", get(media_analyze))

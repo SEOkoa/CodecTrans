@@ -127,6 +127,13 @@ export const api = {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(body),
     }),
+  folderBlocksGet: (fid) => jfetch(`/api/library/folders/${fid}/blocks`),
+  folderBlocksPost: (fid, body) =>
+    jfetch(`/api/library/folders/${fid}/blocks`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    }),
 };
 
 export function fmtSize(bytes) {

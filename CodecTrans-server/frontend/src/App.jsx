@@ -72,7 +72,17 @@ function nodeTitle(n) {
   if (n.label) return n.label;
   const c = n.condition || {};
   const a = n.action || {};
-  const codec = (id) => (id ? (id === "h265" ? "HEVC" : id.toUpperCase()) : "?");
+  const codec = (id) => {
+  if (!id) return "?";
+  const map = {
+    h264: "H.264", libx264: "H.264",
+    h265: "HEVC", hevc: "HEVC", libx265: "HEVC",
+    av1: "AV1", libsvtav1: "AV1", "libaom-av1": "AV1",
+    vp9: "VP9", "libvpx-vp9": "VP9", vp8: "VP8", "libvpx": "VP8",
+    mpeg4: "MPEG-4",
+  };
+  return map[id] || id.toUpperCase();
+};
   switch (n.kind) {
     case "start":
       return "새 영상 발견";
@@ -102,6 +112,18 @@ function nodeTitle(n) {
       if (a.kind === "skip") return "건너뛰기";
       if (a.kind === "healthcheck") return "헬스체크";
       const t = a.target || {};
+      const chs = t.choices || [];
+      if (chs.length) {
+        const names = chs.map(
+          (c) => (c.videoCodec ? codec(c.videoCodec) : "?") + (c.accel ? "/" + c.accel : "")
+        );
+        const m0 = chs[0].mode ?? t.mode;
+        const prate =
+          m0 === "crf"
+            ? "CRF " + (chs[0].crf ?? t.crf ?? 23)
+            : (chs[0].bitratePct ?? t.bitratePct ?? 70) + "%";
+        return "인코딩 → " + names.join(" → ") + " · " + prate;
+      }
       const rate = t.mode === "crf" ? "CRF " + (t.crf ?? 23) : (t.bitratePct ?? 70) + "%";
       return "인코딩 → " + (t.videoCodec ? codec(t.videoCodec) : "폴더 기본") + " · " + rate;
     default:
@@ -240,6 +262,9 @@ export default function App() {
   // logic automation — ComfyUI-style node graph (start → condition ✓/✗ → action)
   const [graph, setGraph] = useState({ nodes: [], edges: [] });
   const [blockMsg, setBlockMsg] = useState("");
+  // Which scope the canvas is editing: "global" or a registered folder id.
+  const [logicScope, setLogicScope] = useState("global");
+  const logicScopeRef = useRef("global");
 
   // jobs
   const [jobs, setJobs] = useState([]);
@@ -558,7 +583,34 @@ export default function App() {
   const commitGraph = (g) => {
     setGraph(g);
     graphRef.current = g;
-    api.blocksPost({ graph: g }).catch((err) => flashBlock(err.message));
+    const scope = logicScopeRef.current;
+    const post =
+      scope === "global"
+        ? api.blocksPost({ graph: g })
+        : api.folderBlocksPost(scope, { graph: g });
+    post.catch((err) => flashBlock(err.message));
+  };
+  // Switch the canvas to a folder's own graph (or back to the global one).
+  const switchScope = (scope) => {
+    logicScopeRef.current = scope;
+    setLogicScope(scope);
+    const load = scope === "global" ? api.blocksGet() : api.folderBlocksGet(scope);
+    load
+      .then((d) => {
+        let g =
+          d.graph && d.graph.nodes?.length
+            ? d.graph
+            : migrateBlocksToGraph(d.blocks || []);
+        if (!g.nodes.some((n) => n.kind === "start")) {
+          g = {
+            nodes: [{ id: "start", kind: "start", enabled: true, x: 40, y: 160 }, ...g.nodes],
+            edges: g.edges,
+          };
+        }
+        setGraph(g);
+        graphRef.current = g;
+      })
+      .catch(() => {});
   };
   const patchNode = (id, patch) => {
     const g = graphRef.current;
@@ -577,6 +629,55 @@ export default function App() {
     patchNode(id, {
       action: { ...(n?.action || {}), target: { ...(n?.action?.target || {}), ...patch } },
     });
+  };
+  // ── encoder-preference list (choices) on an encode node ──────────
+  const patchChoice = (id, idx, patch) => {
+    const n = graphRef.current.nodes.find((n) => n.id === id);
+    const cur = n?.action?.target?.choices || [];
+    patchActTarget(id, { choices: cur.map((c, i) => (i === idx ? { ...c, ...patch } : c)) });
+  };
+  const patchChoiceAdd = (id) => {
+    const n = graphRef.current.nodes.find((n) => n.id === id);
+    const t = n?.action?.target || {};
+    const cur = t.choices || [];
+    const last = cur[cur.length - 1] || {};
+    patchActTarget(id, {
+      choices: [
+        ...cur,
+        {
+          videoCodec: last.videoCodec || "h265",
+          accel: null,
+          mode: last.mode || t.mode || "pct",
+          crf: last.crf ?? t.crf,
+          bitratePct: last.bitratePct ?? t.bitratePct,
+        },
+      ],
+    });
+  };
+  const patchChoiceDel = (id, idx) => {
+    const n = graphRef.current.nodes.find((n) => n.id === id);
+    const cur = n?.action?.target?.choices || [];
+    patchActTarget(id, { choices: cur.filter((_, i) => i !== idx) });
+  };
+  const enablePriority = (id) => {
+    const n = graphRef.current.nodes.find((n) => n.id === id);
+    const t = n?.action?.target || {};
+    patchActTarget(id, {
+      choices: [
+        {
+          videoCodec: t.videoCodec || "h265",
+          accel: null,
+          mode: t.mode || "pct",
+          crf: t.crf,
+          bitratePct: t.bitratePct,
+        },
+      ],
+    });
+  };
+  const patchAllChoiceRate = (id, patch) => {
+    const n = graphRef.current.nodes.find((n) => n.id === id);
+    const cur = n?.action?.target?.choices || [];
+    patchActTarget(id, { choices: cur.map((c) => ({ ...c, ...patch })) });
   };
   const addNode = (kind, preset = {}) => {
     const g = graphRef.current;
@@ -1507,6 +1608,17 @@ export default function App() {
               직렬은 AND, 나란히는 OR. 어떤 액션에도 못 가면 폴더 기본 설정을 씁니다.
             </div>
             <div className="gtoolbar">
+              <label className="scopesel">
+                대상
+                <select value={logicScope} onChange={(e) => switchScope(e.target.value)}>
+                  <option value="global">전체 (모든 폴더)</option>
+                  {folders.map((f) => (
+                    <option key={f.id} value={f.id}>
+                      폴더: {(f.path || "").split("/").filter(Boolean).pop() || f.id}
+                    </option>
+                  ))}
+                </select>
+              </label>
               <span className="meta dim">
                 노드: 헤더로 드래그 · 제목 더블클릭 = 이름 변경 · 와이어 클릭 = 끊기 ·
                 캔버스 드래그 = 이동 · 휠 = 확대/축소
@@ -1611,6 +1723,10 @@ export default function App() {
                     const isCond = n.kind === "condition";
                     const isAct = n.kind === "action";
                     const mode = n.action?.target?.mode || "pct";
+                    const ch = n.action?.target?.choices || [];
+                    const atgt = n.action?.target || {};
+                    // choice-level rate wins; fall back to the target's rate
+                    const pMode = ch[0]?.mode || atgt.mode || "pct";
                     return (
                       <div
                         key={n.id}
@@ -1782,82 +1898,207 @@ export default function App() {
                                 <option value="healthcheck">헬스체크 (노드 온라인 시만)</option>
                                 <option value="skip">건너뛰기</option>
                               </select>
-                              {n.action?.kind === "encode" && (
-                                <>
-                                  <label>
-                                    비디오
-                                    <select
-                                      value={n.action?.target?.videoCodec || ""}
-                                      onChange={(e) =>
-                                        patchActTarget(n.id, {
-                                          videoCodec: e.target.value || null,
-                                        })
-                                      }
-                                    >
-                                      <option value="">폴더 기본</option>
-                                      {(codecs?.videoCodecs || [])
-                                        .filter((c) => c.id !== "copy")
-                                        .map((c) => (
-                                          <option key={c.id} value={c.id}>
-                                            {c.label}
-                                          </option>
-                                        ))}
-                                    </select>
-                                  </label>
-                                  <label>
-                                    오디오
-                                    <select
-                                      value={n.action?.target?.audioCodec || ""}
-                                      onChange={(e) =>
-                                        patchActTarget(n.id, {
-                                          audioCodec: e.target.value || null,
-                                        })
-                                      }
-                                    >
-                                      <option value="">원본 유지</option>
-                                      <option value="aac">AAC</option>
-                                      <option value="opus">Opus</option>
-                                    </select>
-                                  </label>
-                                  <div className="rateval">
-                                    <div className="ratemode">
+                              {n.action?.kind === "encode" &&
+                                (ch.length ? (
+                                  <>
+                                    <div className="gprio-head">
+                                      <span>인코더 우선순위 (노드 능력 자동)</span>
                                       <button
                                         type="button"
-                                        className={`rm-opt ${mode === "crf" ? "on" : ""}`}
-                                        onClick={() => patchActTarget(n.id, { mode: "crf" })}
+                                        className="gprio-mini"
+                                        title="단일 코덱으로"
+                                        onClick={() =>
+                                          patchActTarget(n.id, {
+                                            videoCodec: ch[0]?.videoCodec || null,
+                                            mode: ch[0]?.mode || "pct",
+                                            crf: ch[0]?.crf,
+                                            bitratePct: ch[0]?.bitratePct,
+                                            choices: [],
+                                          })
+                                        }
                                       >
-                                        CRF
-                                      </button>
-                                      <button
-                                        type="button"
-                                        className={`rm-opt ${mode !== "crf" ? "on" : ""}`}
-                                        onClick={() => patchActTarget(n.id, { mode: "pct" })}
-                                      >
-                                        %
+                                        단일
                                       </button>
                                     </div>
-                                    <input
-                                      type="number"
-                                      className="num"
-                                      min={mode === "crf" ? 0 : 10}
-                                      max={mode === "crf" ? 51 : 100}
-                                      value={
-                                        mode === "crf"
-                                          ? n.action?.target?.crf ?? 23
-                                          : n.action?.target?.bitratePct ?? 70
-                                      }
-                                      onChange={(e) =>
-                                        patchActTarget(
-                                          n.id,
+                                    {ch.map((c, i) => (
+                                      <div className="gchoice" key={i}>
+                                        <span className="gprio-idx">{i + 1}</span>
+                                        <select
+                                          value={c.videoCodec || ""}
+                                          onChange={(e) =>
+                                            patchChoice(n.id, i, {
+                                              videoCodec: e.target.value || null,
+                                            })
+                                          }
+                                        >
+                                          <option value="">코덱</option>
+                                          {(codecs?.videoCodecs || [])
+                                            .filter((c2) => c2.id !== "copy")
+                                            .map((c2) => (
+                                              <option key={c2.id} value={c2.id}>
+                                                {c2.label}
+                                              </option>
+                                            ))}
+                                        </select>
+                                        <select
+                                          value={c.accel || ""}
+                                          onChange={(e) =>
+                                            patchChoice(n.id, i, {
+                                              accel: e.target.value || null,
+                                            })
+                                          }
+                                        >
+                                          <option value="">HW: 어떤 것</option>
+                                          <option value="gpu">GPU</option>
+                                          <option value="cpu">iGPU</option>
+                                          <option value="nvenc">NVENC</option>
+                                          <option value="videotoolbox">VideoToolbox</option>
+                                          <option value="vaapi">VA-API</option>
+                                          <option value="qsv">QuickSync</option>
+                                          <option value="amf">AMF</option>
+                                        </select>
+                                        <button
+                                          type="button"
+                                          className="gprio-del"
+                                          title="선택 삭제"
+                                          onClick={() => patchChoiceDel(n.id, i)}
+                                        >
+                                          ✕
+                                        </button>
+                                      </div>
+                                    ))}
+                                    <div className="rateval">
+                                      <div className="ratemode">
+                                        <button
+                                          type="button"
+                                          className={`rm-opt ${pMode === "crf" ? "on" : ""}`}
+                                          onClick={() =>
+                                            patchAllChoiceRate(n.id, { mode: "crf" })
+                                          }
+                                        >
+                                          CRF
+                                        </button>
+                                        <button
+                                          type="button"
+                                          className={`rm-opt ${pMode !== "crf" ? "on" : ""}`}
+                                          onClick={() =>
+                                            patchAllChoiceRate(n.id, { mode: "pct" })
+                                          }
+                                        >
+                                          %
+                                        </button>
+                                      </div>
+                                      <input
+                                        type="number"
+                                        className="num"
+                                        min={pMode === "crf" ? 0 : 10}
+                                        max={pMode === "crf" ? 51 : 100}
+                                        value={
+                                          pMode === "crf"
+                                            ? ch[0]?.crf ?? atgt.crf ?? 23
+                                            : ch[0]?.bitratePct ?? atgt.bitratePct ?? 70
+                                        }
+                                        onChange={(e) =>
+                                          patchAllChoiceRate(
+                                            n.id,
+                                            pMode === "crf"
+                                              ? { crf: Number(e.target.value) }
+                                              : { bitratePct: Number(e.target.value) }
+                                          )
+                                        }
+                                      />
+                                    </div>
+                                    <button
+                                      type="button"
+                                      className="gprio-add"
+                                      onClick={() => patchChoiceAdd(n.id)}
+                                    >
+                                      + 인코더 추가 (fallback)
+                                    </button>
+                                  </>
+                                ) : (
+                                  <>
+                                    <label>
+                                      비디오
+                                      <select
+                                        value={n.action?.target?.videoCodec || ""}
+                                        onChange={(e) =>
+                                          patchActTarget(n.id, {
+                                            videoCodec: e.target.value || null,
+                                          })
+                                        }
+                                      >
+                                        <option value="">폴더 기본</option>
+                                        {(codecs?.videoCodecs || [])
+                                          .filter((c) => c.id !== "copy")
+                                          .map((c) => (
+                                            <option key={c.id} value={c.id}>
+                                              {c.label}
+                                            </option>
+                                          ))}
+                                      </select>
+                                    </label>
+                                    <label>
+                                      오디오
+                                      <select
+                                        value={n.action?.target?.audioCodec || ""}
+                                        onChange={(e) =>
+                                          patchActTarget(n.id, {
+                                            audioCodec: e.target.value || null,
+                                          })
+                                        }
+                                      >
+                                        <option value="">원본 유지</option>
+                                        <option value="aac">AAC</option>
+                                        <option value="opus">Opus</option>
+                                      </select>
+                                    </label>
+                                    <div className="rateval">
+                                      <div className="ratemode">
+                                        <button
+                                          type="button"
+                                          className={`rm-opt ${mode === "crf" ? "on" : ""}`}
+                                          onClick={() => patchActTarget(n.id, { mode: "crf" })}
+                                        >
+                                          CRF
+                                        </button>
+                                        <button
+                                          type="button"
+                                          className={`rm-opt ${mode !== "crf" ? "on" : ""}`}
+                                          onClick={() => patchActTarget(n.id, { mode: "pct" })}
+                                        >
+                                          %
+                                        </button>
+                                      </div>
+                                      <input
+                                        type="number"
+                                        className="num"
+                                        min={mode === "crf" ? 0 : 10}
+                                        max={mode === "crf" ? 51 : 100}
+                                        value={
                                           mode === "crf"
-                                            ? { crf: Number(e.target.value) }
-                                            : { bitratePct: Number(e.target.value) }
-                                        )
-                                      }
-                                    />
-                                  </div>
-                                </>
-                              )}
+                                            ? n.action?.target?.crf ?? 23
+                                            : n.action?.target?.bitratePct ?? 70
+                                        }
+                                        onChange={(e) =>
+                                          patchActTarget(
+                                            n.id,
+                                            mode === "crf"
+                                              ? { crf: Number(e.target.value) }
+                                              : { bitratePct: Number(e.target.value) }
+                                          )
+                                        }
+                                      />
+                                    </div>
+                                    <button
+                                      type="button"
+                                      className="gprio-add"
+                                      onClick={() => enablePriority(n.id)}
+                                    >
+                                      ↕ 인코더 우선순위 목록
+                                    </button>
+                                  </>
+                                ))}
                             </>
                           )}
                         </div>

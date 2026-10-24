@@ -1221,6 +1221,90 @@ button:disabled {
 .gbody .rateval { display: flex; align-items: center; gap: 8px; }
 .gbody .rateval .ratemode { flex: 1; }
 .gbody .rateval input.num { width: 62px; flex: 0 0 auto; }
+/* encoder-preference list on an encode node */
+.gbody .gprio-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 6px;
+  font-size: 11px;
+  color: var(--muted-foreground);
+}
+.gbody .gprio-mini {
+  font-size: 10px;
+  padding: 1px 6px;
+  border: 1px solid var(--border);
+  border-radius: 5px;
+  background: transparent;
+  color: var(--muted-foreground);
+  cursor: pointer;
+  flex: 0 0 auto;
+}
+.gbody .gprio-mini:hover { color: var(--text); border-color: var(--accent); }
+.gbody .gchoice {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+.gbody .gchoice select {
+  width: auto;
+  flex: 1;
+  min-width: 0;
+  font-size: 11px;
+  padding: 2px 3px;
+}
+.gbody .gprio-idx {
+  flex: 0 0 auto;
+  width: 15px;
+  height: 15px;
+  border-radius: 50%;
+  background: var(--accent);
+  color: #fff;
+  font-size: 10px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+.gbody .gprio-del {
+  flex: 0 0 auto;
+  width: 18px;
+  height: 18px;
+  border: none;
+  border-radius: 5px;
+  background: transparent;
+  color: var(--muted-foreground);
+  cursor: pointer;
+  font-size: 11px;
+  line-height: 1;
+}
+.gbody .gprio-del:hover { background: rgba(255, 80, 80, 0.18); color: #ff9c9c; }
+.gbody .gprio-add {
+  font-size: 11px;
+  padding: 3px 8px;
+  border: 1px dashed var(--border);
+  border-radius: 6px;
+  background: transparent;
+  color: var(--muted-foreground);
+  cursor: pointer;
+}
+.gbody .gprio-add:hover { color: var(--text); border-color: var(--accent); }
+/* logic toolbar: scope (global vs folder) selector */
+.scopesel {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12px;
+  color: var(--muted-foreground);
+  flex: 0 0 auto;
+}
+.scopesel select {
+  font-size: 12px;
+  padding: 3px 8px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: #10141b;
+  color: var(--text);
+}
 .gsock {
   position: absolute;
   width: 12px;
