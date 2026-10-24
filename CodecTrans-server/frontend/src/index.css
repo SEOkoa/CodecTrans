@@ -1724,3 +1724,36 @@ button:disabled {
   font-weight: 600;
   white-space: nowrap;
 }
+
+/* API-token entry banner (shown when the server requires CT_API_TOKEN) */
+.authbar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 12px;
+  margin: 8px 16px 0;
+  border: 1px solid #b45309;
+  border-radius: 8px;
+  background: rgba(180, 83, 9, 0.12);
+  font-size: 13px;
+}
+.authbar input {
+  flex: 0 1 260px;
+  padding: 5px 8px;
+  border-radius: 6px;
+  border: 1px solid #8a5a17;
+  background: transparent;
+  color: inherit;
+}
+.authbar button {
+  padding: 5px 12px;
+  border-radius: 6px;
+  border: 1px solid #8a5a17;
+  background: #b45309;
+  color: #fff;
+  cursor: pointer;
+}
+.authbar button.ghost {
+  background: transparent;
+  color: inherit;
+}

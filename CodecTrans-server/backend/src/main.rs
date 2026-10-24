@@ -42,6 +42,9 @@ use tokio::io::AsyncWriteExt;
 use tokio::process::Command;
 use tower_http::services::ServeDir;
 use tower_http::cors::CorsLayer;
+use axum::middleware::Next;
+use axum::extract::Request;
+use axum::http::header;
 
 // ============================================================
 //  Paths / config
@@ -200,6 +203,10 @@ pub struct Node {
     pub hw_encoders: Vec<String>,
     /// Grouped per physical device (GPU #0 nvenc, CPU #0 qsv/vaapi, ...).
     pub accels: Vec<Accel>,
+    /// Startup diagnostics from the node (probe failure reasons, driver
+    /// state) — how headless/container nodes get debugged.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub diag: Vec<String>,
     /// Worker-resource selection (dashboard gear): which accel backends this
     /// node may be used for (e.g. disable the Intel iGPU because its encodes
     /// contend with the dGPU for CPU). `None` (key absent = never configured)
@@ -448,6 +455,7 @@ fn hash_get<'a>(h: &'a NodeHash, k: &str) -> Option<&'a str> {
 fn parse_node(id: &str, h: &NodeHash, online: bool) -> Option<Node> {
     let name = hash_get(h, "name")?.to_string();
     let mut accels: Vec<Accel> = serde_json::from_str(hash_get(h, "accels").unwrap_or("[]")).unwrap_or_default();
+    let diag: Vec<String> = serde_json::from_str(hash_get(h, "diag").unwrap_or("[]")).unwrap_or_default();
     let hw_encoders: Vec<String> = serde_json::from_str(hash_get(h, "hwEncoders").unwrap_or("[]")).unwrap_or_default();
     let haccels: Vec<String> = serde_json::from_str(hash_get(h, "haccels").unwrap_or("[]")).unwrap_or_default();
     let enabled_backends: Option<Vec<String>> = hash_get(h, "enabledBackends")
@@ -469,6 +477,7 @@ fn parse_node(id: &str, h: &NodeHash, online: bool) -> Option<Node> {
         hw_encoders,
         haccels,
         accels,
+        diag,
         enabled_backends,
         allow_software,
         max_jobs,
@@ -511,6 +520,7 @@ async fn reg_node(
     haccels: &[String],
     hw_encoders: &[String],
     accels: &[Accel],
+    diag: &[String],
 ) -> Node {
     let mut c = c;
     let now = now_ms();
@@ -542,6 +552,7 @@ async fn reg_node(
         .arg("haccels").arg(serde_json::to_string(haccels).unwrap_or_else(|_| "[]".into()))
         .arg("hwEncoders").arg(serde_json::to_string(hw_encoders).unwrap_or_else(|_| "[]".into()))
         .arg("accels").arg(serde_json::to_string(accels).unwrap_or_else(|_| "[]".into()))
+        .arg("diag").arg(serde_json::to_string(diag).unwrap_or_else(|_| "[]".into()))
         .arg("firstSeen").arg(first_seen)
         .arg("lastHeartbeat").arg(now);
     if is_new {
@@ -557,6 +568,7 @@ async fn reg_node(
         hw_encoders: hw_encoders.to_vec(),
         haccels: haccels.to_vec(),
         accels: accels.to_vec(),
+        diag: diag.to_vec(),
         enabled_backends: None,
         allow_software: true,
         max_jobs: 1,
@@ -1328,7 +1340,7 @@ fn read_mem() -> Option<(u64, u64)> {
 
 /// GET /api/server-stats — CPU% (sampled over ~250 ms) + RAM totals for the
 /// dashboard. Non-Linux hosts report nulls rather than failing.
-pub async fn server_stats() -> impl IntoResponse {
+async fn server_stats() -> impl IntoResponse {
     let (cpu_pct, cores) = {
         let cores = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1);
         let a = read_cpu_times();
@@ -1846,7 +1858,7 @@ struct BlocksBody {
 
 /// GET /api/library/blocks — returns the legacy list AND the node graph
 /// (auto-migrated from the legacy list when no graph is stored yet).
-pub async fn blocks_get(State(_store): State<Store>) -> impl IntoResponse {
+async fn blocks_get(State(_store): State<Store>) -> impl IntoResponse {
     let c = load_lib_cfg();
     let graph = if c.graph.nodes.is_empty() && !c.blocks.is_empty() {
         migrate_blocks_to_graph(&c.blocks)
@@ -1858,7 +1870,7 @@ pub async fn blocks_get(State(_store): State<Store>) -> impl IntoResponse {
 
 /// POST /api/library/blocks — save the block list and/or the node graph.
 /// A saved non-empty graph takes precedence at evaluation time.
-pub async fn blocks_post(State(_store): State<Store>, Json(b): Json<BlocksBody>) -> Response {
+async fn blocks_post(State(_store): State<Store>, Json(b): Json<BlocksBody>) -> Response {
     let _g = LIB_CFG_LOCK.lock().unwrap_or_else(|p| p.into_inner());
     let mut c = load_lib_cfg();
     if let Some(blocks) = b.blocks.clone() {
@@ -1875,7 +1887,7 @@ pub async fn blocks_post(State(_store): State<Store>, Json(b): Json<BlocksBody>)
 
 /// GET /api/library/folders/:id/blocks — the per-folder node graph (empty =
 /// inherit the global library graph).
-pub async fn folder_blocks_get(
+async fn folder_blocks_get(
     State(_store): State<Store>,
     UrlPath(id): UrlPath<String>,
 ) -> Response {
@@ -1889,7 +1901,7 @@ pub async fn folder_blocks_get(
 
 /// POST /api/library/folders/:id/blocks — save a folder's own node graph.
 /// An empty graph clears the override (the folder inherits the global graph).
-pub async fn folder_blocks_post(
+async fn folder_blocks_post(
     State(_store): State<Store>,
     UrlPath(id): UrlPath<String>,
     Json(b): Json<BlocksBody>,
@@ -1917,14 +1929,14 @@ pub async fn folder_blocks_post(
 }
 
 /// GET /api/library/folders
-pub async fn folders_get(State(_store): State<Store>) -> impl IntoResponse {
+async fn folders_get(State(_store): State<Store>) -> impl IntoResponse {
     Json(json!({ "folders": load_lib_cfg().folders }))
 }
 
 // ── saved named logics (assigned per folder from the library tab) ──
 
 /// GET /api/logic — the saved logic list.
-pub async fn logics_get(State(_store): State<Store>) -> impl IntoResponse {
+async fn logics_get(State(_store): State<Store>) -> impl IntoResponse {
     Json(json!({ "logics": load_lib_cfg().logics }))
 }
 
@@ -1939,7 +1951,7 @@ struct LogicBody {
 }
 
 /// POST /api/logic — create (no id) or update (with id) a named logic.
-pub async fn logics_post(State(_store): State<Store>, Json(b): Json<LogicBody>) -> Response {
+async fn logics_post(State(_store): State<Store>, Json(b): Json<LogicBody>) -> Response {
     let _g = LIB_CFG_LOCK.lock().unwrap_or_else(|p| p.into_inner());
     let mut c = load_lib_cfg();
     let name = b.name.trim();
@@ -1968,7 +1980,7 @@ pub async fn logics_post(State(_store): State<Store>, Json(b): Json<LogicBody>) 
 
 /// DELETE /api/logic/:id — remove a named logic. Folders still referencing it
 /// fall back to their bulk target (a dangling id is harmless at scan time).
-pub async fn logic_delete(State(_store): State<Store>, UrlPath(id): UrlPath<String>) -> Response {
+async fn logic_delete(State(_store): State<Store>, UrlPath(id): UrlPath<String>) -> Response {
     let _g = LIB_CFG_LOCK.lock().unwrap_or_else(|p| p.into_inner());
     let mut c = load_lib_cfg();
     let before = c.logics.len();
@@ -1985,7 +1997,7 @@ pub async fn logic_delete(State(_store): State<Store>, UrlPath(id): UrlPath<Stri
 /// POST /api/library/folders — save the folder list. Catalog entries of
 /// removed folders are KEPT (marked "제거됨" in the UI) so re-adding the
 /// folder restores their done state instead of re-queueing everything.
-pub async fn folders_post(State(store): State<Store>, Json(mut b): Json<FoldersBody>) -> Response {
+async fn folders_post(State(store): State<Store>, Json(mut b): Json<FoldersBody>) -> Response {
     let _g = LIB_CFG_LOCK.lock().unwrap_or_else(|p| p.into_inner());
     let mut c = load_lib_cfg();
     // Preserve per-folder graphs: the frontend's folder list is loaded at tab
@@ -2017,7 +2029,7 @@ struct RequeueReq {
 
 /// POST /api/library/requeue — reset a catalog entry to "pending" so the
 /// next scan re-queues it (the per-file ⟳ re-encode button).
-pub async fn library_requeue(State(store): State<Store>, Json(req): Json<RequeueReq>) -> Response {
+async fn library_requeue(State(store): State<Store>, Json(req): Json<RequeueReq>) -> Response {
     let found = {
         let mut s = store.lock().unwrap();
         s.update_library_entry(&req.key, |e| {
@@ -2041,11 +2053,11 @@ pub async fn library_requeue(State(store): State<Store>, Json(req): Json<Requeue
     Json(json!({ "ok": true })).into_response()
 }
 
-pub async fn auto_get(State(_store): State<Store>) -> impl IntoResponse {
+async fn auto_get(State(_store): State<Store>) -> impl IntoResponse {
     Json(load_auto())
 }
 
-pub async fn auto_post(State(_store): State<Store>, Json(c): Json<AutoConfig>) -> Response {
+async fn auto_post(State(_store): State<Store>, Json(c): Json<AutoConfig>) -> Response {
     match save_auto(&c) {
         Ok(_) => Json(json!({"ok": true, "auto": c})).into_response(),
         Err(e) => (
@@ -2421,6 +2433,20 @@ async fn dispatch_lib_job(
     if resolve_lib_source(&key, store).is_none() {
         return Ok(false);
     }
+    // Duplicate guard: a queued/running job for this exact source means the
+    // encode is already in flight (requeue fired while the first run is
+    // active, two scans raced, ...). Queueing a second job would write the
+    // same deterministic output path twice and muddle results — treat it as
+    // "busy" so the entry stays pending and a later rescan retries it.
+    if store
+        .lock()
+        .unwrap()
+        .list()
+        .iter()
+        .any(|j| j.input_file == key && (j.status == "queued" || j.status == "running"))
+    {
+        return Ok(false);
+    }
     // Resolve (node, concrete encoder, effective target params).
     // Encoder-preference list -> capability-based least-busy node; single
     // codec -> legacy first-node-with-that-family.
@@ -2510,11 +2536,14 @@ async fn dispatch_lib_job(
         .clone()
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| "aac".into());
-    let container = eff
-        .container
-        .clone()
-        .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| "mp4".into());
+    let container = safe_container(
+        eff
+            .container
+            .clone()
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| "mp4".into())
+            .as_str(),
+    );
     let out_name = format!(
         "{}_{}_{}.{}",
         safe_base(&e.path),
@@ -2749,7 +2778,7 @@ fn eval_graph(
 //  Handlers
 // ============================================================
 
-pub async fn health() -> impl IntoResponse {
+async fn health() -> impl IntoResponse {
     Json(json!({
         "status": "ok",
         "service": "codectrans",
@@ -2762,7 +2791,7 @@ pub async fn health() -> impl IntoResponse {
     }))
 }
 
-pub async fn codecs() -> impl IntoResponse {
+async fn codecs() -> impl IntoResponse {
     // filter video codecs to those actually present in this ffmpeg build
     let catalog = codec_catalog();
     let mut vc = vec![];
@@ -2784,7 +2813,7 @@ pub async fn codecs() -> impl IntoResponse {
 /// POST /api/upload  (multipart field "file") -> {file, size}
 /// Streams the field to disk in chunks — never buffers the whole file in RAM,
 /// so multi-GB uploads don't OOM the server.
-pub async fn upload(mut mp: Multipart) -> Response {
+async fn upload(mut mp: Multipart) -> Response {
     let mut saved: Option<(String, u64)> = None;
     while let Ok(Some(field)) = mp.next_field().await {
         let name = field.file_name().unwrap_or("upload.bin").to_string();
@@ -2836,7 +2865,7 @@ pub async fn upload(mut mp: Multipart) -> Response {
 /// GET /api/media/analyze?file=<name> — full ffprobe analysis of an uploaded
 /// file (bitrate, codecs, resolution, fps, audio layout). Filename is
 /// base-name only; anything with a path is rejected.
-pub async fn media_analyze(Query(query): Query<HashMap<String, String>>) -> Response {
+async fn media_analyze(Query(query): Query<HashMap<String, String>>) -> Response {
     let Some(name) = query.get("file").cloned() else {
         return (StatusCode::BAD_REQUEST, Json(json!({"error": "missing ?file="}))).into_response();
     };
@@ -2863,7 +2892,7 @@ struct ScanReq {
 }
 
 /// GET /api/library -> {root, count, entries}
-pub async fn library_get(State(store): State<Store>) -> Response {
+async fn library_get(State(store): State<Store>) -> Response {
     let s = store.lock().unwrap();
     let root = s.storage_root().to_string();
     let entries = s.list_library();
@@ -2880,7 +2909,7 @@ struct FsQuery {
 /// must exist and be a directory. Returns parent (for the breadcrumb/up
 /// button) + entries sorted dirs-first (files: video flag + size for the
 /// tree's "this looks like a video" hint).
-pub async fn fs_children(Query(q): Query<FsQuery>) -> Response {
+async fn fs_children(Query(q): Query<FsQuery>) -> Response {
     let raw = q.path.as_deref().unwrap_or("/");
     let p = PathBuf::from(raw);
     if !p.is_absolute() {
@@ -2961,7 +2990,7 @@ fn sub_str_of(p: &std::path::Path) -> String {
 /// ffprobing each video (non-destructive: entries of folders not scanned
 /// this time are kept) and auto-queues newly found files per the saved
 /// automation (logic blocks first, then the folder's default target).
-pub async fn library_scan(State(store): State<Store>, Json(req): Json<ScanReq>) -> Response {
+async fn library_scan(State(store): State<Store>, Json(req): Json<ScanReq>) -> Response {
     // Resolve roots: an explicit {root} wins (ad-hoc, no folder id);
     // otherwise all enabled registered folders.
     let libcfg = load_lib_cfg();
@@ -3280,11 +3309,104 @@ fn safe_base(name: &str) -> String {
     }
 }
 
+/// Containers allowed in output filenames and ffmpeg `-f` values. Anything
+/// else (a typo, a path-like value, an empty string) falls back to mp4 so a
+/// user-supplied `container` can never smuggle separators into a path.
+fn safe_container(c: &str) -> String {
+    let c = c.trim().to_ascii_lowercase();
+    match c.as_str() {
+        "mp4" | "mkv" | "webm" | "mov" | "m4v" | "avi" | "ts" | "m4a" | "mp3" | "flac" | "ogg" | "wav" => c,
+        _ => "mp4".to_string(),
+    }
+}
+
+/// A node-supplied file name is only accepted if it can't escape the roots
+/// it is joined against: no traversal segments, no absolute paths.
+fn bad_filename(name: &str) -> bool {
+    name.is_empty() || name.contains("..") || name.starts_with('/')
+}
+
+/// Constant-time byte comparison (token check — no timing oracle).
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut x = 0u8;
+    for (p, q) in a.iter().zip(b.iter()) {
+        x |= p ^ q;
+    }
+    x == 0
+}
+
+/// Optional API auth. When `CT_API_TOKEN` is set, every /api request except
+/// /api/health must send `Authorization: Bearer <token>`. Unset = open
+/// (local/trusted use); the startup banner warns about that. The layer is
+/// applied to all routes (axum 0.7 has no per-path route_layer), so
+/// non-/api paths (static frontend) pass straight through.
+async fn api_auth(req: Request, next: Next) -> Response {
+    let path = req.uri().path().to_string();
+    if !path.starts_with("/api") || path == "/api/health" {
+        return next.run(req).await;
+    }
+    let token = std::env::var("CT_API_TOKEN").ok().filter(|s| !s.is_empty());
+    if let Some(tok) = &token {
+        let ok = req
+            .headers()
+            .get(header::AUTHORIZATION)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|h| h.strip_prefix("Bearer "))
+            .map(|h| constant_time_eq(h.as_bytes(), tok.as_bytes()))
+            .unwrap_or(false);
+        if !ok {
+            return (
+                StatusCode::UNAUTHORIZED,
+                Json(json!({ "error": "unauthorized" })),
+            )
+                .into_response();
+        }
+    }
+    next.run(req).await
+}
+
+/// CORS config: same-origin only by default (the UI ships from this server,
+/// so no browser ever needs cross-origin access). CT_CORS_ORIGINS is a
+/// comma-separated allow-list for third-party browser frontends.
+fn cors_layer() -> CorsLayer {
+    match std::env::var("CT_CORS_ORIGINS").ok().filter(|s| !s.is_empty()) {
+        Some(list) => {
+            let origins: Vec<axum::http::HeaderValue> = list
+                .split(',')
+                .map(|o| o.trim().to_string())
+                .filter(|o| !o.is_empty())
+                .filter_map(|o| o.parse().ok())
+                .collect();
+            CorsLayer::new()
+                .allow_origin(origins)
+                .allow_methods(vec![
+                    axum::http::Method::GET,
+                    axum::http::Method::POST,
+                    axum::http::Method::PATCH,
+                    axum::http::Method::DELETE,
+                    axum::http::Method::PUT,
+                    axum::http::Method::OPTIONS,
+                ])
+                .allow_headers(vec![
+                    axum::http::header::CONTENT_TYPE,
+                    axum::http::header::AUTHORIZATION,
+                ])
+        }
+        None => CorsLayer::new(),
+    }
+}
+
 /// POST /api/transcode -> {id}
-pub async fn transcode(State(store): State<Store>, Json(req): Json<TranscodeReq>) -> Response {
-    // input must exist
+async fn transcode(State(store): State<Store>, Json(req): Json<TranscodeReq>) -> Response {
+    // input must exist (and must be a plain name inside uploads/ — no traversal)
+    if bad_filename(&req.file) {
+        return (StatusCode::BAD_REQUEST, Json(json!({"error": "bad filename"}))).into_response();
+    }
     if !uploads_dir().join(&req.file).exists() {
-        return (StatusCode::NOT_FOUND, Json(json!({"error": format!("input file not found: {}", req.file)}))).into_response();
+        return (StatusCode::NOT_FOUND, Json(json!({"error": format!("input file not found: {} (must be uploaded via /api/upload first)", req.file)}))).into_response();
     }
     // Resolve a logical name (h264/h265/vp9/...) to a concrete encoder. On the
     // server path there's no HW list, so this maps logical -> canonical software
@@ -3292,7 +3414,7 @@ pub async fn transcode(State(store): State<Store>, Json(req): Json<TranscodeReq>
     let requested_vcodec = req.video_codec.unwrap_or_else(|| "libx264".into());
     let (vcodec, _hw) = resolve_video_codec(&requested_vcodec, &[]);
     let acodec = req.audio_codec.unwrap_or_else(|| "aac".into());
-    let container = req.container.unwrap_or_else(|| "mp4".into());
+    let container = safe_container(&req.container.unwrap_or_else(|| "mp4".into()));
 
     let out_name = format!("{}_{}_{}.{}", safe_base(&req.file), vcodec.replace("lib", "").replace('-', "_"), container, container);
     let id = uuid::Uuid::new_v4().to_string();
@@ -3337,7 +3459,7 @@ pub async fn transcode(State(store): State<Store>, Json(req): Json<TranscodeReq>
     Json(json!({"id": id})).into_response()
 }
 
-pub async fn list_jobs(State(store): State<Store>) -> impl IntoResponse {
+async fn list_jobs(State(store): State<Store>) -> impl IntoResponse {
     let v: Vec<Value> = store
         .lock()
         .unwrap()
@@ -3349,7 +3471,7 @@ pub async fn list_jobs(State(store): State<Store>) -> impl IntoResponse {
     Json(Value::Array(v))
 }
 
-pub async fn get_job(State(store): State<Store>, UrlPath(id): UrlPath<String>) -> Response {
+async fn get_job(State(store): State<Store>, UrlPath(id): UrlPath<String>) -> Response {
     match store.lock().unwrap().get(&id) {
         Some(j) => match serde_json::to_value(j) {
             Ok(v) => Json(v).into_response(),
@@ -3359,7 +3481,7 @@ pub async fn get_job(State(store): State<Store>, UrlPath(id): UrlPath<String>) -
     }
 }
 
-pub async fn download(UrlPath(name): UrlPath<String>) -> Response {
+async fn download(UrlPath(name): UrlPath<String>) -> Response {
     // only serve from outputs/, block path traversal
     if name.contains("..") || name.contains('/') || name.contains('\\') {
         return (StatusCode::BAD_REQUEST, Json(json!({"error": "bad filename"}))).into_response();
@@ -3395,18 +3517,22 @@ struct RegisterReq {
     hw_encoders: Option<Vec<String>>,
     #[serde(default)]
     accels: Option<Vec<Accel>>,
+    /// Startup diagnostics (probe failures, driver state) — headless nodes.
+    #[serde(default)]
+    diag: Option<Vec<String>>,
 }
 
 /// POST /api/nodes/register — a node announces itself with its ffmpeg capabilities.
 /// Idempotent by name: if a node with this name already exists, its capabilities
 /// and heartbeat are refreshed and the SAME id is returned (safe to re-register,
 /// e.g. after a server restart).
-pub async fn node_register(State(store): State<Store>, Json(req): Json<RegisterReq>) -> Response {
-    let (ffmpeg_version, haccels, hw_encoders, accels) = (
+async fn node_register(State(store): State<Store>, Json(req): Json<RegisterReq>) -> Response {
+    let (ffmpeg_version, haccels, hw_encoders, accels, diag) = (
         req.ffmpeg_version.unwrap_or_default(),
         req.haccels.unwrap_or_default(),
         req.hw_encoders.unwrap_or_default(),
         req.accels.unwrap_or_default(),
+        req.diag.unwrap_or_default(),
     );
     // idempotent re-register by name — the id is looked up in Redis, so a
     // node keeps its identity across server (and its own) restarts.
@@ -3417,13 +3543,13 @@ pub async fn node_register(State(store): State<Store>, Json(req): Json<RegisterR
         .await
         .ok()
         .flatten();
-    let node = reg_node(c, &req.name, &ffmpeg_version, &haccels, &hw_encoders, &accels).await;
+    let node = reg_node(c, &req.name, &ffmpeg_version, &haccels, &hw_encoders, &accels, &diag).await;
     Json(json!({"nodeId": node.id, "new": already.is_none()})).into_response()
 }
 
 /// POST /api/nodes/:id/heartbeat — liveness (+ optional live stats). The
 /// body is optional: older node binaries POST without one.
-pub async fn node_heartbeat(
+async fn node_heartbeat(
     State(store): State<Store>,
     UrlPath(id): UrlPath<String>,
     body: Option<Json<HeartbeatStats>>,
@@ -3457,7 +3583,7 @@ struct NodeConfigBody {
     pub max_jobs: Option<u32>,
 }
 
-pub async fn node_config_patch(
+async fn node_config_patch(
     State(store): State<Store>,
     UrlPath(id): UrlPath<String>,
     Json(body): Json<NodeConfigBody>,
@@ -3533,7 +3659,7 @@ struct NodeFilter {
     family: Option<String>,
 }
 
-pub async fn list_nodes(State(store): State<Store>, Query(f): Query<NodeFilter>) -> impl IntoResponse {
+async fn list_nodes(State(store): State<Store>, Query(f): Query<NodeFilter>) -> impl IntoResponse {
     let c = store.lock().unwrap().redis();
     let status = f.status.as_deref().unwrap_or("online");
     let v: Vec<Value> = list_nodes_redis(c, status, f.backend.as_deref(), f.family.as_deref())
@@ -3547,7 +3673,7 @@ pub async fn list_nodes(State(store): State<Store>, Query(f): Query<NodeFilter>)
 
 /// GET /api/nodes/discovered — nodes seen on the LAN via mDNS (may not be
 /// registered yet). Each carries its name, ip, port and HW encoders.
-pub async fn list_discovered_nodes(State(store): State<Store>) -> impl IntoResponse {
+async fn list_discovered_nodes(State(store): State<Store>) -> impl IntoResponse {
     let v: Vec<Value> = store
         .lock()
         .unwrap()
@@ -3572,7 +3698,7 @@ struct SearchReq {
 /// it in the registry. The user copies the IP:port the node printed in its
 /// terminal and hands it to the server. Idempotent by name, so it merges with
 /// the node's own registration once the node connects back to us.
-pub async fn search_node(State(store): State<Store>, Json(req): Json<SearchReq>) -> Response {
+async fn search_node(State(store): State<Store>, Json(req): Json<SearchReq>) -> Response {
     let port = req.port.unwrap_or(8401);
     let base = format!("http://{}:{}", req.ip, port);
     let client = match reqwest::Client::builder()
@@ -3632,13 +3758,13 @@ pub async fn search_node(State(store): State<Store>, Json(req): Json<SearchReq>)
 
     // 3. Upsert into the Redis registry (idempotent by name).
     let c = store.lock().unwrap().redis();
-    let node = reg_node(c, &name, &ffmpeg_version, &haccels, &hw_encoders, &accels).await;
+    let node = reg_node(c, &name, &ffmpeg_version, &haccels, &hw_encoders, &accels, &[]).await;
 
     Json(serde_json::to_value(node).unwrap_or(Value::Null)).into_response()
 }
 
 /// GET /api/nodes/:id — one node.
-pub async fn get_node(State(store): State<Store>, UrlPath(id): UrlPath<String>) -> Response {
+async fn get_node(State(store): State<Store>, UrlPath(id): UrlPath<String>) -> Response {
     let c = store.lock().unwrap().redis();
     match hgetall_node(c, &id).await {
         Some(n) => match serde_json::to_value(n) {
@@ -3652,7 +3778,7 @@ pub async fn get_node(State(store): State<Store>, UrlPath(id): UrlPath<String>) 
 /// GET /api/nodes/:id/poll — long-poll (up to 20s) for the next dispatched
 /// job. The response also carries the node's worker settings so the node can
 /// adapt (e.g. raise/lower its concurrent-job pool).
-pub async fn node_poll(State(store): State<Store>, UrlPath(id): UrlPath<String>) -> Response {
+async fn node_poll(State(store): State<Store>, UrlPath(id): UrlPath<String>) -> Response {
     let node = {
         let c = store.lock().unwrap().redis();
         match hgetall_node(c, &id).await {
@@ -3699,7 +3825,7 @@ struct ReportReq {
 }
 
 /// POST /api/nodes/:id/report — a node reports job progress / completion.
-pub async fn node_report(State(store): State<Store>, UrlPath(id): UrlPath<String>, Json(req): Json<ReportReq>) -> Response {
+async fn node_report(State(store): State<Store>, UrlPath(id): UrlPath<String>, Json(req): Json<ReportReq>) -> Response {
     let req_error = req.error.clone();
     {
         let mut s = store.lock().unwrap();
@@ -3750,9 +3876,9 @@ pub async fn node_report(State(store): State<Store>, UrlPath(id): UrlPath<String
 /// GET /api/nodes/:id/file/:name (or /*name for library subpaths) — a node
 /// fetches an input file from the server. Uploads first; library jobs pull
 /// straight from the storage root (name is then a relative path with slashes).
-pub async fn node_fetch_file(State(store): State<Store>, UrlPath((_id, name)): UrlPath<(String, String)>) -> Response {
+async fn node_fetch_file(State(store): State<Store>, UrlPath((_id, name)): UrlPath<(String, String)>) -> Response {
     let _ = _id;
-    if name.is_empty() || name.contains("..") {
+    if bad_filename(&name) {
         return (StatusCode::BAD_REQUEST, Json(json!({"error": "bad filename"}))).into_response();
     }
     let path = {
@@ -3780,11 +3906,83 @@ pub async fn node_fetch_file(State(store): State<Store>, UrlPath((_id, name)): U
         }
     };
     match path {
-        Some(p) => match std::fs::read(&p) {
-            Ok(b) => (StatusCode::OK, [("content-type", "application/octet-stream")], b).into_response(),
-            Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e.to_string()}))).into_response(),
-        },
+        // Stream straight from disk (content-length + chunked reads) — a
+        // multi-GB library source must never be buffered in RAM.
+        Some(p) => file_response(&p).await,
         None => (StatusCode::NOT_FOUND, Json(json!({"error": "not found"}))).into_response(),
+    }
+}
+
+/// Chunked byte stream over a tokio file (1 MiB reads) — feeds
+/// `axum::body::Body::from_stream` so large files are served without a
+/// whole-file buffer.
+struct FileChunkStream {
+    file: Option<tokio::fs::File>,
+    buf: Vec<u8>,
+}
+
+impl FileChunkStream {
+    fn new(f: tokio::fs::File) -> Self {
+        Self { file: Some(f), buf: vec![0u8; 1 << 20] }
+    }
+}
+
+impl futures_util::Stream for FileChunkStream {
+    type Item = Result<bytes::Bytes, std::io::Error>;
+
+    fn poll_next(mut self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> std::task::Poll<Option<Self::Item>> {
+        use tokio::io::AsyncRead;
+        let this = self.get_mut();
+        match this.file.as_mut() {
+            None => std::task::Poll::Ready(None),
+            Some(f) => {
+                this.buf.clear();
+                let (res, n) = {
+                    let mut rb = tokio::io::ReadBuf::new(&mut this.buf);
+                    let r = std::pin::Pin::new(f).poll_read(cx, &mut rb);
+                    (r, rb.filled().len())
+                };
+                match res {
+                    std::task::Poll::Ready(Ok(_)) => {
+                        if n == 0 {
+                            this.file = None;
+                            std::task::Poll::Ready(None)
+                        } else {
+                            this.buf.truncate(n);
+                            std::task::Poll::Ready(Some(Ok(this.buf.clone().into())))
+                        }
+                    }
+                    std::task::Poll::Ready(Err(e)) => std::task::Poll::Ready(Some(Err(e))),
+                    std::task::Poll::Pending => std::task::Poll::Pending,
+                }
+            }
+        }
+    }
+}
+
+/// Stream a file as an octet-stream response with Content-Length, reading in
+/// 1 MiB chunks from disk (never buffered whole).
+async fn file_response(path: &std::path::Path) -> Response {
+    match tokio::fs::File::open(path).await {
+        Ok(f) => {
+            let len = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+            let mut headers = axum::http::HeaderMap::new();
+            headers.insert(
+                axum::http::header::CONTENT_TYPE,
+                "application/octet-stream".parse().unwrap(),
+            );
+            headers.insert(
+                axum::http::header::CONTENT_LENGTH,
+                len.to_string().parse().unwrap(),
+            );
+            (
+                StatusCode::OK,
+                headers,
+                axum::body::Body::from_stream(FileChunkStream::new(f)),
+            )
+                .into_response()
+        }
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e.to_string()}))).into_response(),
     }
 }
 
@@ -3808,7 +4006,7 @@ fn wait_file_size(path: &std::path::Path, expected: u64) -> u64 {
 /// fields `file`, `jobId`, `outputFile`). Stored in the server's outputs/.
 /// The `file` field is streamed to a temp file on disk (not held in RAM), then
 /// renamed to the declared `outputFile` — safe for multi-GB outputs.
-pub async fn node_result(State(store): State<Store>, UrlPath(id): UrlPath<String>, mut mp: Multipart) -> Response {
+async fn node_result(State(store): State<Store>, UrlPath(id): UrlPath<String>, mut mp: Multipart) -> Response {
     let mut job_id: Option<String> = None;
     let mut out_name: Option<String> = None;
     // Temp destination for the large `file` field (renamed once we know outputFile).
@@ -4173,7 +4371,7 @@ struct DispatchReq {
 
 /// POST /api/dispatch — create a transcode job targeted at a node. The target
 /// node's best HW encoder for the requested codec family is auto-selected.
-pub async fn dispatch(State(store): State<Store>, Json(req): Json<DispatchReq>) -> Response {
+async fn dispatch(State(store): State<Store>, Json(req): Json<DispatchReq>) -> Response {
     if !uploads_dir().join(&req.file).exists() {
         return (StatusCode::NOT_FOUND, Json(json!({"error": format!("input not found: {}", req.file)}))).into_response();
     }
@@ -4339,7 +4537,14 @@ async fn main() {
         // Lift Multipart's 2MB default body limit (it silently breaks real
         // video uploads). Configurable via CT_MAX_UPLOAD_MB.
         .layer(DefaultBodyLimit::max(max_upload_bytes()))
-        .layer(CorsLayer::permissive())
+        // CORS: the UI is served same-origin by this server, so the default
+        // denies ALL cross-origin requests. Set CT_CORS_ORIGINS
+        // (comma-separated origins) to allow specific browser frontends.
+        .layer(cors_layer())
+        // Optional bearer-token auth on every /api route except /api/health
+        // (enabled when CT_API_TOKEN is set — see api_auth). The layer wraps
+        // all routes; non-/api paths pass through untouched.
+        .layer(axum::middleware::from_fn(api_auth))
         // Static frontend: ServeDir serves / (index.html) and /assets/*.
         // No client-side routing, so unknown paths fall through to ServeDir's
         // default clean 404.
@@ -4348,6 +4553,10 @@ async fn main() {
     let addr = format!("0.0.0.0:{port}");
     println!("[CodecTrans] backend on {addr} | base={}", base_dir().display());
     println!("[CodecTrans] uploads={} outputs={}", uploads_dir().display(), outputs_dir().display());
+    match std::env::var("CT_API_TOKEN").ok().filter(|s| !s.is_empty()) {
+        Some(_) => println!("[CodecTrans] API auth ENABLED (CT_API_TOKEN) — /api calls need Authorization: Bearer <token> (/api/health stays open)"),
+        None => println!("[CodecTrans] WARNING: CT_API_TOKEN not set — the API is open to every device on this network. For LAN-wide exposure set CT_API_TOKEN here AND on each node."),
+    }
     let listener = tokio::net::TcpListener::bind(&addr).await.expect("bind");
     axum::serve(listener, app).await.unwrap();
 }
@@ -4478,5 +4687,60 @@ async fn spawn_mdns(store: &Store, port: u16) {
                 }
             }
         });
+    }
+}
+
+// ============================================================
+//  unit tests — path boundary + auth helpers (regression guard for the
+//  2026-10 security review: traversal, container smuggling, token check)
+// ============================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn container_allowlist() {
+        for ok in ["mp4", "mkv", "webm", "mov", "m4v", "avi", "ts", "m4a", "mp3", "flac", "ogg", "wav"] {
+            assert_eq!(safe_container(ok), ok, "should accept {ok}");
+        }
+        assert_eq!(safe_container("MKV"), "mkv", "case-insensitive");
+        assert_eq!(safe_container(" mp4 "), "mp4", "trims whitespace");
+        for bad in ["", "mp4/", "../../etc", "a/b", "mkv\\x", "movx", ".mp4", "mp4x", "MOV;rm"] {
+            assert_eq!(safe_container(bad), "mp4", "should reject {bad:?}");
+        }
+    }
+
+    #[test]
+    fn base_name_strips_paths_and_extension() {
+        assert_eq!(safe_base("/a/b/movie.mkv"), "movie");
+        assert_eq!(safe_base("movie"), "movie");
+        assert_eq!(safe_base("a\\b\\c.mp4"), "c");
+        assert_eq!(safe_base("noext"), "noext");
+        assert_eq!(safe_base(".hidden"), ".hidden");
+    }
+
+    #[test]
+    fn fetch_file_names() {
+        for bad in ["", "..", "../x", "a/..", "/abs", "/x/y"] {
+            assert!(bad_filename(bad), "should reject {bad:?}");
+        }
+        for ok in ["m.mp4", "sub/d/m.mp4", "123.mkv", "a..b.mp4"] {
+            // "a..b.mp4" contains ".." as a substring — deliberately rejected
+            // (over-rejection is safe; no real video file needs that name).
+            if ok == "a..b.mp4" {
+                assert!(bad_filename(ok));
+            } else {
+                assert!(!bad_filename(ok), "should accept {ok:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn token_comparison() {
+        assert!(constant_time_eq(b"secret", b"secret"));
+        assert!(!constant_time_eq(b"secret", b"secreT"));
+        assert!(!constant_time_eq(b"secret", b"short"));
+        assert!(!constant_time_eq(b"", b"x"));
     }
 }

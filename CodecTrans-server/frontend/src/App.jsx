@@ -1,5 +1,5 @@
 import React, { useEffect, useRef, useState } from "react";
-import { api, fmtSize, fmtDur, fmtRate } from "./api.js";
+import { api, fmtSize, fmtDur, fmtRate, setAuthToken } from "./api.js";
 
 const STATUS_LABEL = {
   queued: "Queued",
@@ -222,6 +222,15 @@ function AccelPanel({ accels, flat }) {
 export default function App() {
   const [health, setHealth] = useState(null);
   const [codecs, setCodecs] = useState(null);
+
+  // Server runs with CT_API_TOKEN → first 401 shows a token entry banner.
+  const [authRequired, setAuthRequired] = useState(false);
+  const [tokenDraft, setTokenDraft] = useState("");
+  useEffect(() => {
+    const on401 = () => setAuthRequired(true);
+    window.addEventListener("ct-unauthorized", on401);
+    return () => window.removeEventListener("ct-unauthorized", on401);
+  }, []);
 
   // tabs: dashboard | library | logic | settings | test (the original screen)
   const [tab, setTab] = useState("dashboard");
@@ -1068,6 +1077,46 @@ export default function App() {
         </div>
       </header>
       {health?.ffmpeg && <div className="sub">{health.ffmpeg}</div>}
+
+      {authRequired && (
+        <div className="authbar">
+          <span>
+            서버에 API 토큰(CT_API_TOKEN)이 설정되어 있습니다 — 토큰을 입력하세요.
+          </span>
+          <input
+            type="password"
+            value={tokenDraft}
+            onChange={(e) => setTokenDraft(e.target.value)}
+            onKeyDown={(e) => {
+              if (e.key === "Enter" && tokenDraft.trim()) {
+                setAuthToken(tokenDraft.trim());
+                location.reload();
+              }
+            }}
+            placeholder="API 토큰"
+            autoFocus
+          />
+          <button
+            onClick={() => {
+              if (tokenDraft.trim()) {
+                setAuthToken(tokenDraft.trim());
+                location.reload();
+              }
+            }}
+          >
+            저장
+          </button>
+          <button
+            className="ghost"
+            onClick={() => {
+              setAuthRequired(false);
+              setTokenDraft("");
+            }}
+          >
+            닫기
+          </button>
+        </div>
+      )}
 
       {/* ═══ 테스트 — the original upload/transcode screen ═══ */}
       {tab === "test" && (

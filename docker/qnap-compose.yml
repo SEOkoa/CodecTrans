@@ -37,6 +37,9 @@ services:
       - CT_FRONTEND=/opt/ct/frontend/dist
       # 노드에서 완성 파일을 업로드 받을 때 용량 한도 (MB)
       - CT_MAX_UPLOAD_MB=16384
+      # ── API 인증 (LAN 노출 시 활성화): 서버/노드 양쪽에 같은 값 설정 ──
+      # /api 전체에 Bearer 토큰 요구 (UI는 첫 401 시 토큰 입력 배너 표시)
+      # - CT_API_TOKEN=변경할-비밀-토큰
     volumes:
       # 카탈로그/라이브러리 설정/업로드 (QNAP 컨테이너 관례 폴더)
       - /share/Container/codectrans/config:/data
@@ -68,6 +71,11 @@ services:
       - CT_BIND=all
       # 3050 NVENC 동시 인코딩 수
       - CT_MAX_JOBS=2
+      # 서버와 같은 값 (서버에 CT_API_TOKEN을 켰을 때만)
+      # - CT_API_TOKEN=변경할-비밀-토큰
+      # ── GPU: 호스트 드라이버 유저랜드 사용 (QNAP 주입) — NVENC MISMATCH 시 ──
+      # - LD_LIBRARY_PATH=/usr/local/nvidia/lib64
+      # - PATH=/usr/local/nvidia/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
       - NVIDIA_VISIBLE_DEVICES=all
       - NVIDIA_DRIVER_CAPABILITIES=all
     # 💡 Tdarr 노드와 동일한 장치 패스스루

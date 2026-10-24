@@ -16,6 +16,7 @@ axum = { version = "0.7", features = ["multipart", "http1", "tokio"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 reqwest = { version = "0.12", default-features = false, features = ["json", "multipart", "stream", "rustls-tls"] }
+bytes = "1"
 uuid = { version = "1", features = ["v4"] }
 futures-util = "0.3"
 mdns-sd = "0.21"

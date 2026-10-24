@@ -1,8 +1,43 @@
 // Tiny API client for the CodecTrans backend (same-origin /api in production,
 // proxied in dev by Vite).
+//
+// Optional server auth: when the server runs with CT_API_TOKEN set, every
+// /api call needs `Authorization: Bearer <token>`. The token is entered once
+// in the UI (a banner appears on the first 401) and kept in localStorage.
+
+function getAuthToken() {
+  try {
+    return localStorage.getItem("ct_token") || "";
+  } catch {
+    return "";
+  }
+}
+
+export function setAuthToken(t) {
+  try {
+    if (t) localStorage.setItem("ct_token", t);
+    else localStorage.removeItem("ct_token");
+  } catch {
+    /* private mode — auth will simply not persist */
+  }
+}
+
+// Any 401 flips the UI into "token required" mode (see App.jsx listener).
+function flagUnauthorized(status) {
+  if (status === 401) {
+    try {
+      window.dispatchEvent(new Event("ct-unauthorized"));
+    } catch {
+      /* non-browser context */
+    }
+  }
+}
 
 async function jfetch(path, opts = {}) {
-  const res = await fetch(path, opts);
+  const headers = { ...(opts.headers || {}) };
+  const t = getAuthToken();
+  if (t && !headers.Authorization) headers.Authorization = `Bearer ${t}`;
+  const res = await fetch(path, { ...opts, headers });
   let body = null;
   const text = await res.text();
   try {
@@ -11,8 +46,11 @@ async function jfetch(path, opts = {}) {
     body = text;
   }
   if (!res.ok) {
+    flagUnauthorized(res.status);
     const msg = body && body.error ? body.error : `HTTP ${res.status}`;
-    throw new Error(msg);
+    const err = new Error(msg);
+    err.status = res.status;
+    throw err;
   }
   return body;
 }
@@ -50,6 +88,8 @@ export const api = {
       fd.append("file", file);
       const xhr = new XMLHttpRequest();
       xhr.open("POST", "/api/upload");
+      const t = getAuthToken();
+      if (t) xhr.setRequestHeader("Authorization", `Bearer ${t}`);
       xhr.upload.onprogress = (e) => {
         if (e.lengthComputable && onProgress) onProgress(e.loaded / e.total);
       };
@@ -63,6 +103,7 @@ export const api = {
         if (xhr.status >= 200 && xhr.status < 300) {
           resolve(body);
         } else {
+          flagUnauthorized(xhr.status);
           const msg =
             body && body.error ? body.error : `Upload failed (HTTP ${xhr.status})`;
           reject(new Error(msg));

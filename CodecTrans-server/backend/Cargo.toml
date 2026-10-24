@@ -14,6 +14,7 @@ serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1" }
 tower-http = { version = "0.5", features = ["cors", "fs"] }
 tower = "0.4"
+bytes = "1"
 uuid = { version = "1", features = ["v4"] }
 futures-util = "0.3"
 mdns-sd = "0.21"

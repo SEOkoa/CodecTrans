@@ -158,6 +158,7 @@ name = "codectrans"
 version = "0.1.0"
 dependencies = [
  "axum",
+ "bytes",
  "futures-util",
  "mdns-sd",
  "redis",

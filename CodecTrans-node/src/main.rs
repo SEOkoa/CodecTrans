@@ -47,6 +47,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::process::Command;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 // ============================================================
 //  config / paths / time
@@ -404,6 +405,20 @@ fn enumerate_gpus() -> Vec<GpuDev> {
     out
 }
 
+/// Startup diagnostics shared with the server: headless/container nodes
+/// (QNAP) have no shell access, so the probe/driver findings are sent with
+/// every registration and exposed via `GET /api/nodes` (the `diag` field).
+static DIAG: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+fn dlog(msg: String) {
+    println!("[node] {msg}");
+    let mut g = DIAG.lock().unwrap();
+    g.push(msg);
+    if g.len() > 30 {
+        let n = g.len() - 30;
+        g.drain(..n);
+    }
+}
+
 /// Ground-truth check: does this HW encoder actually work on this box?
 /// An encoder can be compiled in (appears in `ffmpeg -encoders`) yet have no
 /// usable device (no GPU, no /dev/dri access). We run a tiny real test encode
@@ -441,14 +456,15 @@ fn probe_hw_encoder(enc: &str, tag: &str, vf: &str, extra_args: &[String], env: 
     let out = match cmd.output() {
         Ok(o) => o,
         Err(e) => {
-            eprintln!("[node] probe {enc}/{tag}: ffmpeg spawn failed: {e}");
+            dlog(format!("probe {enc}/{tag}: ffmpeg spawn failed: {e}"));
             return false;
         }
     };
     let good = out.status.success() && std::fs::metadata(&path).map(|m| m.len() > 0).unwrap_or(false);
     if !good {
         // Surface the real reason (missing driver libs, no device, workdir
-        // not writable, ...) — container logs are the only debug channel.
+        // not writable, ...) — dlog() ships it to the server so headless
+        // (container) nodes are debuggable via GET /api/nodes.
         let code = out.status.code().map(|c| c.to_string()).unwrap_or_else(|| "signal".into());
         let err: String = String::from_utf8_lossy(&out.stderr)
             .lines()
@@ -458,7 +474,7 @@ fn probe_hw_encoder(enc: &str, tag: &str, vf: &str, extra_args: &[String], env: 
             .chars()
             .take(500)
             .collect();
-        eprintln!("[node] probe {enc}/{tag} FAILED (ffmpeg exit {code}): {err}");
+        dlog(format!("probe {enc}/{tag} FAILED (ffmpeg exit {code}): {err}"));
     }
     let _ = std::fs::remove_file(&path);
     good
@@ -634,11 +650,11 @@ fn detect_ffmpeg() -> Caps {
     // Diagnostics for the "no HW encoders" case (e.g. containerized QNAP
     // nodes): the container log is the only debug channel, so log what we
     // saw — encoder candidates, GPU enumeration, and every failed probe.
-    println!("[node] encoder candidates: {candidates:?}");
-    println!(
-        "[node] gpus found: {:?}",
+    dlog(format!("encoder candidates: {candidates:?}"));
+    dlog(format!(
+        "gpus found: {:?}",
         gpus.iter().map(|g| (g.kind.as_str(), g.index, g.name.as_str())).collect::<Vec<_>>()
-    );
+    ));
     let all = build_probe_tasks(&candidates, &gpus);
     let mut groups: Vec<(String, Vec<ProbeTask>)> = Vec::new();
     for t in all {
@@ -885,67 +901,175 @@ fn parse_time(s: &str) -> Option<f64> {
     Some(h * 3600.0 + m * 60.0 + sec)
 }
 
+/// Byte stream over a file on disk — feeds reqwest's multipart `Part::stream`
+/// so a multi-GB finished output is uploaded from disk, never read whole
+/// into RAM.
+struct FileBytes {
+    file: Option<tokio::fs::File>,
+    buf: Vec<u8>,
+}
+
+impl FileBytes {
+    fn new(path: &std::path::Path) -> Self {
+        let file = std::fs::File::open(path)
+            .ok()
+            .map(tokio::fs::File::from_std);
+        Self { file, buf: vec![0u8; 1 << 20] }
+    }
+}
+
+impl futures_util::Stream for FileBytes {
+    type Item = Result<bytes::Bytes, std::io::Error>;
+
+    fn poll_next(mut self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> std::task::Poll<Option<Self::Item>> {
+        use tokio::io::AsyncRead;
+        let this = self.get_mut();
+        match this.file.as_mut() {
+            None => std::task::Poll::Ready(None),
+            Some(f) => {
+                this.buf.clear();
+                // ReadBuf borrows this.buf — capture the read result and the
+                // filled length inside one scope so the borrow ends before
+                // we touch the buffer again.
+                let (res, n) = {
+                    let mut rb = tokio::io::ReadBuf::new(&mut this.buf);
+                    let r = std::pin::Pin::new(f).poll_read(cx, &mut rb);
+                    (r, rb.filled().len())
+                };
+                match res {
+                    std::task::Poll::Ready(Ok(_)) => {
+                        if n == 0 {
+                            this.file = None;
+                            std::task::Poll::Ready(None)
+                        } else {
+                            this.buf.truncate(n);
+                            std::task::Poll::Ready(Some(Ok(this.buf.clone().into())))
+                        }
+                    }
+                    std::task::Poll::Ready(Err(e)) => std::task::Poll::Ready(Some(Err(e))),
+                    std::task::Poll::Pending => std::task::Poll::Pending,
+                }
+            }
+        }
+    }
+}
+
 // ============================================================
 //  run a job locally
 // ============================================================
+
+/// Report an error to the server and record it locally — pushing the job if
+/// the failure happened before the local "running" push, updating it after.
+async fn fail_job(
+    client: &reqwest::Client,
+    state: &NState,
+    server: &str,
+    node_id: &str,
+    job: &RemoteJob,
+    msg: String,
+) {
+    let _ = client
+        .post(format!("{}/api/nodes/{}/report", server, node_id))
+        .json(&json!({"jobId": job.id, "status": "error", "error": msg.clone()}))
+        .send()
+        .await;
+    let mut st = state.lock().unwrap();
+    if st.jobs.iter().any(|j| j.id == job.id) {
+        update_job(&mut st, &job.id, |j| {
+            j.status = "error".into();
+            j.error = Some(msg);
+            j.finished_at = Some(now_ms());
+        });
+    } else {
+        push_job(
+            &mut st,
+            LocalJob {
+                id: job.id.clone(),
+                input_file: job.input_file.clone(),
+                output_file: job.output_file.clone(),
+                video_codec: job.effective_video_codec.clone(),
+                status: "error".into(),
+                progress: 0.0,
+                error: Some(msg),
+                finished_at: Some(now_ms()),
+            },
+        );
+    }
+}
 
 async fn run_job(client: reqwest::Client, state: NState, server: String, node_id: String, job: RemoteJob) {
     let in_path = in_dir().join(&job.input_file);
     let out_path = out_dir().join(&job.output_file);
 
-    // 1. download input from server
+    // File transfers (multi-GB in both directions) get their own client with
+    // a 30-minute timeout: the shared client's 30s cap is right for
+    // control-plane calls but would kill a big transfer mid-stream.
+    let xfer = reqwest::Client::builder()
+        .default_headers(api_auth_headers())
+        .timeout(std::time::Duration::from_secs(1800))
+        .build()
+        .unwrap();
+
+    // 1. download input from server — streamed straight to disk (a 16GB
+    // library source must never sit in RAM).
     let url = format!("{}/api/nodes/{}/file/{}", server, node_id, job.input_file);
-    let dl = client.get(&url).send().await;
+    let dl = xfer.get(&url).send().await;
     let dl = match dl {
         Ok(r) if r.status().is_success() => r,
         _ => {
-            let msg: String = "failed to download input from server".into();
-            let _ = client
-                .post(format!("{}/api/nodes/{}/report", server, node_id))
-                .json(&json!({"jobId": job.id, "status": "error", "error": msg}))
-                .send().await;
-            let mut st = state.lock().unwrap();
-            push_job(&mut st, LocalJob {
-                id: job.id.clone(), input_file: job.input_file.clone(), output_file: job.output_file.clone(),
-                video_codec: job.effective_video_codec.clone(), status: "error".into(), progress: 0.0,
-                error: Some(msg.clone()), finished_at: Some(now_ms()),
-            });
+            fail_job(&client, &state, &server, &node_id, &job, "failed to download input from server".into()).await;
             return;
         }
     };
-    // A failed body download (torn connection) must abort the job —
-    // proceeding would encode a missing or STALE input left in in/ by a
-    // previous run and upload a bogus "done" result.
-    match dl.bytes().await {
-        Ok(bytes) => {
-            // input_file may be a library-relative path with subdirectories
-            // (e.g. "subdir/movie.mp4") — make sure the parent exists first.
-            if let Some(p) = in_path.parent() {
-                let _ = std::fs::create_dir_all(p);
+    // A failed body download (torn connection) or a size mismatch vs
+    // Content-Length must abort the job — proceeding would encode a missing
+    // or STALE input left in in/ by a previous run and upload a bogus
+    // "done" result.
+    let expected = dl.content_length();
+    let mut dl_err: Option<String> = None;
+    // input_file may be a library-relative path with subdirectories
+    // (e.g. "subdir/movie.mp4") — make sure the parent exists first.
+    if let Some(p) = in_path.parent() {
+        let _ = std::fs::create_dir_all(p);
+    }
+    match tokio::fs::File::create(&in_path).await {
+        Ok(mut file) => {
+            use futures_util::StreamExt;
+            let mut stream = dl.bytes_stream();
+            let mut written: u64 = 0;
+            while let Some(chunk) = stream.next().await {
+                match chunk {
+                    Ok(b) => {
+                        if let Err(e) = file.write_all(&b).await {
+                            dl_err = Some(format!("failed to write input to disk: {e}"));
+                            break;
+                        }
+                        written += b.len() as u64;
+                    }
+                    Err(e) => {
+                        dl_err = Some(format!("failed to download input body: {e}"));
+                        break;
+                    }
+                }
             }
-            if let Err(e) = std::fs::write(&in_path, &bytes) {
-                let msg = format!("failed to write input to disk: {e}");
-                let _ = client
-                    .post(format!("{}/api/nodes/{}/report", server, node_id))
-                    .json(&json!({"jobId": job.id, "status": "error", "error": msg}))
-                    .send()
-                    .await;
-                let mut st = state.lock().unwrap();
-                update_job(&mut st, &job.id, |j| { j.status = "error".into(); j.error = Some(msg); j.finished_at = Some(now_ms()); });
-                return;
+            if dl_err.is_none() {
+                if let Err(e) = file.flush().await {
+                    dl_err = Some(format!("failed to finish input download: {e}"));
+                } else if let Some(cl) = expected {
+                    if written != cl {
+                        dl_err = Some(format!(
+                            "input download truncated: wrote {written} bytes, server sent {cl}"
+                        ));
+                    }
+                }
             }
         }
-        Err(e) => {
-            let msg = format!("failed to download input body: {e}");
-            let _ = client
-                .post(format!("{}/api/nodes/{}/report", server, node_id))
-                .json(&json!({"jobId": job.id, "status": "error", "error": msg}))
-                .send()
-                .await;
-            let mut st = state.lock().unwrap();
-            update_job(&mut st, &job.id, |j| { j.status = "error".into(); j.error = Some(msg); j.finished_at = Some(now_ms()); });
-            return;
-        }
+        Err(e) => dl_err = Some(format!("failed to create input file: {e}")),
+    }
+    if let Some(msg) = dl_err {
+        let _ = std::fs::remove_file(&in_path);
+        fail_job(&client, &state, &server, &node_id, &job, msg).await;
+        return;
     }
 
     // track locally + report running
@@ -1161,15 +1285,15 @@ async fn run_job(client: reqwest::Client, state: NState, server: String, node_id
         }
     }
 
-    // 4. upload result + report
+    // 4. upload result + report — the file part streams from disk (never
+    // held in RAM), over the long-timeout transfer client.
     if ok {
-        if let Ok(bytes) = std::fs::read(&out_path) {
-            let size = bytes.len() as u64;
+        if let Ok(size) = std::fs::metadata(&out_path).map(|m| m.len()) {
             let form = reqwest::multipart::Form::new()
                 .part("jobId", reqwest::multipart::Part::text(job.id.clone()))
                 .part("outputFile", reqwest::multipart::Part::text(job.output_file.clone()))
-                .part("file", reqwest::multipart::Part::bytes(bytes).file_name(job.output_file.clone()));
-            let up = client.post(format!("{}/api/nodes/{}/result", server, node_id)).multipart(form).send().await;
+                .part("file", reqwest::multipart::Part::stream(reqwest::Body::wrap_stream(FileBytes::new(&out_path))).file_name(job.output_file.clone()));
+            let up = xfer.post(format!("{}/api/nodes/{}/result", server, node_id)).multipart(form).send().await;
             match up {
                 Ok(r) if r.status().is_success() => {
                     let _ = client.post(format!("{}/api/nodes/{}/report", server, node_id))
@@ -1225,6 +1349,7 @@ async fn do_register(client: &reqwest::Client, server: &str, name: &str, caps: &
         "haccels": caps.haccels,
         "hwEncoders": caps.hw_encoders,
         "accels": caps.accels,
+        "diag": DIAG.lock().unwrap().clone(),
     });
     let resp = client.post(format!("{}/api/nodes/register", server)).json(&body).send().await;
     match resp {
@@ -1295,9 +1420,25 @@ fn txt_str(svc: &ResolvedService, key: &str) -> Option<String> {
 /// restarted server would otherwise be reused by every retry.
 fn fresh_client() -> reqwest::Client {
     reqwest::Client::builder()
+        .default_headers(api_auth_headers())
         .timeout(std::time::Duration::from_secs(30))
         .build()
         .unwrap()
+}
+
+/// Bearer token for the server API (CT_API_TOKEN). Empty map when unset, so
+/// local/dev setups need no config; nodes MUST mirror the server's token or
+/// every control call will 401.
+fn api_auth_headers() -> reqwest::header::HeaderMap {
+    let mut h = reqwest::header::HeaderMap::new();
+    if let Ok(tok) = std::env::var("CT_API_TOKEN") {
+        if !tok.is_empty() {
+            if let Ok(v) = reqwest::header::HeaderValue::from_str(&format!("Bearer {tok}")) {
+                h.insert(reqwest::header::AUTHORIZATION, v);
+            }
+        }
+    }
+    h
 }
 
 // ============================================================
@@ -1701,25 +1842,71 @@ async fn main() {
     println!("[node] {} | server={} | ffmpeg={}", name, server, caps.ffmpeg_version);
     println!("[node] haccels={:?}", caps.haccels);
     println!("[node] hw_encoders={:?}", caps.hw_encoders);
-    // GPU/driver diagnostics (visible in `docker logs`):
+    // GPU/driver diagnostics (docker logs + shipped to the server):
     match std::process::Command::new("nvidia-smi").args(["-L"]).output() {
         Ok(o) if o.status.success() => {
-            println!("[node] nvidia-smi: {}", String::from_utf8_lossy(&o.stdout).trim())
+            dlog(format!("nvidia-smi: {}", String::from_utf8_lossy(&o.stdout).trim()))
         }
         Ok(o) => {
-            eprintln!(
-                "[node] nvidia-smi FAILED: {}",
+            dlog(format!(
+                "nvidia-smi FAILED: {}",
                 String::from_utf8_lossy(&o.stderr).trim()
-            )
+            ))
         }
-        Err(e) => eprintln!("[node] nvidia-smi not runnable: {e}"),
+        Err(e) => dlog(format!("nvidia-smi not runnable: {e}")),
     }
     // Workdir must be writable (probe files + job scratch land there):
     match std::fs::write(in_dir().join(".wtest"), b"x") {
         Ok(()) => {
             let _ = std::fs::remove_file(in_dir().join(".wtest"));
         }
-        Err(e) => eprintln!("[node] WORKDIR NOT WRITABLE: {} ({e})", in_dir().display()),
+        Err(e) => dlog(format!("WORKDIR NOT WRITABLE: {} ({e})", in_dir().display())),
+    }
+    // Container NVIDIA introspection (QNAP-style host-userland injection):
+    // where are PATH/LD pointing, is the host's /usr/local/nvidia mounted,
+    // what driver does the host's own nvidia-smi report, which CUDA libs
+    // does the dynamic linker actually resolve?
+    {
+        let envdump = |k: &str| std::env::var(k).unwrap_or_else(|_| "<unset>".into());
+        dlog(format!("env PATH={}", envdump("PATH")));
+        dlog(format!("env LD_LIBRARY_PATH={}", envdump("LD_LIBRARY_PATH")));
+        let mut parts = Vec::new();
+        for d in ["/usr/local/nvidia/bin", "/usr/local/nvidia/lib64"] {
+            parts.push(match std::fs::read_dir(d) {
+                Ok(rd) => {
+                    let names: Vec<String> = rd
+                        .filter_map(|e| e.ok())
+                        .map(|e| e.file_name().to_string_lossy().to_string())
+                        .take(10)
+                        .collect();
+                    format!("{d}=[{}]", names.join(","))
+                }
+                Err(_) => format!("{d}=<absent>"),
+            });
+        }
+        dlog(parts.join(" "));
+        for p in ["/usr/local/nvidia/bin/nvidia-smi", "nvidia-smi"] {
+            if let Ok(o) = std::process::Command::new(p)
+                .args(["--query-gpu=driver_version,name", "--format=csv,noheader"])
+                .output()
+            {
+                if o.status.success() {
+                    dlog(format!(
+                        "nvidia-smi({p}): {}",
+                        String::from_utf8_lossy(&o.stdout).trim()
+                    ));
+                }
+            }
+        }
+        if let Ok(o) = std::process::Command::new("sh")
+            .args(["-c", "ldconfig -p 2>/dev/null | grep -E 'libcuda|libnvidia-encode' | head -8"])
+            .output()
+        {
+            let t = String::from_utf8_lossy(&o.stdout).trim().to_string();
+            if !t.is_empty() {
+                dlog(format!("ldconfig: {}", t.replace('\n', " | ")));
+            }
+        }
     }
     let accel_desc: String = if caps.hw_encoders.is_empty() {
         "CPU only".to_string()
@@ -1728,6 +1915,7 @@ async fn main() {
     };
 
     let client = reqwest::Client::builder()
+        .default_headers(api_auth_headers())
         .timeout(std::time::Duration::from_secs(30))
         .build()
         .unwrap();
