@@ -1,0 +1,88 @@
+version: '3.8'
+
+# CodecTrans (server + node + redis) — QNAP 3050 구성
+# 기존 Tdarr compose 패턴 호환: host 네트워킹 + /share 마운트 + privileged GPU
+#
+#   docker compose -f qnap-compose.yml up -d
+#   → http://<nas-ip>:8400
+#
+# 미디어는 서버 컨테이너에만 마운트한다 — CodecTrans 노드는 미디어를 직접
+# 읽지 않고 서버에서 스트리밍 받아서 인코딩 후 서버에 업로드 (Tdarr과 다름).
+
+services:
+  # Redis (노드 레지스트리/설정 저장)
+  codectrans-redis:
+    container_name: codectrans-redis
+    image: redis:7-alpine
+    command: ["redis-server", "--appendonly", "yes", "--port", "6380"]
+    network_mode: host
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "redis-cli", "-p", "6380", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+
+  # CodecTrans 서버 (웹 UI 8400 + 스케줄/카탈로그)
+  codectrans-server:
+    container_name: codectrans-server
+    image: docker.io/seokoa/codectrans-server:latest
+    network_mode: host
+    restart: unless-stopped
+    environment:
+      - TZ=Asia/Seoul
+      - CT_PORT=8400
+      - CT_REDIS=redis://127.0.0.1:6380
+      - CT_BASE=/data
+      - CT_FRONTEND=/opt/ct/frontend/dist
+      # 노드에서 완성 파일을 업로드 받을 때 용량 한도 (MB)
+      - CT_MAX_UPLOAD_MB=16384
+    volumes:
+      # 카탈로그/라이브러리 설정/업로드 (QNAP 컨테이너 관례 폴더)
+      - /share/Container/codectrans/config:/data
+      # ── 미디어: 기존 Tdarr과 같은 3개 공유 폴더 ──────────────
+      # (UI에서 /media/Volume1 형태로 폴더 등록)
+      - /share/YourVolume1:/media/Volume1
+      - /share/YourVolume2:/media/Volume2
+      - /share/YourVolume3:/media/Volume3
+      # ────────────────────────────────────────────────────────
+    depends_on:
+      codectrans-redis:
+        condition: service_healthy
+
+  # CodecTrans 노드 (RTX 3050 NVENC 인코딩)
+  codectrans-node:
+    container_name: codectrans-node
+    image: docker.io/seokoa/codectrans-node:latest
+    network_mode: host
+    privileged: true # 💡 Tdarr 노드와 동일한 GPU 루트 권한 패스스루
+    ipc: host        # 💡 호스트 메모리/드라이버 IPC 직접 통신
+    depends_on:
+      - codectrans-server
+    restart: unless-stopped
+    environment:
+      - TZ=Asia/Seoul
+      - CT_SERVER=http://127.0.0.1:8400
+      - CT_NODE_NAME=qnap-3050-node
+      - CT_PORT=8401
+      - CT_BIND=all
+      # 3050 NVENC 동시 인코딩 수
+      - CT_MAX_JOBS=2
+      - NVIDIA_VISIBLE_DEVICES=all
+      - NVIDIA_DRIVER_CAPABILITIES=all
+    # 💡 Tdarr 노드와 동일한 장치 패스스루
+    devices:
+      - /dev/nvidia0:/dev/nvidia0
+      - /dev/nvidiactl:/dev/nvidiactl
+      - /dev/nvidia-uvm:/dev/nvidia-uvm
+      - /dev/nvidia-uvm-tools:/dev/nvidia-uvm-tools
+    volumes:
+      # 인코딩 중 스크래치 (임시 파일 — 완료 후 삭제)
+      - /share/Container/codectrans/work:/opt/ct/work
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
