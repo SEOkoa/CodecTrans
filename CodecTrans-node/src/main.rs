@@ -489,26 +489,49 @@ fn nvidia_libdir() -> Option<String> {
 
 /// Pick the bundled NVIDIA userland series that matches THIS host's kernel
 /// driver. The NAS doesn't inject the host driver userland into containers
-/// (verified on the user's QNAP: /usr/local/nvidia is absent), so the host
-/// driver version is invisible from inside — the only way to find the match
-/// is to try: a version-skewed userland fails cuInit with
-/// CUDA_ERROR_SYSTEM_DRIVER_MISMATCH. /opt/nvidia-userland/<ver>/lib holds
-/// one series each; try newest first, remember the winner. Probe envs and
-/// per-job ffmpeg envs then prepend it to LD_LIBRARY_PATH.
+/// (verified on the user's QNAP: /usr/local/nvidia is absent), so the only
+/// reliable way to find the match is to try: a version-skewed userland
+/// fails cuInit with CUDA_ERROR_SYSTEM_DRIVER_MISMATCH. The host kernel
+/// version IS readable from inside (sysfs/procfs are not namespaced), so
+/// try that series first; if it isn't bundled (NAS firmware often ships a
+/// driver newer than anything in the image), fetch it from the Ubuntu
+/// repos at runtime, best effort. /opt/nvidia-userland/<ver>/lib holds one
+/// series each; remember the winner — probe envs and per-job ffmpeg envs
+/// then prepend it to LD_LIBRARY_PATH.
 fn pick_nvidia_series() {
     let root = PathBuf::from("/opt/nvidia-userland");
-    let mut series: Vec<u32> = Vec::new();
+    if !root.exists() {
+        return; // no bundled series (bare host / non-NVIDIA box)
+    }
+    let host = host_nvidia_driver_version();
+    let host_major = host.as_deref().and_then(nv_major);
+    if let Some(h) = &host {
+        dlog(format!("host NVIDIA kernel driver: {h}"));
+    }
+    if let Some(m) = host_major {
+        if !root.join(m.to_string()).exists() {
+            fetch_nvidia_series(m, &root);
+        }
+    }
+    let mut bundled: Vec<u32> = Vec::new();
     if let Ok(rd) = std::fs::read_dir(&root) {
         for e in rd.filter_map(|e| e.ok()) {
             if let Some(v) = e.file_name().to_str().and_then(|s| s.parse::<u32>().ok()) {
-                series.push(v);
+                bundled.push(v);
             }
         }
     }
-    if series.is_empty() {
-        return; // no bundled series (bare host / non-NVIDIA box)
+    if bundled.is_empty() {
+        return;
     }
-    series.sort_by(|a, b| b.cmp(a)); // newest first
+    // host's own series first, then the rest newest-first
+    let mut others = bundled;
+    if let Some(m) = host_major {
+        others.retain(|v| *v != m);
+    }
+    others.sort_by(|a, b| b.cmp(a));
+    let mut series: Vec<u32> = host_major.into_iter().collect();
+    series.append(&mut others);
     for v in series {
         let lib = root.join(v.to_string()).join("lib");
         if !lib.is_dir() {
@@ -532,9 +555,122 @@ fn pick_nvidia_series() {
         }
     }
     dlog(
-        "no bundled nvidia series matched the host driver — NVENC falls back to system libs (expect DRIVER_MISMATCH if the host driver is older than the system series)"
+        "no bundled nvidia series matched the host driver — NVENC falls back to system libs (expect DRIVER_MISMATCH if the host driver is outside the bundled series)"
             .to_string(),
     );
+}
+
+/// Read the host NVIDIA kernel driver version. /sys/module/nvidia/version
+/// is just the version string; /proc/driver/nvidia/version is the NVRM
+/// banner. Neither is namespaced — both report the HOST from a container.
+fn host_nvidia_driver_version() -> Option<String> {
+    for p in ["/sys/module/nvidia/version", "/proc/driver/nvidia/version"] {
+        if let Ok(s) = std::fs::read_to_string(p) {
+            if let Some(line) = s.lines().next() {
+                let t = line.trim().to_string();
+                if !t.is_empty() {
+                    return Some(t);
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Major series number (e.g. 575) out of a version string like
+/// "575.64.03" or an NVRM banner line.
+fn nv_major(line: &str) -> Option<u32> {
+    for t in line.split_whitespace() {
+        if let Some(m) = t.split('.').next() {
+            if let Ok(n) = m.parse::<u32>() {
+                if n >= 300 && n <= 999 {
+                    return Some(n);
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Install the driver userland matching the host kernel driver at runtime
+/// when it isn't bundled (NAS firmware keeps shipping newer driver series
+/// than the image). Surgical: downloads the three debs and extracts only
+/// the files NVENC + nvidia-smi need. Best effort — a logged no-op without
+/// network or repo coverage.
+fn fetch_nvidia_series(major: u32, root: &PathBuf) {
+    dlog(format!(
+        "bundled userland has no series {major} — trying a runtime install from the Ubuntu repo (best effort)"
+    ));
+    let dest_lib = root.join(major.to_string()).join("lib");
+    let dest_bin = root.join(major.to_string()).join("bin");
+    let _ = std::fs::create_dir_all(&dest_lib);
+    let _ = std::fs::create_dir_all(&dest_bin);
+    let tmp = format!("/tmp/ct-nv-{major}");
+    let _ = std::fs::remove_dir_all(&tmp);
+    let _ = std::fs::create_dir_all(&tmp);
+    let script = format!(
+        r#"set -e
+cd {tmp}
+U=https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2204/x86_64/
+# path 1: NVIDIA's CUDA repo (real debs for series Ubuntu only ships as
+# transitional packages, e.g. 575). Needs only the major number — the
+# newest point release for it is taken from the repo listing.
+fetch_cuda_repo() {{
+    curl -sf $U/ -o listing.html || return 9
+    for base in libnvidia-compute-{m} libnvidia-encode-{m} libnvidia-cfg1-{m} nvidia-compute-utils-{m} nvidia-utils-{m}; do
+        f=$(grep -oE ">$\{{base}}_[0-9][^>]*amd64\.deb" listing.html | sed 's/^>//' | sort -V | tail -1)
+        [ -z "$f" ] && return 9
+        curl -sf -O "$U/$f" || return 9
+    done
+}}
+# path 2: Ubuntu repos (jammy, then noble — covers series that ARE real
+# Ubuntu packages, e.g. 580+)
+fetch_apt() {{
+    apt-get update -qq 2>/dev/null || true
+    for p in libnvidia-compute-{m} libnvidia-encode-{m} nvidia-utils-{m}; do
+        apt-get download $p 2>/dev/null || return 9
+    done
+}}
+rm -f *.deb listing.html
+fetch_cuda_repo || {{
+    rm -f *.deb listing.html
+    echo 'deb http://archive.ubuntu.com/ubuntu noble main universe' > /etc/apt/sources.list.d/ct-noble.list
+    fetch_apt
+}}
+[ -n "$(ls *.deb 2>/dev/null)" ] || exit 9
+mkdir -p ex
+for d in *.deb; do dpkg -x "$d" ex/; done
+for f in libcuda.so* libnvidia-encode.so* libnvidia-ml.so* libnvidia-cfg.so*; do
+    cp -a ex/usr/lib/x86_64-linux-gnu/$f {dl}/ 2>/dev/null || true
+done
+cp -a ex/usr/bin/nvidia-smi {db}/ 2>/dev/null || true
+ls {dl}/
+"#,
+        tmp = tmp,
+        m = major,
+        dl = dest_lib.display(),
+        db = dest_bin.display()
+    );
+    match std::process::Command::new("sh").args(["-c", &script]).output() {
+        Ok(o) if o.status.success() => {
+            dlog(format!(
+                "runtime userland series {major} installed: {}",
+                String::from_utf8_lossy(&o.stdout).trim()
+            ));
+        }
+        Ok(o) => dlog(format!(
+            "runtime userland series {major} install failed (exit {}): {}",
+            o.status.code().unwrap_or(-1),
+            String::from_utf8_lossy(&o.stderr)
+                .lines()
+                .take(3)
+                .collect::<Vec<_>>()
+                .join(" | ")
+                .trim()
+        )),
+        Err(e) => dlog(format!("runtime userland series {major}: cannot run sh: {e}")),
+    }
+    let _ = std::fs::remove_dir_all(&tmp);
 }
 
 /// One probe task: encoder + device selection + the Accel entry it feeds.

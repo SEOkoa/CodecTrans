@@ -6,7 +6,7 @@ COPY CodecTrans-node/Cargo.toml CodecTrans-node/Cargo.lock ./
 COPY CodecTrans-node/src ./src
 RUN cargo build --release
 
-# Bundled NVIDIA driver *userland* series (535, 525, 470 — extracted, NOT
+# Bundled NVIDIA driver *userland* series (575, 535, 525 — extracted, NOT
 # installed, so they can coexist with the system 545 libs):
 #
 #   /opt/nvidia-userland/<series>/lib  libcuda.so.1, libnvidia-encode.so.1,
@@ -14,18 +14,37 @@ RUN cargo build --release
 #   /opt/nvidia-userland/<series>/bin  nvidia-smi
 #
 # Why several series: a NAS (e.g. QNAP) passes /dev/nvidia* into the
-# container but does NOT inject the host driver userland, and the host
-# driver version is invisible from inside. The node therefore tries each
-# series (newest first) with a real cuInit probe at startup and uses the
-# one that matches the kernel driver (a mismatched series fails with
-# CUDA_ERROR_SYSTEM_DRIVER_MISMATCH). Only the files ffmpeg's NVENC path +
-# nvidia-smi actually need are copied — no ptxjit/kernel modules.
+# container but does NOT inject the host driver userland. The node reads
+# the host kernel driver version from /sys/module/nvidia/version (visible
+# from inside), tries that series first, and if it isn't bundled fetches
+# it at runtime (best effort) — a version-skewed userland fails cuInit
+# with CUDA_ERROR_SYSTEM_DRIVER_MISMATCH. Only the files ffmpeg's NVENC
+# path + nvidia-smi actually need are copied — no ptxjit/kernel modules.
+# Sources: 575 straight from NVIDIA's CUDA repo (Ubuntu ships 575 only as
+# a transitional package pointing at 580 — no real 575 .so files); 535/525
+# from Ubuntu jammy (older NAS firmware).
 FROM ubuntu:22.04 AS nvidia-userland
 RUN set -x; \
     apt-get update; \
-    apt-get install -y --no-install-recommends ca-certificates; \
+    apt-get install -y --no-install-recommends ca-certificates curl dpkg; \
     cd /tmp; \
-    for v in 535 525 470; do \
+    # ── 575 (NVIDIA CUDA repo, 575.57.08 — any 575.x host driver works) ──
+    mkdir -p /opt/nvidia-userland/575/lib /opt/nvidia-userland/575/bin /opt/nvidia-userland/575/ex; \
+    U=https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2204/x86_64/; \
+    curl -sf -o 575-compute.deb $U/libnvidia-compute-575_575.57.08-0ubuntu1_amd64.deb; \
+    curl -sf -o 575-encode.deb  $U/libnvidia-encode-575_575.57.08-0ubuntu1_amd64.deb; \
+    curl -sf -o 575-cfg.deb     $U/libnvidia-cfg1-575_575.57.08-0ubuntu1_amd64.deb; \
+    curl -sf -o 575-ml.deb      $U/nvidia-compute-utils-575_575.57.08-0ubuntu1_amd64.deb; \
+    curl -sf -o 575-smi.deb     $U/nvidia-utils-575_575.57.08-0ubuntu1_amd64.deb; \
+    for d in 575-*.deb; do dpkg -x "$d" /opt/nvidia-userland/575/ex/; done; \
+    for f in libcuda.so* libnvidia-encode.so* libnvidia-ml.so* libnvidia-cfg.so*; do \
+        cp -a /opt/nvidia-userland/575/ex/usr/lib/x86_64-linux-gnu/$f /opt/nvidia-userland/575/lib/; \
+    done; \
+    cp -a /opt/nvidia-userland/575/ex/usr/bin/nvidia-smi /opt/nvidia-userland/575/bin/; \
+    echo "series 575 (NVIDIA CUDA repo 575.57.08):"; ls -la /opt/nvidia-userland/575/lib/; \
+    rm -rf /opt/nvidia-userland/575/ex /tmp/575-*.deb; \
+    # ── 535 / 525 (Ubuntu jammy — older NAS firmware) ──
+    for v in 535 525; do \
         mkdir -p /opt/nvidia-userland/$v/lib /opt/nvidia-userland/$v/bin; \
         ok=1; \
         for p in libnvidia-compute-$v libnvidia-encode-$v nvidia-utils-$v; do \
@@ -49,8 +68,9 @@ RUN set -x; \
 # Runtime: Ubuntu 22.04 + ffmpeg 4.4 (h264/hevc NVENC — everything the
 # RTX 30-series can do; AV1 NVENC doesn't exist on Ampere anyway) +
 # the 545 driver userland as the SYSTEM fallback (works with host drivers
-# >= 545). The /opt/nvidia-userland series (535/525/470) cover OLDER host
-# drivers — the node picks the matching one at startup (see above).
+# >= 545). The /opt/nvidia-userland series (575/535/525) cover NEWER and
+# OLDER host drivers — the node picks the matching one at startup (see
+# above) and fetches anything missing from the repos at runtime.
 #
 #   - GPU-self-contained: plain /dev/nvidia* device passthrough (QNAP's
 #     privileged+devices pattern) is enough — no nvidia docker runtime
@@ -62,7 +82,7 @@ RUN set -x; \
 FROM ubuntu:22.04
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
-        ffmpeg ca-certificates \
+        ffmpeg ca-certificates curl \
         libnvidia-encode-545 libnvidia-compute-545 nvidia-utils-545 \
     && rm -rf /var/lib/apt/lists/*
 COPY --from=nvidia-userland /opt/nvidia-userland /opt/nvidia-userland
