@@ -175,16 +175,47 @@ devices:
   - /dev/nvidia-uvm-tools:/dev/nvidia-uvm-tools
 ```
 
-Requires an NVIDIA driver **≥ 545** on the NAS (the 545 userland works with
-any newer kernel driver). The containerized node then auto-probes the GPU
-and reports its real NVENC encoders — an RTX 3050 (Ampere) reports
-H.264/HEVC NVENC (no AV1 encode; that's Ada/RTX 40 and newer). With the
-`nvidia` runtime available instead, the host's injected driver libraries
-take precedence and the built-in ones are shadowed — both paths work.
+Requires an NVIDIA driver **≥ 545** on the NAS (the bundled 545 userland
+works with any newer kernel driver). **Older host driver (e.g. QNAP images
+shipped with the 535 series)?** The probe fails with
+`CUDA_ERROR_SYSTEM_DRIVER_MISMATCH` — the bundled userland is then newer
+than the kernel driver and must be bypassed. If the NAS injects the host
+driver userland into containers (QNAP does — its own `nvidia-smi` is
+visible inside), point the loader at it in the node service:
+
+```yaml
+environment:
+  - LD_LIBRARY_PATH=/usr/local/nvidia/lib64
+  - PATH=/usr/local/nvidia/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+```
+
+The node logs its container NVIDIA diagnostics at startup (PATH /
+LD_LIBRARY_PATH, `/usr/local/nvidia` contents, the host `nvidia-smi`
+driver version, resolvable CUDA libs) so the right fix is visible in
+`docker logs`. The containerized node then auto-probes the GPU and reports
+its real NVENC encoders — an RTX 3050 (Ampere) reports H.264/HEVC NVENC
+(no AV1 encode; that's Ada/RTX 40 and newer). With the `nvidia` runtime
+available instead, the host's injected driver libraries take precedence
+and the built-in ones are shadowed — both paths work.
 No GPU: remove the `privileged`/`devices`/`ipc` lines and the node runs
 software-only (enable `allowSoftware` in the dashboard gear).
 
-**4. Start:**
+**4. Security (LAN exposure).** By default the API is open to the whole
+network and CORS is same-origin only. For anything beyond a trusted LAN,
+set **the same** `CT_API_TOKEN` on the *server* and *every* node:
+
+```yaml
+environment:
+  - CT_API_TOKEN=change-me
+```
+
+Every `/api` call then needs `Authorization: Bearer <token>`
+(`/api/health` stays open); the web UI shows a token-entry banner on the
+first 401 and remembers the token per browser. Optional
+`CT_CORS_ORIGINS=https://a.example,http://b.example:8400` whitelists
+specific cross-origin browser frontends.
+
+**5. Start:**
 
 ```bash
 docker compose -f docker/docker-compose.yml up -d
