@@ -510,7 +510,7 @@ fn pick_nvidia_series() {
     }
     if let Some(m) = host_major {
         if !root.join(m.to_string()).exists() {
-            fetch_nvidia_series(m, &root);
+            fetch_nvidia_series(m, host.as_deref().unwrap_or(""), &root);
         }
     }
     let mut bundled: Vec<u32> = Vec::new();
@@ -592,14 +592,18 @@ fn nv_major(line: &str) -> Option<u32> {
     None
 }
 
-/// Install the driver userland matching the host kernel driver at runtime
-/// when it isn't bundled (NAS firmware keeps shipping newer driver series
-/// than the image). Surgical: downloads the three debs and extracts only
-/// the files NVENC + nvidia-smi need. Best effort — a logged no-op without
-/// network or repo coverage.
-fn fetch_nvidia_series(major: u32, root: &PathBuf) {
+/// Fetch the driver userland matching the host kernel driver at runtime
+/// when it isn't bundled (NAS firmware keeps shipping newer driver
+/// series/point releases than the image). Sources, in order: NVIDIA's
+/// official .run of the EXACT host version (the only source with every
+/// point release — an older userland than the kernel fails with
+/// SYSTEM_DRIVER_MISMATCH), then the NVIDIA CUDA repo debs (newest point
+/// release of the major series), then Ubuntu apt. Surgical: only the
+/// files NVENC + nvidia-smi need land in the container. Best effort — a
+/// logged no-op without network or repo coverage.
+fn fetch_nvidia_series(major: u32, ver: &str, root: &PathBuf) {
     dlog(format!(
-        "bundled userland has no series {major} — trying a runtime install from the Ubuntu repo (best effort)"
+        "bundled userland has no series {major} (host {ver}) — trying to fetch it (best effort)"
     ));
     let dest_lib = root.join(major.to_string()).join("lib");
     let dest_bin = root.join(major.to_string()).join("bin");
@@ -612,9 +616,26 @@ fn fetch_nvidia_series(major: u32, root: &PathBuf) {
         r#"set -e
 cd {tmp}
 U=https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2204/x86_64/
-# path 1: NVIDIA's CUDA repo (real debs for series Ubuntu only ships as
-# transitional packages, e.g. 575). Needs only the major number — the
-# newest point release for it is taken from the repo listing.
+fix_symlinks() {{
+    for n in libcuda libnvidia-encode libnvidia-ml libnvidia-cfg; do
+        t=$(ls {dl}/ 2>/dev/null | grep "^$n\.so\.[0-9]" | grep -v "^$n\.so\.1$" | head -1)
+        if [ -n "$t" ]; then ln -sf "$t" {dl}/$n.so.1; fi
+    done
+    return 0
+}}
+# path 1: NVIDIA's official .run of the EXACT host version
+fetch_run() {{
+    case "{ver}" in *[!0-9.]*|'') return 9 ;; esac
+    curl -sf -o nv.run "https://us.download.nvidia.com/XFree86/Linux-x86_64/{ver}/NVIDIA-Linux-x86_64-{ver}.run" || return 9
+    sh nv.run --extract-only --target r || return 9
+    for f in libcuda.so* libnvidia-encode.so* libnvidia-ml.so* libnvidia-cfg.so*; do
+        cp -a r/$f {dl}/ 2>/dev/null || true
+    done
+    cp -a r/nvidia-smi {db}/ 2>/dev/null || true
+    [ -n "$(ls {dl}/libcuda.so.[0-9]* 2>/dev/null)" ] || return 9
+    fix_symlinks
+}}
+# path 2: NVIDIA CUDA repo debs (newest point release of the major series)
 fetch_cuda_repo() {{
     curl -sf $U/ -o listing.html || return 9
     for base in libnvidia-compute-{m} libnvidia-encode-{m} libnvidia-cfg1-{m} nvidia-compute-utils-{m} nvidia-utils-{m}; do
@@ -623,31 +644,36 @@ fetch_cuda_repo() {{
         curl -sf -O "$U/$f" || return 9
     done
 }}
-# path 2: Ubuntu repos (jammy, then noble — covers series that ARE real
-# Ubuntu packages, e.g. 580+)
+# path 3: Ubuntu repos (jammy, then noble — series that ARE real Ubuntu
+# packages, e.g. 580/595)
 fetch_apt() {{
     apt-get update -qq 2>/dev/null || true
     for p in libnvidia-compute-{m} libnvidia-encode-{m} nvidia-utils-{m}; do
         apt-get download $p 2>/dev/null || return 9
     done
 }}
-rm -f *.deb listing.html
-fetch_cuda_repo || {{
-    rm -f *.deb listing.html
-    echo 'deb http://archive.ubuntu.com/ubuntu noble main universe' > /etc/apt/sources.list.d/ct-noble.list
-    fetch_apt
+rm -rf r ex *.deb listing.html nv.run
+fetch_run || {{
+    rm -rf r nv.run
+    fetch_cuda_repo || {{
+        rm -f *.deb listing.html
+        echo 'deb http://archive.ubuntu.com/ubuntu noble main universe' > /etc/apt/sources.list.d/ct-noble.list
+        fetch_apt
+    }}
+    [ -n "$(ls *.deb 2>/dev/null)" ] || exit 9
+    mkdir -p ex
+    for d in *.deb; do dpkg -x "$d" ex/; done
+    for f in libcuda.so* libnvidia-encode.so* libnvidia-ml.so* libnvidia-cfg.so*; do
+        cp -a ex/usr/lib/x86_64-linux-gnu/$f {dl}/ 2>/dev/null || true
+    done
+    cp -a ex/usr/bin/nvidia-smi {db}/ 2>/dev/null || true
+    fix_symlinks
 }}
-[ -n "$(ls *.deb 2>/dev/null)" ] || exit 9
-mkdir -p ex
-for d in *.deb; do dpkg -x "$d" ex/; done
-for f in libcuda.so* libnvidia-encode.so* libnvidia-ml.so* libnvidia-cfg.so*; do
-    cp -a ex/usr/lib/x86_64-linux-gnu/$f {dl}/ 2>/dev/null || true
-done
-cp -a ex/usr/bin/nvidia-smi {db}/ 2>/dev/null || true
 ls {dl}/
 "#,
         tmp = tmp,
         m = major,
+        ver = ver,
         dl = dest_lib.display(),
         db = dest_bin.display()
     );

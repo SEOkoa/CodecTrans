@@ -28,21 +28,24 @@ RUN set -x; \
     apt-get update; \
     apt-get install -y --no-install-recommends ca-certificates curl dpkg; \
     cd /tmp; \
-    # ── 575 (NVIDIA CUDA repo, 575.57.08 — any 575.x host driver works) ──
-    mkdir -p /opt/nvidia-userland/575/lib /opt/nvidia-userland/575/bin /opt/nvidia-userland/575/ex; \
-    U=https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2204/x86_64/; \
-    curl -sf -o 575-compute.deb $U/libnvidia-compute-575_575.57.08-0ubuntu1_amd64.deb; \
-    curl -sf -o 575-encode.deb  $U/libnvidia-encode-575_575.57.08-0ubuntu1_amd64.deb; \
-    curl -sf -o 575-cfg.deb     $U/libnvidia-cfg1-575_575.57.08-0ubuntu1_amd64.deb; \
-    curl -sf -o 575-ml.deb      $U/nvidia-compute-utils-575_575.57.08-0ubuntu1_amd64.deb; \
-    curl -sf -o 575-smi.deb     $U/nvidia-utils-575_575.57.08-0ubuntu1_amd64.deb; \
-    for d in 575-*.deb; do dpkg -x "$d" /opt/nvidia-userland/575/ex/; done; \
+    # ── 575 (official NVIDIA .run, 575.64.05 — the QNAP host driver).
+    #    The CUDA repo only carries 575.57.08, and an OLDER userland than
+    #    the host kernel (575.57.08 < 575.64.05) fails with
+    #    SYSTEM_DRIVER_MISMATCH — the exact point release is required. ──
+    mkdir -p /opt/nvidia-userland/575/lib /opt/nvidia-userland/575/bin; \
+    curl -sf -o /tmp/575.run https://us.download.nvidia.com/XFree86/Linux-x86_64/575.64.05/NVIDIA-Linux-x86_64-575.64.05.run; \
+    sh /tmp/575.run --extract-only --target /tmp/575-ex; \
     for f in libcuda.so* libnvidia-encode.so* libnvidia-ml.so* libnvidia-cfg.so*; do \
-        cp -a /opt/nvidia-userland/575/ex/usr/lib/x86_64-linux-gnu/$f /opt/nvidia-userland/575/lib/; \
+        cp -a /tmp/575-ex/$f /opt/nvidia-userland/575/lib/; \
     done; \
-    cp -a /opt/nvidia-userland/575/ex/usr/bin/nvidia-smi /opt/nvidia-userland/575/bin/; \
-    echo "series 575 (NVIDIA CUDA repo 575.57.08):"; ls -la /opt/nvidia-userland/575/lib/; \
-    rm -rf /opt/nvidia-userland/575/ex /tmp/575-*.deb; \
+    cp -a /tmp/575-ex/nvidia-smi /opt/nvidia-userland/575/bin/; \
+    (cd /opt/nvidia-userland/575/lib && \
+        ln -sf libcuda.so.575.64.05 libcuda.so.1 && \
+        ln -sf libnvidia-encode.so.575.64.05 libnvidia-encode.so.1 && \
+        ln -sf libnvidia-ml.so.575.64.05 libnvidia-ml.so.1 && \
+        ln -sf libnvidia-cfg.so.575.64.05 libnvidia-cfg.so.1); \
+    echo "series 575 (official .run 575.64.05):"; ls -la /opt/nvidia-userland/575/lib/; \
+    rm -rf /tmp/575-ex /tmp/575.run; \
     # ── 535 / 525 (Ubuntu jammy — older NAS firmware) ──
     for v in 535 525; do \
         mkdir -p /opt/nvidia-userland/$v/lib /opt/nvidia-userland/$v/bin; \
