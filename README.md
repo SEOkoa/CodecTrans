@@ -128,29 +128,64 @@ On macOS the wizard still works, but remember the headless-SSH routing quirk
 
 ## Running on a NAS (Docker Compose, e.g. QNAP)
 
-`docker/docker-compose.yml` brings up **redis + server + node** in one go:
+`docker/docker-compose.yml` brings up **redis + server + node** in one go.
+
+**1. Get the images on the NAS.** Compose cannot download the app images by
+itself — it only pulls them, so they have to live in a registry (or be
+`docker save`d over):
 
 ```bash
-# 1. edit docker/docker-compose.yml -> point the media bind mount at your share
-#    (QNAP: /volume1/<share>). The server sees it at /media — register
-#    folders as /media/... in the web UI.
-# 2. build + start
-docker compose -f docker/docker-compose.yml up -d --build
+# on your build box (needs docker + `docker login`):
+docker/push-images.sh <your-docker-hub-user>      # -> docker.io/<user>/codectrans-{server,node}:latest
+# or GHCR:
+docker/push-images.sh <your-gh-user> latest ghcr
+```
+
+then on the NAS either point the compose `image:` fields at the registry
+paths (Docker Hub — no auth needed) or `docker pull` + `docker tag` them to
+`codectrans/{server,node}:latest` (GHCR). No-registry option:
+`docker save` both images into one tar on the build box, copy it to the NAS
+via File Station, `docker load -i`, then `up`.
+
+**2. Point the media mounts at your shares.** QNAP pools live at `/mnt/1`,
+`/mnt/2`, … — one bind-mount line per shared folder:
+
+```yaml
+volumes:
+  - server-data:/data
+  - /mnt/1/media:/media/media     # share on pool 1
+  - /mnt/2/movies:/media/movies   # share on pool 2
+```
+
+Register `/media/media`, `/media/movies` in the web UI (🔍 폴더 찾아보기
+lists them once the mount is live).
+
+**3. GPU (e.g. RTX 3050).** The compose runs the node with
+`runtime: nvidia` + `NVIDIA_DRIVER_CAPABILITIES=video,utility`. Prerequisites
+on the NAS: an installed NVIDIA driver **and** the nvidia-container-toolkit
+(`docker info` must list the `nvidia` runtime). Then the containerized node
+auto-probes the GPU and reports its real NVENC encoders — an RTX 3050
+(Ampere) reports H.264/HEVC NVENC (no AV1 encode; that's Ada/RTX 40 and
+newer), newer cards also AV1. No GPU: delete the `runtime` line + the
+`NVIDIA_*` vars and the node runs software-only (enable `allowSoftware` in
+the dashboard gear). Verified in-container: node on the nvidia runtime
+probed `nvenc device 0` and encoded AV1 (Blackwell test box) end to end.
+
+**4. Start:**
+
+```bash
+docker compose -f docker/docker-compose.yml up -d
 # open http://<nas-ip>:8400
 ```
 
 - **The node does not need the media share** — it streams sources from the
   server and uploads finished files back; only the *server* container needs
-  the media bind mount.
-- **No GPU on the NAS** → the node reports zero hardware encoders and
-  encodes in software (flip `allowSoftware` on in the dashboard gear). For
-  real HW encoding, run the node container (or the `install-node.sh` wizard)
-  on the GPU box instead — it just points `CT_SERVER` at the NAS.
+  the media bind mounts.
 - **Persistence:** node identity/registry lives in the `redis-data` volume,
   catalog + library config + uploads in `server-data`. Removing a service
   without `-v` keeps both.
 - **Architecture:** all current QNAP TS lines + QuTS hero are `x86_64` — the
-  default build runs as-is (verify with `uname -m` on the QNAP; ARM boxes
+  default images run as-is (verify with `uname -m` on the QNAP; ARM boxes
   need `docker buildx --platform` with a cross target).
 - **Uploads:** finished files stream back through the server; the compose
   sets `CT_MAX_UPLOAD_MB=16384`. Raise it for large 4K masters.
@@ -158,6 +193,8 @@ docker compose -f docker/docker-compose.yml up -d --build
   (0644) — readable by QNAP services. If you need specific uid/gid, remap
   the share or run the server service with `user: "1000:1000"` (QNAP QUGID)
   and chown the `server-data` volume once.
+- **Images:** `ubuntu:24.04` + ffmpeg 6.1 (NVENC incl. AV1 on Ada/Blackwell),
+  ~800MB each, `linux/amd64`.
 
 ## Per-OS support
 

@@ -7,9 +7,10 @@ COPY CodecTrans-server/backend/Cargo.toml CodecTrans-server/backend/Cargo.lock .
 COPY CodecTrans-server/backend/src ./src
 RUN cargo build --release
 
-# Runtime: slim Debian + ffmpeg (ffprobe = scan + post-encode health check,
-# ffmpeg = the server-local transcode fallback path)
-FROM debian:bookworm-slim
+# Runtime: Ubuntu 24.04 + ffmpeg 6.1 (nvenc incl. AV1 on Ada/Blackwell,
+# ffprobe for scan + post-encode health check, ffmpeg for the server-local
+# transcode fallback path)
+FROM ubuntu:24.04
 RUN apt-get update \
     && apt-get install -y --no-install-recommends ffmpeg ca-certificates \
     && rm -rf /var/lib/apt/lists/*

@@ -6,9 +6,12 @@ COPY CodecTrans-node/Cargo.toml CodecTrans-node/Cargo.lock ./
 COPY CodecTrans-node/src ./src
 RUN cargo build --release
 
-# Runtime: slim Debian + ffmpeg (encodes). The node does NOT need access to
+# Runtime: Ubuntu 24.04 + ffmpeg 6.1 (nvenc incl. AV1 on Ada/Blackwell GPUs,
+# h264/hevc nvenc on the RTX 30-series). The node does NOT need access to
 # the media itself — it streams sources from the server and uploads results.
-FROM debian:bookworm-slim
+# GPU: use the nvidia docker runtime (see docker/docker-compose.yml) — the
+# host driver's libraries are injected, no CUDA toolkit needed in the image.
+FROM ubuntu:24.04
 RUN apt-get update \
     && apt-get install -y --no-install-recommends ffmpeg ca-certificates \
     && rm -rf /var/lib/apt/lists/*

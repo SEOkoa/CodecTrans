@@ -2,17 +2,40 @@
 #
 #   docker compose up -d
 #
+# GETTING THE IMAGES (compose alone cannot download app images — it only
+# pulls them; they must exist in a registry or be built locally):
+#   A) Docker Hub (recommended — public images, zero auth on the NAS):
+#        on your build box:  docker/push-images.sh <your-hub-user>
+#        then set REGISTRY below to your hub user and just `docker compose up -d`.
+#   B) GHCR:  docker/push-images.sh <your-hub-user> ghcr
+#        then pull+tag on the NAS:
+#        docker pull ghcr.io/<user>/codectrans/codectrans-server:latest \
+#          && docker tag  ghcr.io/<user>/codectrans/codectrans-server:latest codectrans/server:latest
+#        (same for codectrans-node) — then `docker compose up -d`.
+#   C) No registry:  on the build box `docker save` both images into one
+#        tar, copy it to the NAS (File Station), `docker load -i`, then up.
+#   The `build:` blocks below are kept for local building — delete the
+#   pulled images first if you want `up` to build instead of using the tag.
+#
 # BEFORE STARTING:
-#   1. Change the media bind mount below to your share path
-#      (QNAP: /volume1/<share> or /share/CACHEDEV1_DATA/<share>).
-#      The server sees it at /media — register folders as /media/... in the
-#      web UI.
-#   2. QNAP without a GPU: the node only reports SW encoders. Set
-#      allowSoftware on it (dashboard gear) — or just don't start the node
-#      service and run a real GPU node elsewhere (same compose, or the
-#      install-node.sh wizard on that box).
-#   3. The QNAP is x86_64 on all current TS/TS-X/EX lines and QuTS hero —
-#      the default build is fine. (Check `uname -m` on the QNAP to be sure.)
+#   1. Media mounts (server service): one line per shared folder. On a QNAP
+#      pools live at /mnt/1, /mnt/2, ... so typically:
+#        - /mnt/1/media:/media/media
+#        - /mnt/2/movies:/media/movies
+#      Then register /media/media, /media/movies in the web UI.
+#   2. GPU: this compose has the node on the `nvidia` runtime (for the
+#      RTX 3050). Host prerequisites on the QNAP:
+#        - an installed NVIDIA driver (App Center → "NVIDIA driver", or the
+#          driver package for your model) with the matching nvidia-container-toolkit
+#        - `docker info` on the NAS must list the `nvidia` runtime
+#      If the NAS has no GPU: delete the `runtime: nvidia` line and the two
+#      NVIDIA_* env vars, and the node runs with software encoders only
+#      (enable allowSoftware on it in the dashboard gear).
+#      Note: the RTX 3050 (Ampere) does NVENC H.264/HEVC — no AV1 encode
+#      (that's Ada/RTX 40 and newer). The node probes the real encoders,
+#      so the graph/logic just picks from what it reports.
+#   3. Architecture: all current QNAP TS lines + QuTS hero are x86_64 —
+#      the default images run as-is (verify with `uname -m` on the QNAP).
 
 services:
   redis:
@@ -28,10 +51,12 @@ services:
       retries: 12
 
   server:
-    build:
-      context: ..
-      dockerfile: docker/server.Dockerfile
+    # A) replace with your hub user, e.g. image: docker.io/youruser/codectrans-server:latest
     image: codectrans/server:latest
+    # B) or build locally (needs the repo source on this box):
+    # build:
+    #   context: ..
+    #   dockerfile: docker/server.Dockerfile
     environment:
       CT_PORT: "8400"
       CT_REDIS: redis://redis:6379
@@ -41,9 +66,12 @@ services:
       CT_MAX_UPLOAD_MB: "16384"
     volumes:
       - server-data:/data
-      # ── your media ────────────────────────────────────────────────
-      - /volume1/media:/media
-      # ─────────────────────────────────────────────────────────────
+      # ── your media: one bind mount per shared folder (QNAP pools /mnt/N) ──
+      - /mnt/1/media:/media/media
+      - /mnt/2/movies:/media/movies
+      # e.g. more pools:
+      # - /mnt/3/tv:/media/tv
+      # ─────────────────────────────────────────────────────────────────────
     ports:
       - "8400:8400"
     depends_on:
@@ -52,16 +80,22 @@ services:
     restart: unless-stopped
 
   node:
-    build:
-      context: ..
-      dockerfile: docker/node.Dockerfile
     image: codectrans/node:latest
+    # build:
+    #   context: ..
+    #   dockerfile: docker/node.Dockerfile
+    # GPU passthrough (RTX 3050). Remove `runtime` + the NVIDIA_* vars for
+    # a GPU-less NAS.
+    runtime: nvidia
     environment:
       CT_SERVER: http://server:8400
       CT_NODE_NAME: qnap-node
       CT_PORT: "8401"
       CT_BIND: all
       CT_MAX_JOBS: "2"
+      # "video" is what NVENC needs (compute alone is not enough)
+      NVIDIA_VISIBLE_DEVICES: all
+      NVIDIA_DRIVER_CAPABILITIES: video,utility
     volumes:
       - node-work:/opt/ct/work
     depends_on:
