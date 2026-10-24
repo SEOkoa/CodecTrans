@@ -1,0 +1,10 @@
+# build context = repository root (see docker/*.Dockerfile)
+.git
+**/target
+**/node_modules
+**/*.log
+/tmp
+/tmp/*
+*.mp4
+*.mkv
+.DS_Store

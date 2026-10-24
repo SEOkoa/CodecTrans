@@ -126,6 +126,39 @@ On macOS the wizard still works, but remember the headless-SSH routing quirk
 - `frontend/dist` is committed so a clone runs without a Node toolchain; rebuild it with
   `npm run build` in `CodecTrans-server/frontend/` when changing the UI.
 
+## Running on a NAS (Docker Compose, e.g. QNAP)
+
+`docker/docker-compose.yml` brings up **redis + server + node** in one go:
+
+```bash
+# 1. edit docker/docker-compose.yml -> point the media bind mount at your share
+#    (QNAP: /volume1/<share>). The server sees it at /media — register
+#    folders as /media/... in the web UI.
+# 2. build + start
+docker compose -f docker/docker-compose.yml up -d --build
+# open http://<nas-ip>:8400
+```
+
+- **The node does not need the media share** — it streams sources from the
+  server and uploads finished files back; only the *server* container needs
+  the media bind mount.
+- **No GPU on the NAS** → the node reports zero hardware encoders and
+  encodes in software (flip `allowSoftware` on in the dashboard gear). For
+  real HW encoding, run the node container (or the `install-node.sh` wizard)
+  on the GPU box instead — it just points `CT_SERVER` at the NAS.
+- **Persistence:** node identity/registry lives in the `redis-data` volume,
+  catalog + library config + uploads in `server-data`. Removing a service
+  without `-v` keeps both.
+- **Architecture:** all current QNAP TS lines + QuTS hero are `x86_64` — the
+  default build runs as-is (verify with `uname -m` on the QNAP; ARM boxes
+  need `docker buildx --platform` with a cross target).
+- **Uploads:** finished files stream back through the server; the compose
+  sets `CT_MAX_UPLOAD_MB=16384`. Raise it for large 4K masters.
+- **Ownership:** container processes run as root, so outputs land root-owned
+  (0644) — readable by QNAP services. If you need specific uid/gid, remap
+  the share or run the server service with `user: "1000:1000"` (QNAP QUGID)
+  and chown the `server-data` volume once.
+
 ## Per-OS support
 
 | | server | node HW accel | status |

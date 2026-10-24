@@ -121,8 +121,12 @@ fn bind_addr() -> String {
     }
 }
 fn work_dir() -> PathBuf {
-    // the node's own folder (CodecTrans-node/) — keep in/out local to the node
-    let d = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    // Scratch area for the in-flight source (in/) and finished file (out/).
+    // CT_WORKDIR overrides it (Docker: the compile-time manifest dir is
+    // baked into the image, so point it at a clean path instead).
+    let d = std::env::var("CT_WORKDIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| PathBuf::from(env!("CARGO_MANIFEST_DIR")));
     let _ = std::fs::create_dir_all(&d);
     d
 }

@@ -1,0 +1,74 @@
+# CodecTrans — server + node + Redis on one box (e.g. a QNAP NAS).
+#
+#   docker compose up -d
+#
+# BEFORE STARTING:
+#   1. Change the media bind mount below to your share path
+#      (QNAP: /volume1/<share> or /share/CACHEDEV1_DATA/<share>).
+#      The server sees it at /media — register folders as /media/... in the
+#      web UI.
+#   2. QNAP without a GPU: the node only reports SW encoders. Set
+#      allowSoftware on it (dashboard gear) — or just don't start the node
+#      service and run a real GPU node elsewhere (same compose, or the
+#      install-node.sh wizard on that box).
+#   3. The QNAP is x86_64 on all current TS/TS-X/EX lines and QuTS hero —
+#      the default build is fine. (Check `uname -m` on the QNAP to be sure.)
+
+services:
+  redis:
+    image: redis:7-alpine
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes:
+      - redis-data:/data
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+
+  server:
+    build:
+      context: ..
+      dockerfile: docker/server.Dockerfile
+    image: codectrans/server:latest
+    environment:
+      CT_PORT: "8400"
+      CT_REDIS: redis://redis:6379
+      CT_BASE: /data
+      CT_FRONTEND: /opt/ct/frontend/dist
+      # finished files stream back from nodes — raise for big 4K masters
+      CT_MAX_UPLOAD_MB: "16384"
+    volumes:
+      - server-data:/data
+      # ── your media ────────────────────────────────────────────────
+      - /volume1/media:/media
+      # ─────────────────────────────────────────────────────────────
+    ports:
+      - "8400:8400"
+    depends_on:
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+
+  node:
+    build:
+      context: ..
+      dockerfile: docker/node.Dockerfile
+    image: codectrans/node:latest
+    environment:
+      CT_SERVER: http://server:8400
+      CT_NODE_NAME: qnap-node
+      CT_PORT: "8401"
+      CT_BIND: all
+      CT_MAX_JOBS: "2"
+    volumes:
+      - node-work:/opt/ct/work
+    depends_on:
+      - server
+    restart: unless-stopped
+
+volumes:
+  redis-data:
+  server-data:
+  node-work:

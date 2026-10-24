@@ -1693,109 +1693,120 @@ export default function App() {
                         ))}
                       </select>
                     </label>
-                    <label>
-                      비디오
-                      <select
-                        value={f.target.videoCodec || ""}
-                        onChange={(e) => patchTarget(f.id, { videoCodec: e.target.value || null })}
-                      >
-                        <option value="">코덱 없음 (큐잉 안 함)</option>
-                        {(codecs?.videoCodecs || [])
-                          .filter((c) => c.id !== "copy")
-                          .map((c) => (
-                            <option key={c.id} value={c.id}>
-                              {c.label}
-                            </option>
-                          ))}
-                      </select>
-                    </label>
-                    <label>
-                      오디오
-                      <select
-                        value={f.target.audioCodec || "aac"}
-                        onChange={(e) => patchTarget(f.id, { audioCodec: e.target.value })}
-                      >
-                        {(codecs?.audioCodecs || []).map((c) => (
-                          <option key={c.id} value={c.id}>
-                            {c.label}
-                          </option>
-                        ))}
-                      </select>
-                    </label>
-                    <label>
-                      컨테이너
-                      <select
-                        value={f.target.container || "mp4"}
-                        onChange={(e) => patchTarget(f.id, { container: e.target.value })}
-                      >
-                        {(codecs?.containers || []).map((c) => (
-                          <option key={c.id} value={c.id}>
-                            {c.label}
-                          </option>
-                        ))}
-                      </select>
-                    </label>
-                    <div className="rateval">
-                      <div className="ratemode">
-                        <button
-                          type="button"
-                          className={`rm-opt ${mode === "crf" ? "on" : ""}`}
-                          onClick={() => patchTarget(f.id, { mode: "crf" })}
-                        >
-                          CRF
-                        </button>
-                        <button
-                          type="button"
-                          className={`rm-opt ${mode !== "crf" ? "on" : ""}`}
-                          onClick={() => patchTarget(f.id, { mode: "pct" })}
-                        >
-                          %
-                        </button>
+                    {f.logicId ? (
+                      <div className="logic-note" title="코덱·비트레이트·검증·대치까지 전부 로직 그래프의 인코딩/후처리 노드가 결정합니다">
+                        <span className="logic-badge">
+                          {logics.find((l) => l.id === f.logicId)?.name || "로직"}
+                        </span>
+                        로직이 적용 중 — 처리 방식은 <b>로직 탭</b>의 그래프로만 조정됩니다
                       </div>
-                      <input
-                        type="number"
-                        className="num"
-                        min={mode === "crf" ? 0 : 10}
-                        max={mode === "crf" ? 51 : 100}
-                        value={mode === "crf" ? f.target.crf ?? 23 : f.target.bitratePct ?? 70}
-                        onChange={(e) =>
-                          patchTarget(
-                            f.id,
-                            mode === "crf"
-                              ? { crf: Number(e.target.value) }
-                              : { bitratePct: Number(e.target.value) }
-                          )
-                        }
-                      />
-                    </div>
-                    <div className="postenc">
-                      <label
-                        className="postenc-opt"
-                        title="인코딩 완료 후 ffprobe 검증 — 영상 스트림 존재 + 재생시간 확인. 실패하면 출력 삭제 · 에러 표시"
-                      >
-                        <input
-                          type="checkbox"
-                          checked={!!f.target.verifyOutput}
-                          onChange={(e) =>
-                            patchTarget(f.id, { verifyOutput: e.target.checked })
-                          }
-                        />
-                        ✓ 출력 검증
-                      </label>
-                      <label
-                        className="postenc-opt"
-                        title="출력이 원본의 경로를 대체 — 원본은 옆에 .orig로 백업"
-                      >
-                        <input
-                          type="checkbox"
-                          checked={!!f.target.replaceOriginal}
-                          onChange={(e) =>
-                            patchTarget(f.id, { replaceOriginal: e.target.checked })
-                          }
-                        />
-                        ⟲ 원본 대치
-                      </label>
-                    </div>
+                    ) : (
+                      <>
+                        <label>
+                          비디오
+                          <select
+                            value={f.target.videoCodec || ""}
+                            onChange={(e) => patchTarget(f.id, { videoCodec: e.target.value || null })}
+                          >
+                            <option value="">코덱 없음 (큐잉 안 함)</option>
+                            {(codecs?.videoCodecs || [])
+                              .filter((c) => c.id !== "copy")
+                              .map((c) => (
+                                <option key={c.id} value={c.id}>
+                                  {c.label}
+                                </option>
+                              ))}
+                          </select>
+                        </label>
+                        <label>
+                          오디오
+                          <select
+                            value={f.target.audioCodec || "aac"}
+                            onChange={(e) => patchTarget(f.id, { audioCodec: e.target.value })}
+                          >
+                            {(codecs?.audioCodecs || []).map((c) => (
+                              <option key={c.id} value={c.id}>
+                                {c.label}
+                              </option>
+                            ))}
+                          </select>
+                        </label>
+                        <label>
+                          컨테이너
+                          <select
+                            value={f.target.container || "mp4"}
+                            onChange={(e) => patchTarget(f.id, { container: e.target.value })}
+                          >
+                            {(codecs?.containers || []).map((c) => (
+                              <option key={c.id} value={c.id}>
+                                {c.label}
+                              </option>
+                            ))}
+                          </select>
+                        </label>
+                        <div className="rateval">
+                          <div className="ratemode">
+                            <button
+                              type="button"
+                              className={`rm-opt ${mode === "crf" ? "on" : ""}`}
+                              onClick={() => patchTarget(f.id, { mode: "crf" })}
+                            >
+                              CRF
+                            </button>
+                            <button
+                              type="button"
+                              className={`rm-opt ${mode !== "crf" ? "on" : ""}`}
+                              onClick={() => patchTarget(f.id, { mode: "pct" })}
+                            >
+                              %
+                            </button>
+                          </div>
+                          <input
+                            type="number"
+                            className="num"
+                            min={mode === "crf" ? 0 : 10}
+                            max={mode === "crf" ? 51 : 100}
+                            value={mode === "crf" ? f.target.crf ?? 23 : f.target.bitratePct ?? 70}
+                            onChange={(e) =>
+                              patchTarget(
+                                f.id,
+                                mode === "crf"
+                                  ? { crf: Number(e.target.value) }
+                                  : { bitratePct: Number(e.target.value) }
+                              )
+                            }
+                          />
+                        </div>
+                        <div className="postenc">
+                          <label
+                            className="postenc-opt"
+                            title="인코딩 완료 후 ffprobe 검증 — 영상 스트림 존재 + 재생시간 확인. 실패하면 출력 삭제 · 에러 표시"
+                          >
+                            <input
+                              type="checkbox"
+                              checked={!!f.target.verifyOutput}
+                              onChange={(e) =>
+                                patchTarget(f.id, { verifyOutput: e.target.checked })
+                              }
+                            />
+                            ✓ 출력 검증
+                          </label>
+                          <label
+                            className="postenc-opt"
+                            title="출력이 원본의 경로를 대체 — 원본은 옆에 .orig으로 백업"
+                          >
+                            <input
+                              type="checkbox"
+                              checked={!!f.target.replaceOriginal}
+                              onChange={(e) =>
+                                patchTarget(f.id, { replaceOriginal: e.target.checked })
+                              }
+                            />
+                            ⟲ 원본 대치
+                          </label>
+                        </div>
+                      </>
+                    )}
                   </div>
                 </div>
               );

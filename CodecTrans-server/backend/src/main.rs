@@ -64,7 +64,11 @@ fn outputs_dir() -> PathBuf {
     d
 }
 fn frontend_dir() -> PathBuf {
-    base_dir().join("frontend").join("dist")
+    // CT_FRONTEND overrides the built-UI location (Docker: the image bakes
+    // dist in while CT_BASE points at a data volume).
+    std::env::var("CT_FRONTEND")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| base_dir().join("frontend").join("dist"))
 }
 
 /// Max upload size in bytes. `Multipart` defaults to 2MB, which silently breaks
