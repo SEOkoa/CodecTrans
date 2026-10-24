@@ -438,8 +438,28 @@ fn probe_hw_encoder(enc: &str, tag: &str, vf: &str, extra_args: &[String], env: 
     for (k, v) in env {
         cmd.env(k, v);
     }
-    let ok = cmd.output().map(|o| o.status.success()).unwrap_or(false);
-    let good = ok && std::fs::metadata(&path).map(|m| m.len() > 0).unwrap_or(false);
+    let out = match cmd.output() {
+        Ok(o) => o,
+        Err(e) => {
+            eprintln!("[node] probe {enc}/{tag}: ffmpeg spawn failed: {e}");
+            return false;
+        }
+    };
+    let good = out.status.success() && std::fs::metadata(&path).map(|m| m.len() > 0).unwrap_or(false);
+    if !good {
+        // Surface the real reason (missing driver libs, no device, workdir
+        // not writable, ...) — container logs are the only debug channel.
+        let code = out.status.code().map(|c| c.to_string()).unwrap_or_else(|| "signal".into());
+        let err: String = String::from_utf8_lossy(&out.stderr)
+            .lines()
+            .take(4)
+            .collect::<Vec<_>>()
+            .join(" | ")
+            .chars()
+            .take(500)
+            .collect();
+        eprintln!("[node] probe {enc}/{tag} FAILED (ffmpeg exit {code}): {err}");
+    }
     let _ = std::fs::remove_file(&path);
     good
 }
@@ -610,7 +630,16 @@ fn detect_ffmpeg() -> Caps {
     // parallel contexts (probes drop out flakily under contention), so probes
     // for one device+backend run SEQUENTIALLY while different devices
     // (NVIDIA dGPU vs Intel iGPU) still probe in parallel.
-    let all = build_probe_tasks(&candidates, &enumerate_gpus());
+    let gpus = enumerate_gpus();
+    // Diagnostics for the "no HW encoders" case (e.g. containerized QNAP
+    // nodes): the container log is the only debug channel, so log what we
+    // saw — encoder candidates, GPU enumeration, and every failed probe.
+    println!("[node] encoder candidates: {candidates:?}");
+    println!(
+        "[node] gpus found: {:?}",
+        gpus.iter().map(|g| (g.kind.as_str(), g.index, g.name.as_str())).collect::<Vec<_>>()
+    );
+    let all = build_probe_tasks(&candidates, &gpus);
     let mut groups: Vec<(String, Vec<ProbeTask>)> = Vec::new();
     for t in all {
         let key = format!("{}|{}|{}", t.accel.kind, t.accel.device, t.accel.backend);
@@ -1672,6 +1701,26 @@ async fn main() {
     println!("[node] {} | server={} | ffmpeg={}", name, server, caps.ffmpeg_version);
     println!("[node] haccels={:?}", caps.haccels);
     println!("[node] hw_encoders={:?}", caps.hw_encoders);
+    // GPU/driver diagnostics (visible in `docker logs`):
+    match std::process::Command::new("nvidia-smi").args(["-L"]).output() {
+        Ok(o) if o.status.success() => {
+            println!("[node] nvidia-smi: {}", String::from_utf8_lossy(&o.stdout).trim())
+        }
+        Ok(o) => {
+            eprintln!(
+                "[node] nvidia-smi FAILED: {}",
+                String::from_utf8_lossy(&o.stderr).trim()
+            )
+        }
+        Err(e) => eprintln!("[node] nvidia-smi not runnable: {e}"),
+    }
+    // Workdir must be writable (probe files + job scratch land there):
+    match std::fs::write(in_dir().join(".wtest"), b"x") {
+        Ok(()) => {
+            let _ = std::fs::remove_file(in_dir().join(".wtest"));
+        }
+        Err(e) => eprintln!("[node] WORKDIR NOT WRITABLE: {} ({e})", in_dir().display()),
+    }
     let accel_desc: String = if caps.hw_encoders.is_empty() {
         "CPU only".to_string()
     } else {
