@@ -10,8 +10,16 @@ RUN cargo build --release
 # installed, so they can coexist with the system 545 libs):
 #
 #   /opt/nvidia-userland/<series>/lib  libcuda.so.1, libnvidia-encode.so.1,
-#                                       libnvidia-ml.so.1, libnvidia-cfg.so.1
+#                                       libnvidia-ml.so.1, libnvidia-cfg.so.1,
+#                                       libnvcuvid.so.1
 #   /opt/nvidia-userland/<series>/bin  nvidia-smi
+#
+# NOTE: libnvcuvid MUST be bundled with each series. Since 575,
+# libnvidia-encode.so.1 has a hard DT_NEEDED on libnvcuvid.so.1; without
+# a same-series copy on the LD path it resolves to a STALE system one
+# (e.g. the 545 fallback below) and NvEncOpenEncodeSessionEx dies with
+# "unsupported device (2)" — cuInit still passes, so the failure is easy
+# to misread as a host problem.
 #
 # Why several series: a NAS (e.g. QNAP) passes /dev/nvidia* into the
 # container but does NOT inject the host driver userland. The node reads
@@ -35,7 +43,7 @@ RUN set -x; \
     mkdir -p /opt/nvidia-userland/575/lib /opt/nvidia-userland/575/bin; \
     curl -sf -o /tmp/575.run https://us.download.nvidia.com/XFree86/Linux-x86_64/575.64.05/NVIDIA-Linux-x86_64-575.64.05.run; \
     sh /tmp/575.run --extract-only --target /tmp/575-ex; \
-    for f in libcuda.so* libnvidia-encode.so* libnvidia-ml.so* libnvidia-cfg.so*; do \
+    for f in libcuda.so* libnvidia-encode.so* libnvidia-ml.so* libnvidia-cfg.so* libnvcuvid.so*; do \
         cp -a /tmp/575-ex/$f /opt/nvidia-userland/575/lib/; \
     done; \
     cp -a /tmp/575-ex/nvidia-smi /opt/nvidia-userland/575/bin/; \
@@ -43,20 +51,21 @@ RUN set -x; \
         ln -sf libcuda.so.575.64.05 libcuda.so.1 && \
         ln -sf libnvidia-encode.so.575.64.05 libnvidia-encode.so.1 && \
         ln -sf libnvidia-ml.so.575.64.05 libnvidia-ml.so.1 && \
-        ln -sf libnvidia-cfg.so.575.64.05 libnvidia-cfg.so.1); \
+        ln -sf libnvidia-cfg.so.575.64.05 libnvidia-cfg.so.1 && \
+        ln -sf libnvcuvid.so.575.64.05 libnvcuvid.so.1); \
     echo "series 575 (official .run 575.64.05):"; ls -la /opt/nvidia-userland/575/lib/; \
     rm -rf /tmp/575-ex /tmp/575.run; \
     # ── 535 / 525 (Ubuntu jammy — older NAS firmware) ──
     for v in 535 525; do \
         mkdir -p /opt/nvidia-userland/$v/lib /opt/nvidia-userland/$v/bin; \
         ok=1; \
-        for p in libnvidia-compute-$v libnvidia-encode-$v nvidia-utils-$v; do \
+        for p in libnvidia-compute-$v libnvidia-encode-$v libnvidia-decode-$v nvidia-utils-$v; do \
             apt-get download $p >/dev/null 2>&1 || ok=0; \
         done; \
         if [ "$ok" = "1" ]; then \
             mkdir -p /tmp/ex-$v; \
             for d in *.deb; do dpkg -x "$d" /tmp/ex-$v/; done; \
-            for f in libcuda.so.1* libnvidia-encode.so.1* libnvidia-ml.so.1* libnvidia-cfg.so.1*; do \
+            for f in libcuda.so.1* libnvidia-encode.so.1* libnvidia-ml.so.1* libnvidia-cfg.so.1* libnvcuvid.so.1*; do \
                 cp -a /tmp/ex-$v/usr/lib/x86_64-linux-gnu/$f /opt/nvidia-userland/$v/lib/ 2>/dev/null || true; \
             done; \
             cp -a /tmp/ex-$v/usr/bin/nvidia-smi /opt/nvidia-userland/$v/bin/ 2>/dev/null || true; \

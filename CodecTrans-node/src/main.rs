@@ -617,7 +617,7 @@ fn fetch_nvidia_series(major: u32, ver: &str, root: &PathBuf) {
 cd {tmp}
 U=https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2204/x86_64/
 fix_symlinks() {{
-    for n in libcuda libnvidia-encode libnvidia-ml libnvidia-cfg; do
+    for n in libcuda libnvidia-encode libnvidia-ml libnvidia-cfg libnvcuvid; do
         t=$(ls {dl}/ 2>/dev/null | grep "^$n\.so\.[0-9]" | grep -v "^$n\.so\.1$" | head -1)
         if [ -n "$t" ]; then ln -sf "$t" {dl}/$n.so.1; fi
     done
@@ -628,7 +628,7 @@ fetch_run() {{
     case "{ver}" in *[!0-9.]*|'') return 9 ;; esac
     curl -sf -o nv.run "https://us.download.nvidia.com/XFree86/Linux-x86_64/{ver}/NVIDIA-Linux-x86_64-{ver}.run" || return 9
     sh nv.run --extract-only --target r || return 9
-    for f in libcuda.so* libnvidia-encode.so* libnvidia-ml.so* libnvidia-cfg.so*; do
+    for f in libcuda.so* libnvidia-encode.so* libnvidia-ml.so* libnvidia-cfg.so* libnvcuvid.so*; do
         cp -a r/$f {dl}/ 2>/dev/null || true
     done
     cp -a r/nvidia-smi {db}/ 2>/dev/null || true
@@ -636,6 +636,10 @@ fetch_run() {{
     fix_symlinks
 }}
 # path 2: NVIDIA CUDA repo debs (newest point release of the major series)
+# NOTE: the CUDA repo has NO libnvidia-decode (libnvcuvid) — if this path is
+# used, nvcuvid is absent and 575+ encode libs may fall back to a stale
+# system nvcuvid. Path 1 (.run) and path 3 (apt, with libnvidia-decode) are
+# preferred precisely for this reason.
 fetch_cuda_repo() {{
     curl -sf $U/ -o listing.html || return 9
     for base in libnvidia-compute-{m} libnvidia-encode-{m} libnvidia-cfg1-{m} nvidia-compute-utils-{m} nvidia-utils-{m}; do
@@ -648,7 +652,7 @@ fetch_cuda_repo() {{
 # packages, e.g. 580/595)
 fetch_apt() {{
     apt-get update -qq 2>/dev/null || true
-    for p in libnvidia-compute-{m} libnvidia-encode-{m} nvidia-utils-{m}; do
+    for p in libnvidia-compute-{m} libnvidia-encode-{m} libnvidia-decode-{m} nvidia-utils-{m}; do
         apt-get download $p 2>/dev/null || return 9
     done
 }}
@@ -663,7 +667,7 @@ fetch_run || {{
     [ -n "$(ls *.deb 2>/dev/null)" ] || exit 9
     mkdir -p ex
     for d in *.deb; do dpkg -x "$d" ex/; done
-    for f in libcuda.so* libnvidia-encode.so* libnvidia-ml.so* libnvidia-cfg.so*; do
+    for f in libcuda.so* libnvidia-encode.so* libnvidia-ml.so* libnvidia-cfg.so* libnvcuvid.so*; do
         cp -a ex/usr/lib/x86_64-linux-gnu/$f {dl}/ 2>/dev/null || true
     done
     cp -a ex/usr/bin/nvidia-smi {db}/ 2>/dev/null || true
