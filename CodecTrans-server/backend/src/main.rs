@@ -1399,11 +1399,104 @@ pub struct LibraryConfig {
     pub folders: Vec<FolderRule>,
     #[serde(default)]
     pub blocks: Vec<LogicBlock>,
+    /// ComfyUI-style node graph (nodes + directed edges). When it has
+    /// nodes, evaluation uses the graph; the legacy `blocks` list is a
+    /// linear-chain fallback (auto-migrated for display).
+    #[serde(default)]
+    pub graph: WorkflowGraph,
     /// Basenames of re-encoded outputs ever produced (tombstone). Skipped by
     /// rescans so a folder removed+re-added (or a server restart) never
     /// picks up our own outputs and re-encodes them.
     #[serde(default)]
     pub tombstone: Vec<String>,
+}
+
+// ── node-graph workflow (ComfyUI style) ─────────────────────────
+/// One node on the automation canvas.
+#[derive(Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct GraphNode {
+    pub id: String,
+    /// "start" | "condition" | "action"
+    #[serde(default)]
+    pub kind: String,
+    /// condition nodes: which files pass
+    #[serde(default)]
+    pub condition: Condition,
+    /// action nodes: what to do (encode/skip/healthcheck)
+    #[serde(default)]
+    pub action: Action,
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    #[serde(default)]
+    pub x: f64,
+    #[serde(default)]
+    pub y: f64,
+}
+
+/// A directed edge. `from_port` is "true"/"false" on condition nodes
+/// (which branch the file takes); absent for the single start output.
+#[derive(Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct GraphEdge {
+    pub from: String,
+    #[serde(default)]
+    pub from_port: Option<String>,
+    pub to: String,
+}
+
+#[derive(Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct WorkflowGraph {
+    #[serde(default)]
+    pub nodes: Vec<GraphNode>,
+    #[serde(default)]
+    pub edges: Vec<GraphEdge>,
+}
+
+/// Legacy `blocks` → linear graph: start → c1 →a1; c1(false) → c2 →a2; …
+/// so an old block list and its migrated graph mean exactly the same thing.
+fn migrate_blocks_to_graph(blocks: &[LogicBlock]) -> WorkflowGraph {
+    let live: Vec<&LogicBlock> = blocks.iter().filter(|b| b.enabled).collect();
+    let mut nodes = vec![GraphNode {
+        id: "start".into(),
+        kind: "start".into(),
+        enabled: true,
+        x: 40.0,
+        y: 160.0,
+        ..Default::default()
+    }];
+    let mut edges = Vec::new();
+    let mut prev_false: Option<String> = None;
+    for (i, b) in live.iter().enumerate() {
+        let cid = format!("c{}", i + 1);
+        let aid = format!("a{}", i + 1);
+        nodes.push(GraphNode {
+            id: cid.clone(),
+            kind: "condition".into(),
+            condition: b.condition.clone(),
+            enabled: true,
+            x: 340.0,
+            y: 30.0 + (i as f64) * 200.0,
+            ..Default::default()
+        });
+        nodes.push(GraphNode {
+            id: aid.clone(),
+            kind: "action".into(),
+            action: b.action.clone(),
+            enabled: true,
+            x: 660.0,
+            y: 30.0 + (i as f64) * 200.0,
+            ..Default::default()
+        });
+        let from = prev_false.clone().unwrap_or_else(|| "start".into());
+        // start→c1 is portless; cN(false)→cN+1 rides the ✗ branch
+        let port = if prev_false.is_some() { Some("false".into()) } else { None };
+        edges.push(GraphEdge { from, from_port: port, to: cid.clone() });
+        edges.push(GraphEdge { from: cid.clone(), from_port: Some("true".into()), to: aid });
+        prev_false = Some(cid);
+    }
+    WorkflowGraph { nodes, edges }
 }
 
 fn lib_cfg_path() -> PathBuf {
@@ -1462,7 +1555,37 @@ struct FoldersBody {
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct BlocksBody {
-    blocks: Vec<LogicBlock>,
+    blocks: Option<Vec<LogicBlock>>,
+    #[serde(default)]
+    graph: Option<WorkflowGraph>,
+}
+
+/// GET /api/library/blocks — returns the legacy list AND the node graph
+/// (auto-migrated from the legacy list when no graph is stored yet).
+pub async fn blocks_get(State(_store): State<Store>) -> impl IntoResponse {
+    let c = load_lib_cfg();
+    let graph = if c.graph.nodes.is_empty() && !c.blocks.is_empty() {
+        migrate_blocks_to_graph(&c.blocks)
+    } else {
+        c.graph
+    };
+    Json(json!({ "blocks": c.blocks, "graph": graph }))
+}
+
+/// POST /api/library/blocks — save the block list and/or the node graph.
+/// A saved non-empty graph takes precedence at evaluation time.
+pub async fn blocks_post(State(_store): State<Store>, Json(b): Json<BlocksBody>) -> Response {
+    let mut c = load_lib_cfg();
+    if let Some(blocks) = b.blocks.clone() {
+        c.blocks = blocks;
+    }
+    if let Some(graph) = b.graph.clone() {
+        c.graph = graph;
+    }
+    match save_lib_cfg(&c) {
+        Ok(_) => Json(json!({ "ok": true, "blocks": c.blocks, "graph": c.graph })).into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": e.to_string() }))).into_response(),
+    }
 }
 
 /// GET /api/library/folders
@@ -1472,7 +1595,7 @@ pub async fn folders_get(State(_store): State<Store>) -> impl IntoResponse {
 
 /// POST /api/library/folders — save the folder list. Catalog entries of
 /// removed folders are KEPT (marked "제거됨" in the UI) so re-adding the
-/// folder restores their done state instead of re-queuing everything.
+/// folder restores their done state instead of re-queueing everything.
 pub async fn folders_post(State(store): State<Store>, Json(b): Json<FoldersBody>) -> Response {
     let mut c = load_lib_cfg();
     c.folders = b.folders.clone();
@@ -1513,21 +1636,6 @@ pub async fn library_requeue(State(store): State<Store>, Json(req): Json<Requeue
     }
     persist_catalog(&store);
     Json(json!({ "ok": true })).into_response()
-}
-
-/// GET /api/library/blocks
-pub async fn blocks_get(State(_store): State<Store>) -> impl IntoResponse {
-    Json(json!({ "blocks": load_lib_cfg().blocks }))
-}
-
-/// POST /api/library/blocks — save the block list.
-pub async fn blocks_post(State(_store): State<Store>, Json(b): Json<BlocksBody>) -> Response {
-    let mut c = load_lib_cfg();
-    c.blocks = b.blocks.clone();
-    match save_lib_cfg(&c) {
-        Ok(_) => Json(json!({ "ok": true, "blocks": b.blocks })).into_response(),
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": e.to_string() }))).into_response(),
-    }
 }
 
 pub async fn auto_get(State(_store): State<Store>) -> impl IntoResponse {
@@ -1664,6 +1772,115 @@ fn cond_matches(c: &Condition, e: &LibraryEntry, online: &[Node]) -> bool {
         }
         _ => false,
     }
+}
+
+/// Evaluate the node graph for one file: from every `start` node follow the
+/// edges — a condition's ✓ port is taken when the condition matches (a
+/// disabled condition acts as an open gate), ✗ when it doesn't — and the
+/// FIRST `action` node reached wins. None = the file reached no action
+/// (caller falls back to the folder default).
+fn eval_graph(
+    g: &WorkflowGraph,
+    e: &LibraryEntry,
+    online: &[Node],
+    folder_target: &TargetCfg,
+) -> Option<(TargetCfg, bool)> {
+    use std::collections::HashSet;
+    if g.nodes.is_empty() {
+        return None;
+    }
+    let idx: std::collections::HashMap<&str, usize> = g
+        .nodes
+        .iter()
+        .enumerate()
+        .map(|(i, n)| (n.id.as_str(), i))
+        .collect();
+    // out[i] = (child, port) — deduped; children sorted by node order so
+    // the DFS (and therefore "first action wins") is deterministic.
+    let mut out: Vec<Vec<(usize, Option<String>)>> = vec![Vec::new(); g.nodes.len()];
+    for ed in &g.edges {
+        if let (Some(&a), Some(&b)) = (idx.get(ed.from.as_str()), idx.get(ed.to.as_str())) {
+            if a == b {
+                continue;
+            }
+            let p = ed.from_port.clone();
+            if !out[a].iter().any(|(c, q)| *c == b && q == &p) {
+                out[a].push((b, p));
+            }
+        }
+    }
+    for v in out.iter_mut() {
+        v.sort_by_key(|&(c, _)| c);
+    }
+    let mut visited: HashSet<usize> = HashSet::new();
+
+    fn rec(
+        i: usize,
+        g: &WorkflowGraph,
+        out: &[Vec<(usize, Option<String>)>],
+        visited: &mut HashSet<usize>,
+        e: &LibraryEntry,
+        online: &[Node],
+        folder_target: &TargetCfg,
+    ) -> Option<(TargetCfg, bool)> {
+        if !visited.insert(i) {
+            return None;
+        }
+        let n = &g.nodes[i];
+        let result: bool = match n.kind.as_str() {
+            "start" => true,
+            "condition" => !n.enabled || cond_matches(&n.condition, e, online),
+            "action" => {
+                if !n.enabled {
+                    return None;
+                }
+                return match n.action.kind.as_str() {
+                    "encode" => Some((
+                        n.action
+                            .target
+                            .clone()
+                            .unwrap_or_else(|| folder_target.clone()),
+                        true,
+                    )),
+                    "healthcheck" => {
+                        if online.iter().any(|n| n.status == "online") {
+                            Some((
+                                folder_target.clone(),
+                                folder_target.video_codec.is_some(),
+                            ))
+                        } else {
+                            Some((TargetCfg::default(), false))
+                        }
+                    }
+                    _ => Some((TargetCfg::default(), false)), // skip
+                };
+            }
+            _ => false,
+        };
+        for (j, port) in out[i].iter().cloned() {
+            let taken = match port.as_deref() {
+                None => true,
+                Some("true") => result,
+                Some("false") => !result,
+                _ => false,
+            };
+            if taken {
+                if let Some(d) = rec(j, g, out, visited, e, online, folder_target) {
+                    return Some(d);
+                }
+            }
+        }
+        None
+    }
+
+    for (i, n) in g.nodes.iter().enumerate() {
+        if n.kind == "start" {
+            if let Some(d) = rec(i, g, &out, &mut visited, e, online, folder_target) {
+                return Some(d);
+            }
+        }
+    }
+    None
 }
 
 // ============================================================
@@ -1954,6 +2171,20 @@ pub async fn library_scan(State(store): State<Store>, Json(req): Json<ScanReq>) 
         list_nodes_redis(c, "online", None, None).await
     };
     let has_blocks = libcfg.blocks.iter().any(|b| b.enabled);
+    // Effective automation graph: the saved graph if it has real nodes,
+    // else the legacy block list migrated to a linear graph (same meaning).
+    let eff_graph: Option<WorkflowGraph> = if libcfg
+        .graph
+        .nodes
+        .iter()
+        .any(|n| n.kind == "condition" || n.kind == "action")
+    {
+        Some(libcfg.graph.clone())
+    } else if has_blocks {
+        Some(migrate_blocks_to_graph(&libcfg.blocks))
+    } else {
+        None
+    };
     let mut queued: Vec<String> = Vec::new();
     let mut skipped: Vec<String> = Vec::new();
     for e in entries.iter_mut() {
@@ -1966,34 +2197,9 @@ pub async fn library_scan(State(store): State<Store>, Json(req): Json<ScanReq>) 
             .find(|f| e.folder.as_deref() == Some(f.id.as_str()))
             .map(|f| f.target.clone())
             .unwrap_or_default();
-        let decision: Option<(TargetCfg, bool)> = if has_blocks {
-            let mut d: Option<(TargetCfg, bool)> = None;
-            for b in libcfg.blocks.iter().filter(|b| b.enabled) {
-                if cond_matches(&b.condition, e, &online) {
-                    match b.action.kind.as_str() {
-                        "encode" => {
-                            let t = b
-                                .action
-                                .target
-                                .clone()
-                                .unwrap_or_else(|| folder_target.clone());
-                            d = Some((t, true));
-                        }
-                        "skip" => d = Some((TargetCfg::default(), false)),
-                        "healthcheck" => d = if online.iter().any(|n| n.status == "online") {
-                            Some((
-                                folder_target.clone(),
-                                folder_target.video_codec.is_some(),
-                            ))
-                        } else {
-                            Some((TargetCfg::default(), false))
-                        },
-                        _ => d = Some((TargetCfg::default(), false)),
-                    }
-                    break;
-                }
-            }
-            d.or_else(|| {
+        let decision: Option<(TargetCfg, bool)> = if let Some(g) = &eff_graph {
+            // Walk the node graph; first action reached wins.
+            eval_graph(g, e, &online, &folder_target).or_else(|| {
                 Some((
                     folder_target.clone(),
                     folder_target.video_codec.is_some(),

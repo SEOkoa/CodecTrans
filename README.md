@@ -54,15 +54,22 @@ CT_SERVER=http://<server>:8400 ./CodecTrans-node/run.sh
   (`GET /api/nodes?status=…&backend=…&family=…`). Jobs themselves stay in memory.
   Without Redis the server retries the connection on startup and won't bind.
 - **Library automation** (UI tabs *Library* / *Logic*): register watch folders; the server
-  scans them read-only and auto-queues newly found videos. The *Logic* tab is a top-down
-  condition→action block chain (source codec, size/bitrate thresholds, **name contains**,
-  "node has HW accel for this codec" — first match wins, else the folder's default target).
-  Re-encoded files land next to their source and are skipped on rescan (tombstone guard).
-  The status column shows a live progress bar, a ⟳ re-encode button and the error message
-  on failure; a summary row counts files / done / errors / bytes saved. Jobs stuck in
-  `dispatched` for 10+ min (node died) self-heal back to the queue. A result is only marked
-  `done` after its on-disk size is verified — a corrupt/torn upload surfaces as an error
-  you can re-queue, never a silent 0-byte "done".
+  scans them read-only and auto-queues newly found videos. The *Logic* tab is a
+  **ComfyUI-style node graph**: drag **조건 (condition)** and **액션 (action)** nodes
+  around a dotted canvas and wire them together (socket → socket). A file enters at the
+  ▶ **시작 (start)** node and follows the wires to the **first action node it reaches**;
+  condition nodes split into ✓ (true) / ✗ (false) branches, so chaining conditions in
+  series is AND, fan-out is OR. Condition kinds: source codec, size/bitrate thresholds,
+  *name contains*, "node has HW accel for this codec"; actions: start encoding
+  (codec / CRF or % of source bitrate / audio), healthcheck, skip. A file that reaches
+  no action uses the folder's default target. Re-encoded files land next to their
+  source and are skipped on rescan (tombstone guard). The status column shows a live
+  progress bar, a ⟳ re-encode button and the error message on failure; a summary row
+  counts files / done / errors / bytes saved. Jobs stuck in `dispatched` for 10+ min
+  (node died) self-heal back to the queue. A result is only marked `done` after its
+  on-disk size is verified — a corrupt/torn upload surfaces as an error you can
+  re-queue, never a silent 0-byte "done". Old ordered block lists are auto-migrated to
+  an equivalent graph on first load.
 - The node probes every (device, backend, encoder) combination at startup and reports
   accelerators per physical device: `GPU #0 (nvenc)`, `CPU #0 (qsv)`, `CPU #0 (vaapi)`, …
 - The server auto-rewrites logical codecs to the node's best working HW encoder

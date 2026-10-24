@@ -119,13 +119,13 @@ export const api = {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ folders }),
     }),
-  // logic blocks (condition → action automation, evaluated top to bottom)
-  blocksGet: () => jfetch("/api/library/blocks").then((r) => r.blocks || []),
-  blocksPost: (blocks) =>
+  // logic automation (node graph: {graph} — legacy {blocks} still accepted)
+  blocksGet: () => jfetch("/api/library/blocks"),
+  blocksPost: (body) =>
     jfetch("/api/library/blocks", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ blocks }),
+      body: JSON.stringify(body),
     }),
 };
 
