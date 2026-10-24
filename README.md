@@ -160,16 +160,29 @@ volumes:
 Register `/media/media`, `/media/movies` in the web UI (🔍 폴더 찾아보기
 lists them once the mount is live).
 
-**3. GPU (e.g. RTX 3050).** The compose runs the node with
-`runtime: nvidia` + `NVIDIA_DRIVER_CAPABILITIES=video,utility`. Prerequisites
-on the NAS: an installed NVIDIA driver **and** the nvidia-container-toolkit
-(`docker info` must list the `nvidia` runtime). Then the containerized node
-auto-probes the GPU and reports its real NVENC encoders — an RTX 3050
-(Ampere) reports H.264/HEVC NVENC (no AV1 encode; that's Ada/RTX 40 and
-newer), newer cards also AV1. No GPU: delete the `runtime` line + the
-`NVIDIA_*` vars and the node runs software-only (enable `allowSoftware` in
-the dashboard gear). Verified in-container: node on the nvidia runtime
-probed `nvenc device 0` and encoded AV1 (Blackwell test box) end to end.
+**3. GPU (e.g. RTX 3050).** The node image ships its own NVIDIA driver
+*userland* (libcuda + libnvidia-encode + nvidia-smi, 545/CUDA 12.3 series),
+so NVENC works with plain **device passthrough** — no nvidia docker runtime
+needed:
+
+```yaml
+privileged: true
+ipc: host
+devices:
+  - /dev/nvidia0:/dev/nvidia0
+  - /dev/nvidiactl:/dev/nvidiactl
+  - /dev/nvidia-uvm:/dev/nvidia-uvm
+  - /dev/nvidia-uvm-tools:/dev/nvidia-uvm-tools
+```
+
+Requires an NVIDIA driver **≥ 545** on the NAS (the 545 userland works with
+any newer kernel driver). The containerized node then auto-probes the GPU
+and reports its real NVENC encoders — an RTX 3050 (Ampere) reports
+H.264/HEVC NVENC (no AV1 encode; that's Ada/RTX 40 and newer). With the
+`nvidia` runtime available instead, the host's injected driver libraries
+take precedence and the built-in ones are shadowed — both paths work.
+No GPU: remove the `privileged`/`devices`/`ipc` lines and the node runs
+software-only (enable `allowSoftware` in the dashboard gear).
 
 **4. Start:**
 
@@ -193,8 +206,9 @@ docker compose -f docker/docker-compose.yml up -d
   (0644) — readable by QNAP services. If you need specific uid/gid, remap
   the share or run the server service with `user: "1000:1000"` (QNAP QUGID)
   and chown the `server-data` volume once.
-- **Images:** `ubuntu:24.04` + ffmpeg 6.1 (NVENC incl. AV1 on Ada/Blackwell),
-  ~800MB each, `linux/amd64`.
+- **Images:** server = `ubuntu:24.04` + ffmpeg 6.1; node = `ubuntu:22.04`
+  + ffmpeg 4.4 + bundled NVIDIA userland (545 series — see GPU note above),
+  `linux/amd64`.
 
 ## Per-OS support
 
