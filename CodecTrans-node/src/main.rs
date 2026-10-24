@@ -480,6 +480,63 @@ fn probe_hw_encoder(enc: &str, tag: &str, vf: &str, extra_args: &[String], env: 
     good
 }
 
+/// Selected bundled NVIDIA userland libdir (set by pick_nvidia_series).
+static NVIDIA_LIBDIR: Mutex<Option<String>> = Mutex::new(None);
+
+fn nvidia_libdir() -> Option<String> {
+    NVIDIA_LIBDIR.lock().unwrap().clone()
+}
+
+/// Pick the bundled NVIDIA userland series that matches THIS host's kernel
+/// driver. The NAS doesn't inject the host driver userland into containers
+/// (verified on the user's QNAP: /usr/local/nvidia is absent), so the host
+/// driver version is invisible from inside — the only way to find the match
+/// is to try: a version-skewed userland fails cuInit with
+/// CUDA_ERROR_SYSTEM_DRIVER_MISMATCH. /opt/nvidia-userland/<ver>/lib holds
+/// one series each; try newest first, remember the winner. Probe envs and
+/// per-job ffmpeg envs then prepend it to LD_LIBRARY_PATH.
+fn pick_nvidia_series() {
+    let root = PathBuf::from("/opt/nvidia-userland");
+    let mut series: Vec<u32> = Vec::new();
+    if let Ok(rd) = std::fs::read_dir(&root) {
+        for e in rd.filter_map(|e| e.ok()) {
+            if let Some(v) = e.file_name().to_str().and_then(|s| s.parse::<u32>().ok()) {
+                series.push(v);
+            }
+        }
+    }
+    if series.is_empty() {
+        return; // no bundled series (bare host / non-NVIDIA box)
+    }
+    series.sort_by(|a, b| b.cmp(a)); // newest first
+    for v in series {
+        let lib = root.join(v.to_string()).join("lib");
+        if !lib.is_dir() {
+            continue;
+        }
+        dlog(format!("nvidia userland series {v}: testing cuInit against host driver"));
+        let ok = probe_hw_encoder(
+            "h264_nvenc",
+            &format!("series{v}"),
+            "format=nv12",
+            &[],
+            &[("LD_LIBRARY_PATH".into(), lib.to_string_lossy().to_string())],
+        );
+        if ok {
+            dlog(format!(
+                "nvidia userland series {v} WORKS — all NVENC runs will use {}",
+                lib.display()
+            ));
+            *NVIDIA_LIBDIR.lock().unwrap() = Some(lib.to_string_lossy().to_string());
+            return;
+        }
+    }
+    dlog(
+        "no bundled nvidia series matched the host driver — NVENC falls back to system libs (expect DRIVER_MISMATCH if the host driver is older than the system series)"
+            .to_string(),
+    );
+}
+
 /// One probe task: encoder + device selection + the Accel entry it feeds.
 struct ProbeTask {
     enc: String,
@@ -512,12 +569,19 @@ fn build_probe_tasks(encs: &[String], devs: &[GpuDev]) -> Vec<ProbeTask> {
                 for e in encs.iter().filter(|e| e.ends_with("_nvenc")) {
                     let mut a = base();
                     a.backend = "nvenc".into();
+                    let mut env = vec![(
+                        "CUDA_VISIBLE_DEVICES".to_string(),
+                        d.index.to_string(),
+                    )];
+                    if let Some(lib) = nvidia_libdir() {
+                        env.push(("LD_LIBRARY_PATH".to_string(), lib));
+                    }
                     tasks.push(ProbeTask {
                         enc: e.clone(),
                         tag: format!("nvenc{}", d.index),
                         vf: "format=nv12".into(),
                         extra_args: vec![],
-                        env: vec![("CUDA_VISIBLE_DEVICES".into(), d.index.to_string())],
+                        env,
                         accel: a,
                     });
                 }
@@ -647,9 +711,10 @@ fn detect_ffmpeg() -> Caps {
     // for one device+backend run SEQUENTIALLY while different devices
     // (NVIDIA dGPU vs Intel iGPU) still probe in parallel.
     let gpus = enumerate_gpus();
-    // Diagnostics for the "no HW encoders" case (e.g. containerized QNAP
-    // nodes): the container log is the only debug channel, so log what we
-    // saw — encoder candidates, GPU enumeration, and every failed probe.
+    // Containerized NAS nodes: the host NVIDIA driver version is invisible
+    // from inside, so pick the bundled userland series that can actually
+    // init CUDA before any NVENC probe (see pick_nvidia_series).
+    pick_nvidia_series();
     dlog(format!("encoder candidates: {candidates:?}"));
     dlog(format!(
         "gpus found: {:?}",
@@ -770,7 +835,13 @@ fn pin_device(job: &RemoteJob, eff: &str, caps: &Caps) -> (Vec<(&'static str, St
     let d = enumerate_gpus().into_iter().find(|d| d.index == dev && d.kind == kind);
     match backend.as_str() {
         "nvenc" => match d {
-            Some(d) => (vec![("CUDA_VISIBLE_DEVICES", d.index.to_string())], vec![]),
+            Some(d) => {
+                let mut e = vec![("CUDA_VISIBLE_DEVICES", d.index.to_string())];
+                if let Some(lib) = nvidia_libdir() {
+                    e.push(("LD_LIBRARY_PATH", lib));
+                }
+                (e, vec![])
+            }
             None => (vec![], vec![]),
         },
         "vaapi" | "qsv" => {
@@ -1893,6 +1964,28 @@ async fn main() {
                 if o.status.success() {
                     dlog(format!(
                         "nvidia-smi({p}): {}",
+                        String::from_utf8_lossy(&o.stdout).trim()
+                    ));
+                }
+            }
+        }
+        // The selected bundled series' nvidia-smi speaks the host driver's
+        // version (it only works when the series matches the kernel driver).
+        if let Some(lib) = nvidia_libdir() {
+            let bin = std::path::Path::new(&lib).join("../bin/nvidia-smi");
+            if let Ok(o) = std::process::Command::new(&bin)
+                .env("LD_LIBRARY_PATH", &lib)
+                .args(["--query-gpu=driver_version,name", "--format=csv,noheader"])
+                .output()
+            {
+                if o.status.success() {
+                    dlog(format!(
+                        "host driver (via {} libs): {}",
+                        std::path::Path::new(&lib)
+                            .parent()
+                            .and_then(|s| s.file_name())
+                            .map(|s| s.to_string_lossy().to_string())
+                            .unwrap_or_default(),
                         String::from_utf8_lossy(&o.stdout).trim()
                     ));
                 }

@@ -175,28 +175,32 @@ devices:
   - /dev/nvidia-uvm-tools:/dev/nvidia-uvm-tools
 ```
 
-Requires an NVIDIA driver **≥ 545** on the NAS (the bundled 545 userland
-works with any newer kernel driver). **Older host driver (e.g. QNAP images
-shipped with the 535 series)?** The probe fails with
-`CUDA_ERROR_SYSTEM_DRIVER_MISMATCH` — the bundled userland is then newer
-than the kernel driver and must be bypassed. If the NAS injects the host
-driver userland into containers (QNAP does — its own `nvidia-smi` is
-visible inside), point the loader at it in the node service:
+The host driver version is **invisible from inside the container** (the
+NAS doesn't inject its userland), so the node image bundles **several
+driver userland series** (535 / 525 / 470) under `/opt/nvidia-userland/`
+and at startup tries each one (newest first) with a real `cuInit` probe —
+the series that matches the host kernel driver wins and is used for every
+NVENC run (a mismatched series fails with
+`CUDA_ERROR_SYSTEM_DRIVER_MISMATCH`). The 545 system libraries remain as
+the fallback for host drivers ≥ 545. The startup log says which series was
+tested and which one works, plus the host driver version once a series
+matches:
 
-```yaml
-environment:
-  - LD_LIBRARY_PATH=/usr/local/nvidia/lib64
-  - PATH=/usr/local/nvidia/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+```
+[node] nvidia userland series 535: testing cuInit against host driver
+[node] nvidia userland series 535 WORKS — all NVENC runs will use /opt/nvidia-userland/535/lib
+[node] host driver (via 535 libs): 535.183.01, NVIDIA GeForce RTX 3050
 ```
 
-The node logs its container NVIDIA diagnostics at startup (PATH /
-LD_LIBRARY_PATH, `/usr/local/nvidia` contents, the host `nvidia-smi`
-driver version, resolvable CUDA libs) so the right fix is visible in
-`docker logs`. The containerized node then auto-probes the GPU and reports
-its real NVENC encoders — an RTX 3050 (Ampere) reports H.264/HEVC NVENC
-(no AV1 encode; that's Ada/RTX 40 and newer). With the `nvidia` runtime
-available instead, the host's injected driver libraries take precedence
-and the built-in ones are shadowed — both paths work.
+No compose changes needed for this. The containerized node then
+auto-probes the GPU and reports its real NVENC encoders — an RTX 3050
+(Ampere) reports H.264/HEVC NVENC (no AV1 encode; that's Ada/RTX 40 and
+newer). With the `nvidia` runtime available instead, the host's injected
+driver libraries take precedence and the built-in ones are shadowed.
+If **none** of the bundled series matches (host driver outside 470–545),
+the node falls back to the 545 system libs and logs why — send the
+`nvidia userland` log lines and `cat /proc/driver/nvidia/version` from
+the NAS (SSH) so a matching series can be added to the image.
 No GPU: remove the `privileged`/`devices`/`ipc` lines and the node runs
 software-only (enable `allowSoftware` in the dashboard gear).
 
