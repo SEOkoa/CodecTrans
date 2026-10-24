@@ -129,6 +129,9 @@ export const api = {
     }),
   // logic automation (node graph: {graph} — legacy {blocks} still accepted)
   blocksGet: () => jfetch("/api/library/blocks"),
+  // filesystem tree browser (library folder picker): one directory level
+  fsChildren: (path) =>
+    jfetch("/api/fs/children?path=" + encodeURIComponent(path || "/")),
   blocksPost: (body) =>
     jfetch("/api/library/blocks", {
       method: "POST",

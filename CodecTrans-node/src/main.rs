@@ -691,6 +691,52 @@ struct RemoteJob {
     /// bitrate and the user's "% of source" setting). Wins over crf.
     #[serde(default)]
     video_bitrate: Option<u32>,
+    /// Multi-GPU: the physical device (0-based index within its kind, as
+    /// reported in our `accels`) the server pinned this encode to.
+    #[serde(default)]
+    gpu_device: Option<u32>,
+}
+
+/// Multi-GPU device pinning: the server picked the concrete encoder AND a
+/// physical device for this job. We re-derive how to pin ffmpeg to that
+/// device:
+///   nvenc  -> CUDA_VISIBLE_DEVICES=<nvidia-smi index>
+///   vaapi  -> -vaapi_device <render node>
+///   qsv    -> -qsv_device <render node> (Linux; Windows picks its own)
+/// When several devices share the same index across kinds (a dGPU #0 and an
+/// iGPU #0), the reported accel entry for (device, backend, encoder) breaks
+/// the tie. Returns (extra env vars, extra args) — both empty when there is
+/// nothing to pin (software, single-device box, unknown device).
+fn pin_device(job: &RemoteJob, eff: &str, caps: &Caps) -> (Vec<(&'static str, String)>, Vec<String>) {
+    let Some(dev) = job.gpu_device else { return (vec![], vec![]) };
+    let backend = eff.rsplit('_').next().unwrap_or("").to_string();
+    if !is_hw_encoder(eff) {
+        return (vec![], vec![]);
+    }
+    let acc = caps
+        .accels
+        .iter()
+        .find(|a| a.device == dev && a.backend == backend && a.encoders.iter().any(|e| e == eff));
+    let kind = acc.map(|a| a.kind.clone()).unwrap_or_else(|| "gpu".to_string());
+    let d = enumerate_gpus().into_iter().find(|d| d.index == dev && d.kind == kind);
+    match backend.as_str() {
+        "nvenc" => match d {
+            Some(d) => (vec![("CUDA_VISIBLE_DEVICES", d.index.to_string())], vec![]),
+            None => (vec![], vec![]),
+        },
+        "vaapi" | "qsv" => {
+            let node = d.and_then(|d| d.render_node);
+            match node {
+                Some(n) => {
+                    let flag = if backend == "qsv" { "-qsv_device" } else { "-vaapi_device" };
+                    (vec![], vec![flag.to_string(), n])
+                }
+                None => (vec![], vec![]),
+            }
+        }
+        // videotoolbox / mft / amf: single-device or backend-managed.
+        _ => (vec![], vec![]),
+    }
 }
 
 #[derive(Clone, Serialize)]
@@ -890,6 +936,12 @@ async fn run_job(client: reqwest::Client, state: NState, server: String, node_id
 
     // 2. build ffmpeg args
     let eff = job.effective_video_codec.clone();
+    // Multi-GPU: server pinned a physical device for this encode (nvenc ->
+    // CUDA_VISIBLE_DEVICES, vaapi/qsv -> the matching render node).
+    let (pin_env, pin_args) = {
+        let caps = state.lock().unwrap().caps.clone();
+        pin_device(&job, &eff, &caps)
+    };
     let mut args: Vec<String> = vec![
         "-hide_banner".into(),
         "-nostdin".into(),
@@ -905,11 +957,14 @@ async fn run_job(client: reqwest::Client, state: NState, server: String, node_id
     if eff.ends_with("_vaapi") {
         args.push("-vf".into());
         args.push("format=nv12,hwupload".into());
-        if let Some(dev) = pick_vaapi_device() {
-            args.push("-vaapi_device".into());
-            args.push(dev);
+        if pin_args.is_empty() {
+            if let Some(dev) = pick_vaapi_device() {
+                args.push("-vaapi_device".into());
+                args.push(dev);
+            }
         }
     }
+    args.extend(pin_args);
     args.push("-c:v".into());
     args.push(eff.clone());
     if let Some(kbps) = job.video_bitrate {
@@ -966,7 +1021,7 @@ async fn run_job(client: reqwest::Client, state: NState, server: String, node_id
 
     let total = probe_duration(&in_path.to_string_lossy()).await;
 
-    let mut child = match Command::new("ffmpeg").args(&args).stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::piped()).spawn() {
+    let mut child = match Command::new("ffmpeg").args(&args).envs(pin_env.into_iter()).stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::piped()).spawn() {
         Ok(c) => c,
         Err(e) => {
             let msg = format!("spawn ffmpeg failed: {e}");

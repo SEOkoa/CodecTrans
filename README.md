@@ -44,6 +44,28 @@ CT_SERVER=http://<server>:8400 ./CodecTrans-node/run.sh
 - server API: `:8400/api/health` · node local API: `:8401/api/health`
 - node bind: `CT_BIND=local|all` (default `all`), `CT_NODE_NAME`, `CT_PORT`
 
+## Installing a node (wizard)
+
+`CodecTrans-node/install-node.sh` walks a new machine through the whole setup —
+server address, display name, bind, concurrent jobs, **GPU selection** (pins
+`CUDA_VISIBLE_DEVICES` on multi-GPU boxes), and an **optional NFS share**
+(mounts it and writes `/etc/fstab` so the mount survives reboots). It then
+starts the node (nohup by default, `--daemon` for a systemd unit on Linux)
+and **verifies** the local API and the node's registration on the server:
+
+```sh
+# interactive (asks each question)
+./install-node.sh
+
+# unattended
+./install-node.sh --server http://192.168.x.x:8400 --name "NAS node" \
+    --jobs 2 --gpus all --nfs nas:/exports/videos /mnt/videos --yes
+```
+
+On macOS the wizard still works, but remember the headless-SSH routing quirk
+(see below): for a reboot-proof Mac node, run it inside the server's
+`mac-supervisor.sh` SSH loop instead.
+
 ## Notes
 
 - The **node registry lives in Redis** (`ct:node:*` keys): node identity (UUID) survives
@@ -72,6 +94,33 @@ CT_SERVER=http://<server>:8400 ./CodecTrans-node/run.sh
   an equivalent graph on first load.
 - The node probes every (device, backend, encoder) combination at startup and reports
   accelerators per physical device: `GPU #0 (nvenc)`, `CPU #0 (qsv)`, `CPU #0 (vaapi)`, …
+  **Multi-GPU nodes:** the server pins each job to a concrete physical device
+  (least-loaded first) — `CUDA_VISIBLE_DEVICES` for NVENC, `-vaapi_device` / `-qsv_device`
+  render nodes otherwise — so a two-GPU box actually uses both; raise the node's
+  concurrent-job count (dashboard gear) to let them run in parallel.
+- **Post-encode chain:** the encode action node has an output port — chain
+  *인코딩 이후* nodes on it and they run (in order) when the finished file
+  arrives: **출력 검증** (ffprobe health check — video stream present +
+  duration ≥ 50% of source; verify ALL files, a random N% sample, or every
+  Nth — a stable key hash, so big folders aren't probed file by file; on
+  failure: mark error **or send back to the queue** to retry), **원본 대치**
+  (the finished file takes the source's path; the original is kept as
+  `name.orig.ext` and tombstoned so rescans never re-queue it), **원본 위치
+  에 저장** (keep the output next to the source — the library default, made
+  explicit), **큐로 되돌리기** (re-queue the entry after the chain). A failed
+  health check stops the chain (never replaces a corrupt file).
+- **⚡ HW-only encode:** the encode action has an *HW 전용* checkbox — the
+  file is never sent to a node without a working hardware encoder for its
+  codec (no software fallback, no other-node fallback). With no capable node
+  online the entry shows a clear error and a later rescan retries it; the
+  pair with the *HW 가속 지원* condition lets you branch "encode if a
+  capable node exists / skip otherwise".
+- The folder-row **✓/⟲ checkboxes** in the Library tab still work for
+  folders without a graph (legacy target flags fold into the same post-encode
+  plan).
+- The Library tab's **🔍 폴더 찾아보기** opens a filesystem tree browser
+  (`GET /api/fs/children`) — click through directories, jump to any absolute path,
+  see video files inline, and add the selected folder to the watch list in one click.
 - The server auto-rewrites logical codecs to the node's best working HW encoder
   (nvenc > vaapi > qsv > amf > videotoolbox > software) and records `effectiveVideoCodec` + `accelerated` per job.
 - `frontend/dist` is committed so a clone runs without a Node toolchain; rebuild it with

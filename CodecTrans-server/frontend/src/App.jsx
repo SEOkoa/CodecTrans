@@ -111,6 +111,15 @@ function nodeTitle(n) {
     case "action":
       if (a.kind === "skip") return "건너뛰기";
       if (a.kind === "healthcheck") return "헬스체크";
+      if (a.kind === "verify") {
+        const m = a.verifyMode || "all";
+        if (m === "pct") return "출력 검증 · " + (a.verifyValue ?? 100) + "% 샘플";
+        if (m === "every") return "출력 검증 · " + (a.verifyValue ?? 1) + "에 1개";
+        return "출력 검증 (전체)";
+      }
+      if (a.kind === "replace") return "원본 대치";
+      if (a.kind === "saveHere") return "원본 위치에 저장";
+      if (a.kind === "requeue") return "큐로 되돌리기";
       const t = a.target || {};
       const chs = t.choices || [];
       if (chs.length) {
@@ -122,10 +131,10 @@ function nodeTitle(n) {
           m0 === "crf"
             ? "CRF " + (chs[0].crf ?? t.crf ?? 23)
             : (chs[0].bitratePct ?? t.bitratePct ?? 70) + "%";
-        return "인코딩 → " + names.join(" → ") + " · " + prate;
+        return "인코딩 → " + names.join(" → ") + " · " + prate + (a.hwOnly ? " · ⚡HW 전용" : "");
       }
       const rate = t.mode === "crf" ? "CRF " + (t.crf ?? 23) : (t.bitratePct ?? 70) + "%";
-      return "인코딩 → " + (t.videoCodec ? codec(t.videoCodec) : "폴더 기본") + " · " + rate;
+      return "인코딩 → " + (t.videoCodec ? codec(t.videoCodec) : "폴더 기본") + " · " + rate + (a.hwOnly ? " · ⚡HW 전용" : "");
     default:
       return n.kind;
   }
@@ -259,6 +268,12 @@ export default function App() {
   const [folders, setFolders] = useState([]);
   const [folderMsg, setFolderMsg] = useState("");
   const [newFolder, setNewFolder] = useState("");
+  // filesystem tree browser (folder picker)
+  const [treeOpen, setTreeOpen] = useState(false);
+  const [tree, setTree] = useState(null); // {path, parent, dirs, files}
+  const [treePath, setTreePath] = useState("/");
+  const [treeJump, setTreeJump] = useState("");
+  const [treeErr, setTreeErr] = useState("");
   // logic automation — named logics (saved list; the canvas edits one).
   // The library tab assigns a named logic (or none) to each folder.
   const [graph, setGraph] = useState({ nodes: [], edges: [] });
@@ -611,6 +626,63 @@ export default function App() {
     ]);
     setNewFolder("");
   }
+  // ── filesystem tree browser ────────────────────────────────
+  async function loadTree(path) {
+    try {
+      const d = await api.fsChildren(path);
+      setTree(d);
+      setTreePath(d.path);
+      setTreeErr("");
+    } catch (err) {
+      setTreeErr(err.message || "불러오기 실패");
+    }
+  }
+  function openTree() {
+    setTreeOpen(true);
+    setTreeJump("");
+    loadTree("/");
+  }
+  function treeNav(path) {
+    loadTree(path);
+  }
+  function treeJumpGo() {
+    const p = treeJump.trim();
+    if (!p) return;
+    loadTree(p.startsWith("/") ? p : "/" + p);
+  }
+  function treeUp() {
+    if (tree?.parent && tree.parent !== treePath) loadTree(tree.parent);
+  }
+  function addTreeFolder() {
+    const p = treePath;
+    if (!p || folders.some((f) => f.path === p)) return;
+    saveFolders([
+      ...folders,
+      {
+        id: uid(),
+        path: p,
+        enabled: true,
+        target: {
+          videoCodec: "h265",
+          audioCodec: "aac",
+          container: "mp4",
+          mode: "pct",
+          bitratePct: 70,
+        },
+      },
+    ]);
+    setTreeOpen(false);
+  }
+  const treeCrumbs = (p) => {
+    const parts = p.split("/").filter(Boolean);
+    const out = [{ label: "/", path: "/" }];
+    let acc = "";
+    for (const part of parts) {
+      acc += "/" + part;
+      out.push({ label: part, path: acc });
+    }
+    return out;
+  };
   const patchFolder = (id, fn) =>
     saveFolders(folders.map((f) => (f.id === id ? fn(f) : f)));
   const patchTarget = (id, patch) =>
@@ -766,15 +838,16 @@ export default function App() {
     const cur = n?.action?.target?.choices || [];
     patchActTarget(id, { choices: cur.map((c) => ({ ...c, ...patch })) });
   };
-  const addNode = (kind, preset = {}) => {
+  const addNode = (kind, preset = {}, pos = null) => {
     const g = graphRef.current;
     if (kind === "start" && g.nodes.some((n) => n.kind === "start")) return;
     const id = `n${Date.now().toString(36)}${Math.floor(Math.random() * 999)}`;
     const base = {
       id,
       enabled: true,
-      x: 380 + (g.nodes.length % 4) * 48,
-      y: 50 + (g.nodes.length % 6) * 44,
+      // explicit drop position wins; otherwise a cascading default slot
+      x: pos ? pos.x : 380 + (g.nodes.length % 4) * 48,
+      y: pos ? pos.y : 50 + (g.nodes.length % 6) * 44,
     };
     let node;
     if (kind === "start") node = { ...base, kind: "start" };
@@ -794,6 +867,8 @@ export default function App() {
         action:
           preset.kind === "encode"
             ? { kind: "encode", target: { videoCodec: "av1", container: "mp4", mode: "pct", bitratePct: 70 } }
+            : preset.kind === "verify"
+            ? { kind: "verify", verifyMode: "all" }
             : { kind: preset.kind || "skip" },
       };
     else return;
@@ -810,6 +885,40 @@ export default function App() {
   const removeEdgeAt = (i) => {
     const g = graphRef.current;
     commitGraph({ ...g, edges: g.edges.filter((_, j) => j !== i) });
+  };
+  // Palette → canvas drag & drop. HTML5 DnD: the payload travels in
+  // dataTransfer (readable only on drop), and the drop point is converted
+  // from canvas-viewport px to world coordinates (pan + zoom aware).
+  const palDragStart = (e, kind, preset) => {
+    e.dataTransfer.setData("application/x-ct-node", JSON.stringify({ kind, preset }));
+    e.dataTransfer.effectAllowed = "copy";
+  };
+  const Pal = ({ kind, preset, disabled, children }) => (
+    <button
+      className="gpal-item"
+      draggable={!disabled}
+      disabled={disabled}
+      onClick={() => addNode(kind, preset)}
+      onDragStart={(e) => palDragStart(e, kind, preset)}
+      title="클릭 = 기본 위치 추가 · 캔버스로 드래그 = 놓은 위치에 추가"
+    >
+      {children}
+    </button>
+  );
+  const onCanvasDrop = (e) => {
+    e.preventDefault();
+    const raw = e.dataTransfer.getData("application/x-ct-node");
+    if (!raw) return;
+    let payload;
+    try {
+      payload = JSON.parse(raw);
+    } catch {
+      return;
+    }
+    const rect = canvasRef.current.getBoundingClientRect();
+    const x = (e.clientX - rect.left - view.x) / view.k;
+    const y = (e.clientY - rect.top - view.y) / view.k;
+    addNode(payload.kind, payload.preset || {}, { x: Math.round(x - 60), y: Math.round(y - 12) });
   };
 
   // canvas view: pan (x,y) + zoom (k) applied to the .gworld wrapper
@@ -1531,6 +1640,9 @@ export default function App() {
               <button onClick={addFolder} disabled={!newFolder.trim()}>
                 추가
               </button>
+              <button onClick={openTree} title="파일시스템 트리로 폴더 찾기">
+                🔍 폴더 찾아보기
+              </button>
             </div>
             {folders.length === 0 && (
               <div className="empty">
@@ -1655,6 +1767,34 @@ export default function App() {
                           )
                         }
                       />
+                    </div>
+                    <div className="postenc">
+                      <label
+                        className="postenc-opt"
+                        title="인코딩 완료 후 ffprobe 검증 — 영상 스트림 존재 + 재생시간 확인. 실패하면 출력 삭제 · 에러 표시"
+                      >
+                        <input
+                          type="checkbox"
+                          checked={!!f.target.verifyOutput}
+                          onChange={(e) =>
+                            patchTarget(f.id, { verifyOutput: e.target.checked })
+                          }
+                        />
+                        ✓ 출력 검증
+                      </label>
+                      <label
+                        className="postenc-opt"
+                        title="출력이 원본의 경로를 대체 — 원본은 옆에 .orig로 백업"
+                      >
+                        <input
+                          type="checkbox"
+                          checked={!!f.target.replaceOriginal}
+                          onChange={(e) =>
+                            patchTarget(f.id, { replaceOriginal: e.target.checked })
+                          }
+                        />
+                        ⟲ 원본 대치
+                      </label>
                     </div>
                   </div>
                 </div>
@@ -1863,62 +2003,77 @@ export default function App() {
             <div className="logic-flex">
               <aside className="gpals">
                 <div className="gpal-sec">시작</div>
-                <button
-                  className="gpal-item"
-                  disabled={graph.nodes.some((n) => n.kind === "start")}
-                  onClick={() => addNode("start")}
-                >
+                <Pal kind="start" disabled={graph.nodes.some((n) => n.kind === "start")}>
                   ▶ 시작
                   <span>새 영상이 발견되면</span>
-                </button>
+                </Pal>
                 <div className="gpal-sec">📹 영상 조건</div>
-                <button className="gpal-item" onClick={() => addNode("cond", { kind: "srcCodec" })}>
+                <Pal kind="cond" preset={{ kind: "srcCodec" }}>
                   원본 코덱 =
                   <span>h264 / hevc / av1 …</span>
-                </button>
-                <button className="gpal-item" onClick={() => addNode("cond", { kind: "sizeGt" })}>
+                </Pal>
+                <Pal kind="cond" preset={{ kind: "sizeGt" }}>
                   파일 크기 &gt;
                   <span>MB 단위로</span>
-                </button>
-                <button className="gpal-item" onClick={() => addNode("cond", { kind: "sizeLt" })}>
+                </Pal>
+                <Pal kind="cond" preset={{ kind: "sizeLt" }}>
                   파일 크기 &lt;
                   <span>MB 단위로</span>
-                </button>
-                <button className="gpal-item" onClick={() => addNode("cond", { kind: "bitrateGt" })}>
+                </Pal>
+                <Pal kind="cond" preset={{ kind: "bitrateGt" }}>
                   원본 비트레이트 &gt;
                   <span>Mbps 단위로</span>
-                </button>
-                <button className="gpal-item" onClick={() => addNode("cond", { kind: "bitrateLt" })}>
+                </Pal>
+                <Pal kind="cond" preset={{ kind: "bitrateLt" }}>
                   원본 비트레이트 &lt;
                   <span>Mbps 단위로</span>
-                </button>
-                <button className="gpal-item" onClick={() => addNode("cond", { kind: "nameContains" })}>
+                </Pal>
+                <Pal kind="cond" preset={{ kind: "nameContains" }}>
                   이름에 포함
                   <span>예: 4K, raw, .mkv</span>
-                </button>
+                </Pal>
                 <div className="gpal-sec">🖥 노드(서버) 조건</div>
-                <button className="gpal-item" onClick={() => addNode("cond", { kind: "nodeHasHw" })}>
+                <Pal kind="cond" preset={{ kind: "nodeHasHw" }}>
                   HW 가속 지원
                   <span>코덱 + GPU/CPU 구분 — 예: “av1을 GPU 가속으로 하는 노드가 있으면”</span>
-                </button>
+                </Pal>
                 <div className="gpal-sec">⚙ 액션</div>
-                <button className="gpal-item" onClick={() => addNode("act", { kind: "encode" })}>
+                <Pal kind="act" preset={{ kind: "encode" }}>
                   인코딩 시작
                   <span>코덱 · CRF 또는 원본 %</span>
-                </button>
-                <button className="gpal-item" onClick={() => addNode("act", { kind: "healthcheck" })}>
+                </Pal>
+                <Pal kind="act" preset={{ kind: "healthcheck" }}>
                   헬스체크
                   <span>노드 온라인 시만</span>
-                </button>
-                <button className="gpal-item" onClick={() => addNode("act", { kind: "skip" })}>
+                </Pal>
+                <Pal kind="act" preset={{ kind: "skip" }}>
                   건너뛰기
                   <span>인코딩하지 않음</span>
-                </button>
+                </Pal>
+                <div className="gpal-sec">⬇ 인코딩 이후 (인코딩 출력 포트에 연결)</div>
+                <Pal kind="act" preset={{ kind: "verify" }}>
+                  출력 검증
+                  <span>ffprobe 헬스체크 — 전체 / N% / N에 1 샘플</span>
+                </Pal>
+                <Pal kind="act" preset={{ kind: "replace" }}>
+                  원본 대치
+                  <span>출력이 원본 경로를 대체 (원본은 .orig 백업)</span>
+                </Pal>
+                <Pal kind="act" preset={{ kind: "saveHere" }}>
+                  원본 위치에 저장
+                  <span>출력을 원본 옆에 둔다 (기본 동작을 노드로 명시)</span>
+                </Pal>
+                <Pal kind="act" preset={{ kind: "requeue" }}>
+                  큐로 되돌리기
+                  <span>체인 실행 후 다시 큐에 (재스캔 시 재처리)</span>
+                </Pal>
               </aside>
               <div
                 className="gcanvas"
                 ref={canvasRef}
                 onMouseDown={(e) => onCanvasDown(e)}
+                onDragOver={(e) => e.preventDefault()}
+                onDrop={onCanvasDrop}
               >
                 <div
                   className="gworld"
@@ -2132,7 +2287,98 @@ export default function App() {
                                 <option value="encode">인코딩 시작</option>
                                 <option value="healthcheck">헬스체크 (노드 온라인 시만)</option>
                                 <option value="skip">건너뛰기</option>
+                                <option value="verify">⬇ 출력 검증</option>
+                                <option value="replace">⬇ 원본 대치</option>
+                                <option value="saveHere">⬇ 원본 위치에 저장</option>
+                                <option value="requeue">⬇ 큐로 되돌리기</option>
                               </select>
+                              {n.action?.kind === "encode" && (
+                                <label
+                                  className="postenc-opt"
+                                  title="HW 가속으로 이 코덱을 할 수 없는 노드는 아예 받지 않음 — 소프트웨어 폴백도 없음. 온라인 노드 중 가능한 곳이 없으면 파일은 에러로 표시 (노드가 올라오면 재스캔으로 재시도)"
+                                >
+                                  <input
+                                    type="checkbox"
+                                    checked={!!n.action?.hwOnly}
+                                    onChange={(e) =>
+                                      patchAct(n.id, { hwOnly: e.target.checked })
+                                    }
+                                  />
+                                  ⚡ HW 전용 (비지원 노드에 안 보냄)
+                                </label>
+                              )}
+                              {n.action?.kind === "verify" && (
+                                <>
+                                  <label>
+                                    검증 범위
+                                    <select
+                                      value={n.action?.verifyMode || "all"}
+                                      onChange={(e) =>
+                                        patchAct(n.id, {
+                                          verifyMode: e.target.value,
+                                        })
+                                      }
+                                    >
+                                      <option value="all">전체 (모든 파일)</option>
+                                      <option value="pct">N% 무작위 샘플</option>
+                                      <option value="every">N에 1 (같은 파일 매번 동일)</option>
+                                    </select>
+                                  </label>
+                                  {(n.action?.verifyMode === "pct" ||
+                                    n.action?.verifyMode === "every") && (
+                                    <label>
+                                      N
+                                      <input
+                                        type="number"
+                                        className="num"
+                                        min={n.action?.verifyMode === "pct" ? 1 : 1}
+                                        max={n.action?.verifyMode === "pct" ? 100 : 9999}
+                                        value={n.action?.verifyValue ?? (n.action?.verifyMode === "pct" ? 50 : 3)}
+                                        onChange={(e) =>
+                                          patchAct(n.id, {
+                                            verifyValue: Number(e.target.value),
+                                          })
+                                        }
+                                      />
+                                    </label>
+                                  )}
+                                  <label
+                                    title="검증 실패 시: 에러로 표시(기본) 또는 큐로 되돌려 다음 스캔에 재시도"
+                                  >
+                                    실패 시
+                                    <select
+                                      value={n.action?.verifyOnFailure || "error"}
+                                      onChange={(e) =>
+                                        patchAct(n.id, {
+                                          verifyOnFailure:
+                                            e.target.value === "error" ? null : e.target.value,
+                                        })
+                                      }
+                                    >
+                                      <option value="error">에러 표시</option>
+                                      <option value="requeue">큐로 되돌리기 (재시도)</option>
+                                    </select>
+                                  </label>
+                                </>
+                              )}
+                              {n.action?.kind === "replace" && (
+                                <div className="phint">
+                                  인코딩 출력 포트에 연결 — 출력이 원본의 경로를 대체하고, 원본은
+                                  옆에 .orig으로 백업됩니다.
+                                </div>
+                              )}
+                              {n.action?.kind === "saveHere" && (
+                                <div className="phint">
+                                  출력을 원본 옆에 둔 채로 마무리 (라이브러리 작업의 기본 동작을
+                                  그래프에 명시적으로 표시).
+                                </div>
+                              )}
+                              {n.action?.kind === "requeue" && (
+                                <div className="phint">
+                                  체인 실행 후 파일을 다시 큐에 둡니다 — 재스캔 시 같은 로직이
+                                  적용되면 재인코딩되니, 다른 폴더 로직과 조합해 사용하세요.
+                                </div>
+                              )}
                               {n.action?.kind === "encode" &&
                                 (ch.length ? (
                                   <>
@@ -2334,6 +2580,16 @@ export default function App() {
                                     </button>
                                   </>
                                 ))}
+                              {n.action?.kind === "encode" && (
+                                <div className="postenc">
+                                  <span
+                                    className="phint"
+                                    title="인코딩 출력 포트(우측)에 ‘출력 검증’, ‘원본 대치’, ‘큐로 되돌리기’ 같은 노드를 이어 붙이면 완료 후 그 순서로 실행됩니다"
+                                  >
+                                    ⬇ 완료 후 작업 — 우측 출력 포트에 검증·대치 노드를 연결하세요
+                                  </span>
+                                </div>
+                              )}
                             </>
                           )}
                         </div>
@@ -2346,6 +2602,14 @@ export default function App() {
                             style={{ top: 9 }}
                             onMouseDown={(e) => onSocketDown(e, n, "")}
                             title="출력 — 새 영상"
+                          />
+                        )}
+                        {n.kind === "action" && (
+                          <div
+                            className="gsock out"
+                            style={{ top: 9 }}
+                            onMouseDown={(e) => onSocketDown(e, n, "")}
+                            title="출력 — ‘인코딩 이후’ 노드(검증/대치/…)를 연결"
                           />
                         )}
                         {isCond && (
@@ -2408,6 +2672,86 @@ export default function App() {
             </div>
           </div>
         </section>
+      )}
+
+      {/* ── filesystem tree browser (folder picker) — any tab ── */}
+      {treeOpen && (
+        <div className="overlay" onClick={() => setTreeOpen(false)}>
+          <div className="treemodal" onClick={(e) => e.stopPropagation()}>
+            <div className="tm-head">
+              <b>🔍 폴더 찾아보기</b>
+              <input
+                className="tm-jump"
+                value={treeJump}
+                onChange={(e) => setTreeJump(e.target.value)}
+                onKeyDown={(e) => e.key === "Enter" && treeJumpGo()}
+                placeholder="경로로 점프 (예: /mnt/nas/Videos)"
+              />
+              <button className="tm-x" onClick={() => setTreeOpen(false)}>
+                ✕
+              </button>
+            </div>
+            <div className="tm-crumbs">
+              {treeCrumbs(treePath).map((c) => (
+                <button
+                  key={c.path}
+                  className={`tm-crumb ${c.path === treePath ? "here" : ""}`}
+                  onClick={() => treeNav(c.path)}
+                >
+                  {c.label}
+                </button>
+              ))}
+            </div>
+            <div className="tm-body">
+              {treeErr && <div className="tm-err">⚠ {treeErr}</div>}
+              {!tree && !treeErr && <div className="tm-err">불러오는 중…</div>}
+              {tree && (
+                <>
+                  {tree.parent !== treePath && (
+                    <div className="tm-row up" onClick={treeUp}>
+                      ⬆ <span>{tree.parent}</span>
+                    </div>
+                  )}
+                  {(tree.dirs || []).map((d) => (
+                    <div
+                      key={d.path}
+                      className="tm-row dir"
+                      title={d.path}
+                      onClick={() => treeNav(d.path)}
+                    >
+                      📁 <span>{d.name}</span>
+                    </div>
+                  ))}
+                  {(tree.files || []).map((f) => (
+                    <div
+                      key={f.path}
+                      className={`tm-row file ${f.video ? "video" : ""}`}
+                      title={f.path}
+                    >
+                      {f.video ? "🎬" : "📄"} <span>{f.name}</span>
+                      <span className="tm-size">{fmtSize(f.size || 0)}</span>
+                    </div>
+                  ))}
+                  {(!tree.dirs || tree.dirs.length === 0) &&
+                    (!tree.files || tree.files.length === 0) && (
+                      <div className="tm-err">비어 있습니다</div>
+                    )}
+                </>
+              )}
+            </div>
+            <div className="tm-foot">
+              <span className="tm-pick" title={treePath}>
+                {treePath}
+              </span>
+              <button
+                onClick={addTreeFolder}
+                disabled={!treePath || folders.some((f) => f.path === treePath)}
+              >
+                + 이 폴더 추가
+              </button>
+            </div>
+          </div>
+        </div>
       )}
     </div>
   );

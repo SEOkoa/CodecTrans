@@ -153,6 +153,17 @@ pub struct Job {
     /// the node can pull the source and the result lands next to it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub lib_path: Option<String>,
+    /// Multi-GPU: the physical device index (0-based within its kind, as
+    /// reported in `accels`) the node must pin this encode to
+    /// (CUDA_VISIBLE_DEVICES / -vaapi_device / -qsv_device). None = let the
+    /// backend pick (single-device machines, software).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gpu_device: Option<u32>,
+    /// Post-encode plan — the ops chained on the encode node's output
+    /// port (verify/replace/saveHere/requeue), executed in order when the
+    /// result arrives. Empty = plain encode (output lands next to source).
+    #[serde(default)]
+    pub post: Vec<PostOp>,
 }
 
 /// One accelerator as reported by a node: a physical device (GPU or iGPU)
@@ -1444,6 +1455,16 @@ pub struct TargetCfg {
     /// one choice, then resolves the first choice that node can run.
     #[serde(default)]
     pub choices: Vec<TargetChoice>,
+    /// Post-encode health check: ffprobe the finished file (video stream
+    /// present, duration within 50% of the source). On failure the output is
+    /// deleted and the entry marked error (requeue retries it).
+    #[serde(default)]
+    pub verify_output: bool,
+    /// Replace the original: the finished file takes the source's path and
+    /// the original is kept next to it as `name.orig.ext`. Library jobs only.
+    /// (A second replace overwrites the previous `.orig` backup.)
+    #[serde(default)]
+    pub replace_original: bool,
 }
 
 impl From<AutoConfig> for TargetCfg {
@@ -1456,6 +1477,8 @@ impl From<AutoConfig> for TargetCfg {
             crf: a.crf,
             bitrate_pct: a.bitrate_pct,
             choices: Vec::new(),
+            verify_output: false,
+            replace_original: false,
         }
     }
 }
@@ -1522,11 +1545,30 @@ pub struct Condition {
 #[serde(rename_all = "camelCase")]
 pub struct Action {
     /// "encode" | "skip" | "healthcheck"
+    /// post-encode (chain on the encode output port):
+    /// "verify" | "replace" | "saveHere" | "requeue"
     #[serde(default)]
     pub kind: String,
     /// "encode": the target to use (None = folder default)
     #[serde(default)]
     pub target: Option<TargetCfg>,
+    /// "encode": never send to a node without a working HW encoder for
+    /// this target's codec family — no software fallback, no other-node
+    /// fallback. When nothing online can do it, the entry errors out
+    /// (a later rescan retries it).
+    #[serde(default)]
+    pub hw_only: bool,
+    /// "verify": which subset to health-check — "all" (default) | "pct"
+    /// (random `verify_value`%) | "every" (every `verify_value`th file).
+    #[serde(default)]
+    pub verify_mode: Option<String>,
+    /// "verify": the number for pct/every.
+    #[serde(default)]
+    pub verify_value: Option<u32>,
+    /// "verify": what a failed check does — "error" (default) |
+    /// "requeue" (entry goes back to the queue for another attempt).
+    #[serde(default)]
+    pub verify_on_failure: Option<String>,
 }
 
 /// One automation block: condition → action. Blocks are evaluated in order,
@@ -1621,6 +1663,65 @@ pub struct WorkflowGraph {
     pub nodes: Vec<GraphNode>,
     #[serde(default)]
     pub edges: Vec<GraphEdge>,
+}
+
+/// A post-encode operation — chained on the encode action's OUTPUT port.
+/// The server executes the whole plan (in chain order) when the finished
+/// file arrives in `node_result`. The node never sees it.
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", tag = "op")]
+pub enum PostOp {
+    /// ffprobe the output: video stream present, positive duration, at
+    /// least half the source's length. `mode`: "all" (default) | "pct"
+    /// (random `value`%) | "every" (every Nth file by key hash — cheap
+    /// sampling so a big folder isn't probed file by file).
+    /// `on_failure`: "error" (default) | "requeue" (back to the queue).
+    Verify {
+        #[serde(default)]
+        mode: Option<String>,
+        #[serde(default)]
+        value: Option<u32>,
+        #[serde(default)]
+        on_failure: Option<String>,
+    },
+    /// The finished file takes the SOURCE path; the original is kept as
+    /// `stem.orig.ext` (tombstoned so rescans ignore it).
+    Replace,
+    /// Explicit "keep the output next to the source" step (already true
+    /// for library jobs — makes it a visible node on the graph).
+    SaveHere,
+    /// Put the entry back in the queue (status pending) after the rest of
+    /// the plan ran. A rescan re-dispatches it — combine with a different
+    /// folder logic to reprocess, or expect a re-encode loop if the same
+    /// logic applies.
+    Requeue,
+}
+
+/// FNV-1a — stable across restarts (unlike a counter) so "every Nth"
+/// sampling picks the SAME files on every scan.
+fn fnv1a(s: &str) -> u64 {
+    let mut h: u64 = 0xcbf29ce484222325;
+    for b in s.bytes() {
+        h ^= b as u64;
+        h = h.wrapping_mul(0x100000001b3);
+    }
+    h
+}
+
+/// Does this entry get a health check, given the sampling mode?
+fn verify_selected(key: &str, mode: Option<&str>, value: Option<u32>) -> bool {
+    let h = fnv1a(key);
+    match mode {
+        Some("pct") => {
+            let p = value.unwrap_or(100).clamp(1, 100);
+            h % 100u64 < p as u64
+        }
+        Some("every") => {
+            let n = value.unwrap_or(1).max(1);
+            h % (n as u64) == 0
+        }
+        _ => true, // "all" / unset
+    }
 }
 
 /// Legacy `blocks` → linear graph: start → c1 →a1; c1(false) → c2 →a2; …
@@ -2027,23 +2128,140 @@ fn node_accel_encoder(node: &Node, family: &str, accel: Option<&str>) -> Option<
     best_hw_encoder(&usable_hw_encoders(node), family)
 }
 
+/// Match one choice against a node's accels and return the concrete encoder
+/// AND the physical device it lives on. When the same backend exists on
+/// several devices (a two-GPU box: nvenc on GPU #0 AND GPU #1), the device
+/// with the FEWEST active jobs wins — `dev_load` maps device index -> count
+/// of this node's queued/dispatched/running jobs already pinned there.
+fn node_accel_encoder_dev(
+    node: &Node,
+    family: &str,
+    accel: Option<&str>,
+    dev_load: &std::collections::HashMap<u32, u32>,
+) -> Option<(String, u32)> {
+    let accel = accel.map(|a| a.to_lowercase());
+    if let Some(a) = accel {
+        let is_class = a == "gpu" || a == "cpu";
+        let mut best: Option<(u32, (u32, String))> = None; // (load, (device, enc))
+        for acc in &usable_accels(node) {
+            let ok = if is_class {
+                acc.kind == a
+            } else if a == "vt" {
+                acc.backend.contains("video") || acc.backend == "vt"
+            } else {
+                acc.backend == a
+            };
+            if !ok {
+                continue;
+            }
+            if let Some(enc) = best_hw_encoder(&acc.encoders, family) {
+                let load = dev_load.get(&acc.device).copied().unwrap_or(0);
+                match &best {
+                    None => best = Some((load, (acc.device, enc))),
+                    Some((bl, b)) => {
+                        if load < *bl || (load == *bl && acc.device < b.0) {
+                            best = Some((load, (acc.device, enc)));
+                        }
+                    }
+                }
+            }
+        }
+        return best.map(|(_, (d, e))| (e, d));
+    }
+    // No accel constraint: any device with a working encoder for the family.
+    let mut best: Option<(u32, (u32, String))> = None;
+    for acc in &usable_accels(node) {
+        if let Some(enc) = best_hw_encoder(&acc.encoders, family) {
+            let load = dev_load.get(&acc.device).copied().unwrap_or(0);
+            match &best {
+                None => best = Some((load, (acc.device, enc))),
+                Some((bl, b)) => {
+                    if load < *bl || (load == *bl && acc.device < b.0) {
+                        best = Some((load, (acc.device, enc)));
+                    }
+                }
+            }
+        }
+    }
+    best.map(|(_, (d, e))| (e, d))
+}
+
+/// For a known concrete encoder (legacy single-codec dispatch), pick the
+/// least-loaded device that can run it. None when the encoder is software.
+fn pick_device_for_encoder(
+    node: &Node,
+    encoder: &str,
+    dev_load: &std::collections::HashMap<u32, u32>,
+) -> Option<u32> {
+    if !is_hw_encoder(encoder) {
+        return None;
+    }
+    let mut best: Option<(u32, u32)> = None; // (load, device)
+    for acc in &usable_accels(node) {
+        if acc.encoders.iter().any(|e| e == encoder) {
+            let load = dev_load.get(&acc.device).copied().unwrap_or(0);
+            match &best {
+                None => best = Some((load, acc.device)),
+                Some((bl, bd)) => {
+                    if load < *bl || (load == *bl && acc.device < *bd) {
+                        best = Some((load, acc.device));
+                    }
+                }
+            }
+        }
+    }
+    best.map(|(_, d)| d)
+}
+
+/// Active jobs on ONE node, grouped by the pinned GPU device — the load map
+/// for multi-GPU spreading on that box.
+fn active_jobs_by_node_dev(
+    store: &Store,
+    prefix: Option<&str>,
+    node_id: &str,
+) -> std::collections::HashMap<u32, u32> {
+    let s = store.lock().unwrap();
+    let mut m: std::collections::HashMap<u32, u32> = std::collections::HashMap::new();
+    for j in s.jobs.values() {
+        if matches!(j.status.as_str(), "queued" | "dispatched" | "running")
+            && j.node_id.as_deref() == Some(node_id)
+        {
+            if let Some(p) = prefix {
+                match &j.lib_path {
+                    Some(lp) if lp.starts_with(p) => {}
+                    _ => continue,
+                }
+            }
+            if let Some(d) = j.gpu_device {
+                *m.entry(d).or_insert(0) += 1;
+            }
+        }
+    }
+    m
+}
+
 /// Walk an encoder-preference list on ONE node: the first choice the node can
-/// run (HW) wins. Returns (choice index, concrete encoder, accelerated). When
-/// no choice is HW-satisfiable the first choice runs on a software encoder —
-/// unless this node has software fallback disabled, in which case None (the
-/// node is not eligible for this job at all).
-fn resolve_choices_on_node(node: &Node, choices: &[TargetChoice]) -> Option<(usize, String, bool)> {
+/// run (HW) wins. Returns (choice index, concrete encoder, accelerated,
+/// pinned GPU device — None for software). When no choice is HW-satisfiable
+/// the first choice runs on a software encoder — unless this node has
+/// software fallback disabled, in which case None (the node is not eligible
+/// for this job at all).
+fn resolve_choices_on_node(
+    node: &Node,
+    choices: &[TargetChoice],
+    dev_load: &std::collections::HashMap<u32, u32>,
+) -> Option<(usize, String, bool, Option<u32>)> {
     if choices.is_empty() {
         return (if node.allow_software {
-            Some((0, "libx264".into(), false))
+            Some((0, "libx264".into(), false, None))
         } else {
             None
         });
     }
     for (i, ch) in choices.iter().enumerate() {
         let fam = codec_family(ch.video_codec.as_deref().unwrap_or("h264"));
-        if let Some(enc) = node_accel_encoder(node, &fam, ch.accel.as_deref()) {
-            return Some((i, enc, true));
+        if let Some((enc, dev)) = node_accel_encoder_dev(node, &fam, ch.accel.as_deref(), dev_load) {
+            return Some((i, enc, true, Some(dev)));
         }
     }
     if !node.allow_software {
@@ -2053,7 +2271,7 @@ fn resolve_choices_on_node(node: &Node, choices: &[TargetChoice]) -> Option<(usi
     let sw = family_default_encoder(&fam)
         .map(|s| s.to_string())
         .unwrap_or_else(|| choices[0].video_codec.clone().unwrap_or_else(|| "libx264".into()));
-    Some((0, sw, false))
+    Some((0, sw, false, None))
 }
 
 /// Active (queued/dispatched/running) jobs per node id — used to spread a
@@ -2090,7 +2308,8 @@ async fn resolve_choice_dispatch(
     store: &Store,
     t: &TargetCfg,
     folder_key: Option<&str>,
-) -> Option<(String, String, String, bool, TargetCfg)> {
+    hw_only: bool,
+) -> Option<(String, String, String, bool, Option<u32>, TargetCfg)> {
     let c = store.lock().unwrap().redis();
     let online = list_nodes_redis(c, "online", None, None).await;
     if online.is_empty() {
@@ -2120,11 +2339,15 @@ async fn resolve_choice_dispatch(
         .filter(|i| online[*i].allow_software && free(&online[*i]))
         .collect::<Vec<_>>()
         .into_boxed_slice();
-    // No HW fit on a free node: software fallback on a free node that allows
-    // it. Both empty -> nothing can take the job right now (entry stays
-    // pending; a rescan/requeue retries once capacity frees up).
+    // No HW fit on a free node: software fallback on a free node that
+    // allows it — unless this encode is HW-only, in which case the file
+    // is never sent to a node that can't do it in hardware (it waits for
+    // a capable node; the dispatch layer turns that into a visible error
+    // rather than a silent SW encode).
     let pool: &[usize] = if !hw_idx.is_empty() {
         &hw_idx
+    } else if hw_only {
+        return None;
     } else if !sw_idx.is_empty() {
         &sw_idx
     } else {
@@ -2146,8 +2369,12 @@ async fn resolve_choice_dispatch(
         }
     }
     let node = online[best].clone();
-    let (ci, effective, accelerated) =
-        match resolve_choices_on_node(&node, &t.choices) {
+    // Multi-GPU: pin the encode to the LEAST LOADED physical device on this
+    // node (two nvenc GPUs -> job 1 on #0, job 2 on #1, job 3 back on #0…).
+    let prefix_dev = folder_key.map(|k| format!("{k}/"));
+    let dev_load = active_jobs_by_node_dev(store, prefix_dev.as_deref(), &node.id);
+    let (ci, effective, accelerated, gpu_device) =
+        match resolve_choices_on_node(&node, &t.choices, &dev_load) {
             Some(r) => r,
             None => return None,
         };
@@ -2162,50 +2389,102 @@ async fn resolve_choice_dispatch(
         crf: ch.crf.or(t.crf),
         bitrate_pct: ch.bitrate_pct.or(t.bitrate_pct),
         choices: Vec::new(),
+        verify_output: t.verify_output,
+        replace_original: t.replace_original,
     };
     let node_name = node.display().to_string();
-    Some((node.id, node_name, effective, accelerated, eff))
+    Some((node.id, node_name, effective, accelerated, gpu_device, eff))
 }
 
 /// Queue one library entry for re-encoding on a node with the given target
 /// (folder default or a logic block's). The node pulls the source via
 /// node_fetch_file; the finished file is moved back next to the source
-/// (node_result). Returns true when a job was queued; false leaves the entry
-/// pending (e.g. no online node, file missing).
-async fn dispatch_lib_job(store: &Store, e: &LibraryEntry, t: &TargetCfg) -> bool {
+/// (node_result), then the post-encode plan runs (verify/replace/…).
+///
+/// Ok(true)  = job queued
+/// Ok(false) = nothing can take it right now (no free node / all busy) —
+///             the entry stays pending, a rescan retries it
+/// Err(msg)  = a semantic problem the user should see (e.g. hwOnly encode
+///             but no online node has a hardware encoder for it)
+async fn dispatch_lib_job(
+    store: &Store,
+    e: &LibraryEntry,
+    t: &TargetCfg,
+    post: &[PostOp],
+    hw_only: bool,
+) -> Result<bool, String> {
     let key = e.key();
     if resolve_lib_source(&key, store).is_none() {
-        return false;
+        return Ok(false);
     }
     // Resolve (node, concrete encoder, effective target params).
     // Encoder-preference list -> capability-based least-busy node; single
     // codec -> legacy first-node-with-that-family.
     let eff_owned: Option<TargetCfg>;
-    let (node_id, node_name, effective, accelerated, eff): (String, String, String, bool, &TargetCfg) =
+    let (node_id, node_name, effective, accelerated, gpu_device, eff): (String, String, String, bool, Option<u32>, &TargetCfg) =
         if t.choices.is_empty() {
             let vcodec = t
                 .video_codec
                 .clone()
                 .filter(|s| !s.is_empty())
                 .unwrap_or_else(|| "h264".into());
+            let family = codec_family(&vcodec);
             let node = {
                 let c = store.lock().unwrap().redis();
                 let online = list_nodes_redis(c, "online", None, None).await;
                 let counts = active_jobs_by_node(store, None);
-                match pick_node_idx(&online, &counts, &codec_family(&vcodec)) {
+                let idx = if hw_only {
+                    // HW-only: pick a FREE node that has the family in
+                    // hardware. Nothing capable online at all -> error;
+                    // capable but busy -> pending.
+                    let any_capable = online
+                        .iter()
+                        .any(|n| usable_hw_encoders(n).iter().any(|h| codec_family(h) == family));
+                    if !any_capable {
+                        return Err("HW only: no online node has a hardware encoder for this codec".into());
+                    }
+                    online.iter().position(|n| {
+                        counts.get(&n.id).copied().unwrap_or(0) < n.max_jobs
+                            && usable_hw_encoders(n).iter().any(|h| codec_family(h) == family)
+                    })
+                } else {
+                    pick_node_idx(&online, &counts, &family)
+                };
+                match idx {
                     Some(i) => online[i].clone(),
-                    None => return false,
+                    None => return Ok(false),
                 }
             };
             let (effective, accelerated) = resolve_video_codec(&vcodec, &usable_hw_encoders(&node));
+            if hw_only && !accelerated {
+                return Err("HW only: no hardware encoder available for this codec".into());
+            }
+            let fk = e.folder.as_deref().map(|k| format!("{k}/"));
+            let dev_load = active_jobs_by_node_dev(store, fk.as_deref(), &node.id);
+            let gpu_device = pick_device_for_encoder(&node, &effective, &dev_load);
             eff_owned = None;
             let node_name = node.display().to_string();
-            (node.id, node_name, effective, accelerated, t)
+            (node.id, node_name, effective, accelerated, gpu_device, t)
         } else {
-            let (node_id, node_name, effective, accelerated, eff) =
-                match resolve_choice_dispatch(store, t, e.folder.as_deref()).await {
+            // hwOnly + no online node with HW for ANY choice -> a visible
+            // error (a capable-but-busy pool still waits: Ok(false)).
+            if hw_only {
+                let c = store.lock().unwrap().redis();
+                let online = list_nodes_redis(c, "online", None, None).await;
+                let any_hw = online.iter().any(|n| {
+                    t.choices.iter().any(|ch| {
+                        let fam = codec_family(ch.video_codec.as_deref().unwrap_or("h264"));
+                        node_accel_encoder(n, &fam, ch.accel.as_deref()).is_some()
+                    })
+                });
+                if !any_hw {
+                    return Err("HW only: no online node has a hardware encoder for this target".into());
+                }
+            }
+            let (node_id, node_name, effective, accelerated, gpu_device, eff) =
+                match resolve_choice_dispatch(store, t, e.folder.as_deref(), hw_only).await {
                     Some(r) => r,
-                    None => return false,
+                    None => return Ok(false),
                 };
             eff_owned = Some(eff);
             (
@@ -2213,6 +2492,7 @@ async fn dispatch_lib_job(store: &Store, e: &LibraryEntry, t: &TargetCfg) -> boo
                 node_name,
                 effective,
                 accelerated,
+                gpu_device,
                 eff_owned.as_ref().unwrap(),
             )
         };
@@ -2269,9 +2549,11 @@ async fn dispatch_lib_job(store: &Store, e: &LibraryEntry, t: &TargetCfg) -> boo
         executed_by: node_name,
         accelerated,
         lib_path: Some(key),
+        gpu_device,
+        post: post.to_vec(),
     };
     store.lock().unwrap().insert(job);
-    true
+    Ok(true)
 }
 
 /// Does a block condition match a newly found library entry?
@@ -2304,14 +2586,17 @@ fn cond_matches(c: &Condition, e: &LibraryEntry, online: &[Node]) -> bool {
 /// Evaluate the node graph for one file: from every `start` node follow the
 /// edges — a condition's ✓ port is taken when the condition matches (a
 /// disabled condition acts as an open gate), ✗ when it doesn't — and the
-/// FIRST `action` node reached wins. None = the file reached no action
-/// (caller falls back to the folder default).
+/// FIRST `action` node reached wins. The encode action's OUTPUT port is
+/// then walked for the post-encode chain (verify → replace → … → requeue).
+/// Returns (target, do_encode, post_plan, hw_only).
+/// None = the file reached no action (caller falls back to the folder
+/// default).
 fn eval_graph(
     g: &WorkflowGraph,
     e: &LibraryEntry,
     online: &[Node],
     folder_target: &TargetCfg,
-) -> Option<(TargetCfg, bool)> {
+) -> Option<(TargetCfg, bool, Vec<PostOp>, bool)> {
     use std::collections::HashSet;
     if g.nodes.is_empty() {
         return None;
@@ -2341,6 +2626,47 @@ fn eval_graph(
     }
     let mut visited: HashSet<usize> = HashSet::new();
 
+    // Post-encode chain: BFS over the encode's output port. Only enabled
+    // action nodes of the post kinds join the plan (in chain order);
+    // anything else (another primary action, a condition, the start) ends
+    // that branch — the graph stays linear after the encode.
+    fn post_chain(
+        i: usize,
+        g: &WorkflowGraph,
+        out: &[Vec<(usize, Option<String>)>],
+        visited: &mut HashSet<usize>,
+        plan: &mut Vec<PostOp>,
+    ) {
+        for (j, port) in out[i].iter().cloned() {
+            // branch ports don't exist on action nodes — ignore them
+            if matches!(port.as_deref(), Some("true") | Some("false")) {
+                continue;
+            }
+            if !visited.insert(j) {
+                continue;
+            }
+            let n = &g.nodes[j];
+            if n.kind != "action" || !n.enabled {
+                continue;
+            }
+            let op = match n.action.kind.as_str() {
+                "verify" => Some(PostOp::Verify {
+                    mode: n.action.verify_mode.clone(),
+                    value: n.action.verify_value,
+                    on_failure: n.action.verify_on_failure.clone(),
+                }),
+                "replace" => Some(PostOp::Replace),
+                "saveHere" => Some(PostOp::SaveHere),
+                "requeue" => Some(PostOp::Requeue),
+                _ => None, // another primary action — chain ends here
+            };
+            if let Some(o) = op {
+                plan.push(o);
+                post_chain(j, g, out, visited, plan);
+            }
+        }
+    }
+
     fn rec(
         i: usize,
         g: &WorkflowGraph,
@@ -2349,7 +2675,7 @@ fn eval_graph(
         e: &LibraryEntry,
         online: &[Node],
         folder_target: &TargetCfg,
-    ) -> Option<(TargetCfg, bool)> {
+    ) -> Option<(TargetCfg, bool, Vec<PostOp>, bool)> {
         if !visited.insert(i) {
             return None;
         }
@@ -2362,24 +2688,29 @@ fn eval_graph(
                     return None;
                 }
                 return match n.action.kind.as_str() {
-                    "encode" => Some((
-                        n.action
+                    "encode" => {
+                        let t = n.action
                             .target
                             .clone()
-                            .unwrap_or_else(|| folder_target.clone()),
-                        true,
-                    )),
+                            .unwrap_or_else(|| folder_target.clone());
+                        let hw_only = n.action.hw_only;
+                        let mut plan = Vec::new();
+                        post_chain(i, g, out, visited, &mut plan);
+                        Some((t, true, plan, hw_only))
+                    }
                     "healthcheck" => {
                         if online.iter().any(|n| n.status == "online") {
                             Some((
                                 folder_target.clone(),
                                 folder_target.video_codec.is_some(),
+                                Vec::new(),
+                                false,
                             ))
                         } else {
-                            Some((TargetCfg::default(), false))
+                            Some((TargetCfg::default(), false, Vec::new(), false))
                         }
                     }
-                    _ => Some((TargetCfg::default(), false)), // skip
+                    _ => Some((TargetCfg::default(), false, Vec::new(), false)), // skip
                 };
             }
             _ => false,
@@ -2535,6 +2866,92 @@ pub async fn library_get(State(store): State<Store>) -> Response {
     Json(json!({"root": root, "count": entries.len(), "entries": entries})).into_response()
 }
 
+#[derive(Deserialize)]
+struct FsQuery {
+    path: Option<String>,
+}
+
+/// GET /api/fs/children?path=/media — one directory level for the library
+/// tree browser. Absolute paths only; `..` segments are rejected; the path
+/// must exist and be a directory. Returns parent (for the breadcrumb/up
+/// button) + entries sorted dirs-first (files: video flag + size for the
+/// tree's "this looks like a video" hint).
+pub async fn fs_children(Query(q): Query<FsQuery>) -> Response {
+    let raw = q.path.as_deref().unwrap_or("/");
+    let p = PathBuf::from(raw);
+    if !p.is_absolute() {
+        return (StatusCode::BAD_REQUEST, Json(json!({"error": "path must be absolute"}))).into_response();
+    }
+    if p.components().any(|c| matches!(c, std::path::Component::ParentDir)) {
+        return (StatusCode::BAD_REQUEST, Json(json!({"error": "path contains .."}))).into_response();
+    }
+    if !p.is_dir() {
+        return (StatusCode::NOT_FOUND, Json(json!({"error": "not a directory"}))).into_response();
+    }
+    let read = match std::fs::read_dir(&p) {
+        Ok(r) => r,
+        Err(e) => {
+            return (
+                StatusCode::FORBIDDEN,
+                Json(json!({"error": format!("unreadable: {e}")}))
+            )
+                .into_response()
+        }
+    };
+    let mut dirs: Vec<serde_json::Value> = Vec::new();
+    let mut files: Vec<serde_json::Value> = Vec::new();
+    let mut n = 0usize;
+    for entry in read.flatten() {
+        n += 1;
+        if n > 5000 {
+            break;
+        }
+        let name = entry.file_name().to_string_lossy().to_string();
+        if name.starts_with('.') {
+            continue; // keep hidden/system clutter out of the tree
+        }
+        let sub = entry.path();
+        let sub_str = sub.to_string_lossy().to_string();
+        if sub.is_dir() {
+            dirs.push(json!({"name": name, "path": sub_str, "kind": "dir"}));
+        } else if sub.is_file() {
+            let size = std::fs::metadata(&sub).map(|m| m.len()).unwrap_or(0);
+            files.push(json!({
+                "name": name,
+                "path": sub_str,
+                "kind": "file",
+                "size": size,
+                "video": is_video_ext(sub.extension().and_then(|x| x.to_str())),
+            }));
+        }
+    }
+    let by_name = |a: &serde_json::Value, b: &serde_json::Value| {
+        a["name"]
+            .as_str()
+            .unwrap_or("")
+            .to_lowercase()
+            .cmp(&b["name"].as_str().unwrap_or("").to_lowercase())
+    };
+    dirs.sort_by(by_name);
+    files.sort_by(by_name);
+    let parent = p
+        .parent()
+        .map(|d| d.to_string_lossy().to_string())
+        .filter(|s| s != "/")
+        .or_else(|| Some("/".into()));
+    Json(json!({
+        "path": sub_str_of(&p),
+        "parent": parent,
+        "dirs": dirs,
+        "files": files,
+    }))
+    .into_response()
+}
+
+fn sub_str_of(p: &std::path::Path) -> String {
+    p.to_string_lossy().to_string()
+}
+
 /// POST /api/library/scan — {root} for an ad-hoc one-shot folder, or (no
 /// root) all registered+enabled folders. Builds the in-memory catalog by
 /// ffprobing each video (non-destructive: entries of folders not scanned
@@ -2608,7 +3025,17 @@ pub async fn library_scan(State(store): State<Store>, Json(req): Json<ScanReq>) 
             .into_iter()
             .filter(|rel| {
                 let fname = rel.file_name().and_then(|x| x.to_str()).unwrap_or("");
-                !out_names.contains(fname)
+                if out_names.contains(fname) {
+                    // A replace-original source KEEPS its own name (the
+                    // finished file moved onto the source path) — it is a
+                    // tracked entry, not a stray artifact. Never drop it.
+                    let key = match fid {
+                        Some(f) => format!("{f}/{}", rel.to_string_lossy()),
+                        None => rel.to_string_lossy().to_string(),
+                    };
+                    return store.lock().unwrap().library.contains_key(&key);
+                }
+                true
             })
             .collect();
         for rel in &rels {
@@ -2738,30 +3165,47 @@ pub async fn library_scan(State(store): State<Store>, Json(req): Json<ScanReq>) 
                     .any(|n| n.kind == "condition" || n.kind == "action")
             })
             .map(|f| &f.graph);
-        let decision: Option<(TargetCfg, bool)> = {
+        let decision: Option<(TargetCfg, bool, Vec<PostOp>, bool)> = {
             let g = logic_graph.or(folder_graph).or(eff_graph.as_ref());
             if let Some(g) = g {
-                // Walk the node graph; first action reached wins.
+                // Walk the node graph; first action reached wins, its
+                // output port carries the post-encode plan.
                 eval_graph(g, e, &online, &folder_target).or_else(|| {
                     Some((
                         folder_target.clone(),
                         folder_target.video_codec.is_some(),
+                        Vec::new(),
+                        false,
                     ))
                 })
             } else if e.folder.is_some() {
                 let has_vc = folder_target.video_codec.is_some();
-                Some((folder_target, has_vc))
+                Some((folder_target, has_vc, Vec::new(), false))
             } else {
                 let ac = load_auto();
                 if ac.enabled {
-                    Some((ac.into(), true))
+                    Some((ac.into(), true, Vec::new(), false))
                 } else {
                     None
                 }
             }
         };
-        if let Some((t, do_encode)) = decision {
+        if let Some((t, do_encode, mut post, hw_only)) = decision {
             if do_encode {
+                // Legacy target flags (folder-row checkboxes / old graphs)
+                // still mean the same thing when no post nodes are chained.
+                if post.is_empty() {
+                    if t.verify_output {
+                        post.push(PostOp::Verify {
+                            mode: None,
+                            value: None,
+                            on_failure: None,
+                        });
+                    }
+                    if t.replace_original {
+                        post.push(PostOp::Replace);
+                    }
+                }
                 // Never create a second job for a file that already has a
                 // live (queued/dispatched/running) one — requeue+scan races
                 // would otherwise double-encode the same file.
@@ -2770,9 +3214,18 @@ pub async fn library_scan(State(store): State<Store>, Json(req): Json<ScanReq>) 
                     queued.push(e.key());
                     continue;
                 }
-                if dispatch_lib_job(&store, e, &t).await {
-                    e.status = "queued".into();
-                    queued.push(e.key());
+                match dispatch_lib_job(&store, e, &t, &post, hw_only).await {
+                    Ok(true) => {
+                        e.status = "queued".into();
+                        queued.push(e.key());
+                    }
+                    Ok(false) => {
+                        // stays pending — a later scan retries it
+                    }
+                    Err(msg) => {
+                        e.status = "error".into();
+                        e.error = Some(msg);
+                    }
                 }
             } else {
                 e.status = "skipped".into();
@@ -2867,6 +3320,8 @@ pub async fn transcode(State(store): State<Store>, Json(req): Json<TranscodeReq>
         executed_by: "server".into(),
         accelerated: false,
         lib_path: None,
+        gpu_device: None,
+        post: Vec::new(),
     };
     let job_for_worker = job.clone();
     {
@@ -3464,6 +3919,40 @@ pub async fn node_result(State(store): State<Store>, UrlPath(id): UrlPath<String
             // Resolve the real source from the catalog (registered
             // folder, or legacy storage root).
             if let Some(src) = resolve_lib_source(lp, &store) {
+                // Per-job post-encode plan (the ops chained on the encode
+                // node's output port; legacy target flags were folded in
+                // at dispatch time).
+                let (post_plan, src_dur) = {
+                    let s = store.lock().unwrap();
+                    let jp = s.jobs.get(&job_id).map(|j| j.post.clone()).unwrap_or_default();
+                    let sd = s.library.get(lp).and_then(|e| e.duration);
+                    (jp, sd)
+                };
+                let src_name = src.file_name().and_then(|x| x.to_str()).unwrap_or("").to_string();
+                let fail = |msg: String, lp: &str, job_id: &str, store: &Store| -> Response {
+                    {
+                        let mut s = store.lock().unwrap();
+                        s.update_library_entry(lp, |e| {
+                            e.status = "error".into();
+                            e.error = Some(msg.clone());
+                            e.reencoded = None;
+                            e.new_size = None;
+                        });
+                        if let Some(j) = s.jobs.get_mut(job_id) {
+                            j.status = "error".into();
+                            j.error = Some(msg.clone());
+                            j.output_size = None;
+                        }
+                    }
+                    persist_catalog(store);
+                    (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(json!({ "error": msg })),
+                    )
+                        .into_response()
+                };
+                // Stage next to the source (never on top of it) so a failed
+                // health check can't corrupt the original.
                 let dest = src
                     .parent()
                     .map(|d| d.join(out_name.clone()))
@@ -3488,31 +3977,164 @@ pub async fn node_result(State(store): State<Store>, UrlPath(id): UrlPath<String
                     eprintln!("[node_result] VERIFY FAIL dest {out_name}: moved={moved} dest_size={dsize} expected={size} job={job_id}");
                     let _ = std::fs::remove_file(&dest);
                     let _ = std::fs::remove_file(&path);
-                    let msg = format!("output file failed size verification (got {dsize}, expected {size})");
+                    return fail(format!("output file failed size verification (got {dsize}, expected {size})"), lp, &job_id, &store);
+                }
+                let mut replaced = false;
+                let mut requeue = false;
+                // Execute the post-encode plan IN CHAIN ORDER. A failed
+                // health check stops the chain (don't replace a corrupt
+                // file with the original) and either errors the entry or
+                // sends it back to the queue, per the verify node's
+                // on-failure choice.
+                for op in &post_plan {
+                    match op {
+                        PostOp::Verify { mode, value, on_failure } => {
+                            // Sampling: "all" checks every file; "pct" a
+                            // random subset; "every" every Nth (stable key
+                            // hash) — so a 10k-file folder isn't probed
+                            // file by file.
+                            if !verify_selected(lp, mode.as_deref(), *value) {
+                                continue;
+                            }
+                            // The file must probe as a real video — a video
+                            // stream present, positive duration, and at
+                            // least half the source's length (a truncated/
+                            // corrupt encode shows up here, not after the
+                            // user hits play).
+                            let info = probe_full(&dest.to_string_lossy()).await;
+                            let odur = info.duration.unwrap_or(0.0);
+                            let ok_video = info.video_codec.is_some() && odur > 0.0;
+                            let ok_dur = match src_dur {
+                                Some(sd) if sd > 0.0 => odur >= sd * 0.5,
+                                _ => true,
+                            };
+                            if !ok_video || !ok_dur {
+                                let vdbg = info
+                                    .video_codec
+                                    .clone()
+                                    .unwrap_or_else(|| "<none>".into());
+                                eprintln!("[node_result] HEALTHCHECK FAIL {out_name}: video={vdbg} out_dur={odur} src_dur={src_dur:?} job={job_id}");
+                                let _ = std::fs::remove_file(&dest);
+                                if on_failure.as_deref() == Some("requeue") {
+                                    // Back to the queue — the next scan
+                                    // dispatches a fresh attempt.
+                                    let msg = format!(
+                                        "health check failed: output video={vdbg} duration={odur}s (source {src_dur:?}s) — requeued"
+                                    );
+                                    {
+                                        let mut s = store.lock().unwrap();
+                                        s.update_library_entry(lp, |e| {
+                                            e.status = "pending".into();
+                                            e.error = Some(msg.clone());
+                                            e.reencoded = None;
+                                            e.new_size = None;
+                                        });
+                                        if let Some(j) = s.jobs.get_mut(&job_id) {
+                                            j.status = "error".into();
+                                            j.error = Some(msg.clone());
+                                            j.output_size = None;
+                                        }
+                                    }
+                                    persist_catalog(&store);
+                                    return (
+                                        StatusCode::INTERNAL_SERVER_ERROR,
+                                        Json(json!({ "error": "health check failed — requeued" })),
+                                    )
+                                        .into_response();
+                                }
+                                return fail(format!("health check failed: output video={vdbg} duration={odur}s (source {src_dur:?}s)"), lp, &job_id, &store);
+                            }
+                        }
+                        PostOp::Replace => {
+                            // Replace-the-original: keep the source as
+                            // `stem.orig.ext` (overwrites a previous
+                            // backup), then move the finished file onto
+                            // the source path.
+                            let stem = src.file_stem().and_then(|x| x.to_str()).unwrap_or("").to_string();
+                            let ext = src.extension().and_then(|x| x.to_str()).unwrap_or("").to_string();
+                            let backup = if ext.is_empty() {
+                                src.with_file_name(format!("{stem}.orig"))
+                            } else {
+                                src.with_file_name(format!("{stem}.orig.{ext}"))
+                            };
+                            let backup_name = backup.file_name().and_then(|x| x.to_str()).unwrap_or("").to_string();
+                            let b0 = std::fs::rename(&src, &backup).is_ok();
+                            let b1 = {
+                                let ok = std::fs::copy(&src, &backup).is_ok();
+                                if ok {
+                                    let _ = std::fs::remove_file(&src);
+                                }
+                                ok
+                            };
+                            if !(b0 || b1) {
+                                return fail(format!("could not back up original ({src_name}) before replace"), lp, &job_id, &store);
+                            }
+                            let r0 = std::fs::rename(&dest, &src).is_ok();
+                            let r1 = {
+                                let ok = std::fs::copy(&dest, &src).is_ok();
+                                if ok {
+                                    let _ = std::fs::remove_file(&dest);
+                                }
+                                ok
+                            };
+                            if !(r0 || r1) || wait_file_size(&src, size) != size {
+                                // Best effort: put the original back where it was.
+                                let _ = std::fs::remove_file(&src);
+                                let _ = std::fs::rename(&backup, &src);
+                                let _ = std::fs::remove_file(&dest);
+                                return fail(format!("replace failed while moving output onto {src_name}"), lp, &job_id, &store);
+                            }
+                            replaced = true;
+                            {
+                                let mut s = store.lock().unwrap();
+                                s.update_library_entry(lp, |e| {
+                                    e.status = "done".into();
+                                    // The finished file now lives at the SOURCE path.
+                                    e.reencoded = Some(src_name.clone());
+                                    e.new_size = Some(size);
+                                    e.error = None;
+                                });
+                            }
+                            // Tombstone the backup name so rescans never
+                            // discover it as a fresh video (tombstones
+                            // only ever grow).
+                            {
+                                let _g = LIB_CFG_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+                                let mut c = load_lib_cfg();
+                                if !c.tombstone.iter().any(|t| t == &backup_name) {
+                                    c.tombstone.push(backup_name);
+                                    c.tombstone.sort();
+                                }
+                                let _ = save_lib_cfg(&c);
+                            }
+                        }
+                        PostOp::SaveHere => {
+                            // Library jobs already stage the output next
+                            // to the source — the explicit node just
+                            // documents the intent on the graph.
+                        }
+                        PostOp::Requeue => {
+                            // After the rest of the plan: back to the
+                            // queue (a rescan re-dispatches the entry).
+                            requeue = true;
+                        }
+                    }
+                }
+                if !replaced {
                     {
                         let mut s = store.lock().unwrap();
                         s.update_library_entry(lp, |e| {
-                            e.status = "error".into();
-                            e.error = Some(msg.clone());
-                            e.reencoded = None;
-                            e.new_size = None;
+                            e.status = "done".into();
+                            e.reencoded = Some(out_name.clone());
+                            e.new_size = Some(size);
+                            e.error = None;
                         });
-                        if let Some(j) = s.jobs.get_mut(&job_id) {
-                            j.status = "error".into();
-                            j.error = Some(msg.clone());
-                            j.output_size = None;
-                        }
                     }
-                    persist_catalog(&store);
-                    return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": msg }))).into_response();
                 }
-                {
+                if requeue {
                     let mut s = store.lock().unwrap();
                     s.update_library_entry(lp, |e| {
-                        e.status = "done".into();
-                        e.reencoded = Some(out_name.clone());
-                        e.new_size = Some(size);
-                        e.error = None;
+                        e.status = "pending".into();
                     });
                 }
                 // (lock dropped — persist_catalog re-acquires it)
@@ -3555,7 +4177,7 @@ pub async fn dispatch(State(store): State<Store>, Json(req): Json<DispatchReq>) 
     let acodec = req.audio_codec.unwrap_or_else(|| "aac".into());
     let container = req.container.unwrap_or_else(|| "mp4".into());
 
-    let (node_id, node_name, effective, accelerated) = {
+    let (node_id, node_name, effective, accelerated, gpu_device) = {
         let c = store.lock().unwrap().redis();
         let online = list_nodes_redis(c, "online", None, None).await;
         let counts = active_jobs_by_node(&store, None);
@@ -3576,7 +4198,14 @@ pub async fn dispatch(State(store): State<Store>, Json(req): Json<DispatchReq>) 
         } else {
             resolve_video_codec(&vcodec, &usable_hw_encoders(&node))
         };
-        (node.id.clone(), node.display().to_string(), effective, accelerated)
+        // Multi-GPU: pin the least-loaded device for the chosen HW encoder.
+        let dev_load = active_jobs_by_node_dev(&store, None, &node.id);
+        let gpu_device = if accelerated {
+            pick_device_for_encoder(&node, &effective, &dev_load)
+        } else {
+            None
+        };
+        (node.id.clone(), node.display().to_string(), effective, accelerated, gpu_device)
     };
     // lock dropped here
 
@@ -3616,6 +4245,8 @@ pub async fn dispatch(State(store): State<Store>, Json(req): Json<DispatchReq>) 
         executed_by: node_name.clone(),
         accelerated,
         lib_path: None,
+        gpu_device,
+        post: Vec::new(),
     };
     store.lock().unwrap().insert(job);
     Json(json!({
@@ -3671,6 +4302,7 @@ async fn main() {
         .route("/api/codecs", get(codecs))
         .route("/api/library", get(library_get))
         .route("/api/library/scan", post(library_scan))
+        .route("/api/fs/children", get(fs_children))
         .route("/api/library/auto", get(auto_get).post(auto_post))
         .route("/api/library/folders", get(folders_get).post(folders_post))
         .route("/api/library/blocks", get(blocks_get).post(blocks_post))
