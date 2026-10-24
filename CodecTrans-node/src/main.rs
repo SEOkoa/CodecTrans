@@ -2154,12 +2154,54 @@ async fn main() {
             }
         }
         if let Ok(o) = std::process::Command::new("sh")
-            .args(["-c", "ldconfig -p 2>/dev/null | grep -E 'libcuda|libnvidia-encode' | head -8"])
+            .args([
+                "-c",
+                "ldconfig -p 2>/dev/null | grep -E 'libcuda|libnvidia-encode' | head -8",
+            ])
             .output()
         {
             let t = String::from_utf8_lossy(&o.stdout).trim().to_string();
             if !t.is_empty() {
                 dlog(format!("ldconfig: {}", t.replace('\n', " | ")));
+            }
+        }
+        // Host-major series nvidia-smi — ALWAYS (even when the cuInit probe
+        // failed): tells us whether the kernel RM is reachable from userland
+        // at all, independently of CUDA context creation.
+        if let Some(ver) = host_nvidia_driver_version() {
+            if let Some(major) = nv_major(&ver) {
+                let sdir = PathBuf::from(format!("/opt/nvidia-userland/{major}"));
+                let bin = sdir.join("bin/nvidia-smi");
+                if bin.exists() {
+                    if let Ok(o) = std::process::Command::new(&bin)
+                        .env("LD_LIBRARY_PATH", sdir.join("lib").to_string_lossy().as_ref())
+                        .arg("-L")
+                        .output()
+                    {
+                        let out = String::from_utf8_lossy(&o.stdout).trim().to_string();
+                        let err = String::from_utf8_lossy(&o.stderr).trim().to_string();
+                        dlog(format!(
+                            "series{major} nvidia-smi: exit={} out=[{}] err=[{}]",
+                            o.status.code().unwrap_or(-1),
+                            out.replace('\n', " | "),
+                            err.replace('\n', " | ")
+                        ));
+                    }
+                } else {
+                    dlog(format!(
+                        "series{major} nvidia-smi not available (host driver {ver} — bundled series: none)"
+                    ));
+                }
+            }
+        }
+        // GPU device nodes inside the container:
+        let devout = std::process::Command::new("sh")
+            .args(["-c", "ls -l /dev/nvidia* 2>&1 | head -8"])
+            .output();
+        if let Ok(o) = devout {
+            let t = String::from_utf8_lossy(&o.stdout).trim().to_string();
+            if !t.is_empty() {
+                dlog(format!("dev nodes: {}", t.replace('\n', " | ")));
             }
         }
     }
