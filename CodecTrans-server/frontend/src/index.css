@@ -25,9 +25,9 @@ body {
 }
 
 .wrap {
-  max-width: 1040px;
+  max-width: 1560px;
   margin: 0 auto;
-  padding: 32px 20px 64px;
+  padding: 32px 28px 64px;
 }
 
 header {
