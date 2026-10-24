@@ -259,12 +259,17 @@ export default function App() {
   const [folders, setFolders] = useState([]);
   const [folderMsg, setFolderMsg] = useState("");
   const [newFolder, setNewFolder] = useState("");
-  // logic automation — ComfyUI-style node graph (start → condition ✓/✗ → action)
+  // logic automation — named logics (saved list; the canvas edits one).
+  // The library tab assigns a named logic (or none) to each folder.
   const [graph, setGraph] = useState({ nodes: [], edges: [] });
   const [blockMsg, setBlockMsg] = useState("");
-  // Which scope the canvas is editing: "global" or a registered folder id.
-  const [logicScope, setLogicScope] = useState("global");
-  const logicScopeRef = useRef("global");
+  const [logics, setLogics] = useState([]);
+  // id of the logic the canvas is editing ("" = a brand-new unsaved one)
+  const [activeLogic, setActiveLogic] = useState("");
+  const activeLogicRef = useRef("");
+  const [logicName, setLogicName] = useState("");
+  // node worker-settings modal (dashboard gear)
+  const [nodeCfg, setNodeCfg] = useState(null);
 
   // jobs
   const [jobs, setJobs] = useState([]);
@@ -277,19 +282,13 @@ export default function App() {
     api.health().then(setHealth).catch(() => setHealth({ status: "down" }));
     api.foldersGet().then(setFolders).catch(() => {});
     api
-      .blocksGet()
-      .then((d) => {
-        let g =
-          d.graph && d.graph.nodes?.length
-            ? d.graph
-            : migrateBlocksToGraph(d.blocks || []);
-        if (!g.nodes.some((n) => n.kind === "start")) {
-          g = {
-            nodes: [{ id: "start", kind: "start", enabled: true, x: 40, y: 160 }, ...g.nodes],
-            edges: g.edges,
-          };
-        }
-        setGraph(g);
+      .logicsGet()
+      .then((ls) => {
+        setLogics(ls);
+        // Start on the first saved logic (or a blank canvas with a start node).
+        // Pass `ls` explicitly: the `logics` state is still [] at this point,
+        // and selectLogic's default arg would take the blank-canvas branch.
+        selectLogic(ls.length ? ls[0].id : "", ls);
       })
       .catch(() => {});
     api
@@ -490,6 +489,58 @@ export default function App() {
     }
   }
 
+  // ── node worker-settings modal (dashboard gear) ─────────────
+  const openNodeCfg = (n) => {
+    const all = new Set((n.accels || []).map((a) => a.backend));
+    setNodeCfg({
+      id: n.id,
+      regName: n.name,
+      name: n.displayName || "",
+      accels: n.accels || [],
+      // absent (undefined) = never configured = all backends checked;
+      // an explicit list (possibly empty) = exactly those checked.
+      backends:
+        n.enabledBackends === undefined ? all : new Set(n.enabledBackends),
+      allowSw: n.allowSoftware !== false,
+      maxJobs: n.maxJobs || 1,
+      msg: "",
+    });
+  };
+  const patchNodeCfg = (patch) => setNodeCfg((c) => (c ? { ...c, ...patch } : c));
+  const toggleNodeBackend = (b) =>
+    setNodeCfg((c) => {
+      if (!c) return c;
+      const s = new Set(c.backends);
+      if (s.has(b)) s.delete(b);
+      else s.add(b);
+      return { ...c, backends: s };
+    });
+  const nodeCfgBackends = (n) => {
+    // one checkbox per backend the node actually reports, with the device names
+    const m = new Map();
+    for (const a of n.accels || []) {
+      if (!m.has(a.backend)) m.set(a.backend, []);
+      m.get(a.backend).push(`${a.name} (${a.kind === "gpu" ? "GPU" : "CPU"})`);
+    }
+    return [...m.entries()];
+  };
+  async function saveNodeCfg() {
+    if (!nodeCfg) return;
+    patchNodeCfg({ msg: "저장 중…" });
+    try {
+      const r = await api.nodeConfig(nodeCfg.id, {
+        name: nodeCfg.name,
+        enabledBackends: [...nodeCfg.backends],
+        allowSoftware: nodeCfg.allowSw,
+        maxJobs: nodeCfg.maxJobs,
+      });
+      setNodes((ns) => ns.map((x) => (x.id === nodeCfg.id ? { ...x, ...r.node } : x)));
+      setNodeCfg(null);
+    } catch (err) {
+      patchNodeCfg({ msg: err.message });
+    }
+  }
+
   // Scan all enabled registered folders (read-only); the server auto-queues
   // newly found videos per the saved automation (logic blocks first, then the
   // folder default target).
@@ -580,37 +631,73 @@ export default function App() {
   useEffect(() => {
     graphRef.current = graph;
   }, [graph]);
+  // Save the canvas as a NAMED logic (create when the id is still empty).
+  // Every edit auto-saves — same behavior as before the rename.
+  // Name/graph are read from REFS: selectLogic mutates the refs synchronously
+  // while setLogicName/setGraph are still async — a stale render closure must
+  // never clobber a just-loaded logic with the blank-canvas defaults.
+  const logicNameRef = useRef("");
   const commitGraph = (g) => {
     setGraph(g);
     graphRef.current = g;
-    const scope = logicScopeRef.current;
-    const post =
-      scope === "global"
-        ? api.blocksPost({ graph: g })
-        : api.folderBlocksPost(scope, { graph: g });
-    post.catch((err) => flashBlock(err.message));
-  };
-  // Switch the canvas to a folder's own graph (or back to the global one).
-  const switchScope = (scope) => {
-    logicScopeRef.current = scope;
-    setLogicScope(scope);
-    const load = scope === "global" ? api.blocksGet() : api.folderBlocksGet(scope);
-    load
-      .then((d) => {
-        let g =
-          d.graph && d.graph.nodes?.length
-            ? d.graph
-            : migrateBlocksToGraph(d.blocks || []);
-        if (!g.nodes.some((n) => n.kind === "start")) {
-          g = {
-            nodes: [{ id: "start", kind: "start", enabled: true, x: 40, y: 160 }, ...g.nodes],
-            edges: g.edges,
-          };
+    const id = activeLogicRef.current;
+    const name = logicNameRef.current || logicName || "새 로직";
+    api
+      .logicsPost(id ? { id, name, graph: g } : { name, graph: g })
+      .then((r) => {
+        if (!id && r.logic) {
+          activeLogicRef.current = r.logic.id;
+          setActiveLogic(r.logic.id);
         }
-        setGraph(g);
-        graphRef.current = g;
+        if (r.logics) setLogics(r.logics);
       })
-      .catch(() => {});
+      .catch((err) => flashBlock(err.message));
+  };
+  const ensureStart = (g) =>
+    g.nodes.some((n) => n.kind === "start")
+      ? g
+      : {
+          nodes: [{ id: "start", kind: "start", enabled: true, x: 40, y: 160 }, ...g.nodes],
+          edges: g.edges,
+        };
+  // Switch the canvas to a saved named logic ("" = new blank one).
+  const selectLogic = (id, list = logics) => {
+    activeLogicRef.current = id;
+    setActiveLogic(id);
+    const l = list.find((x) => x.id === id);
+    let g;
+    if (l) {
+      g = ensureStart(l.graph && l.graph.nodes?.length ? l.graph : { nodes: [], edges: [] });
+      logicNameRef.current = l.name;
+    } else {
+      g = {
+        nodes: [{ id: "start", kind: "start", enabled: true, x: 40, y: 160 }],
+        edges: [],
+      };
+      logicNameRef.current = `새 로직 ${list.length + 1}`;
+    }
+    graphRef.current = g; // sync BEFORE any stale-closure commit can run
+    setLogicName(logicNameRef.current);
+    setGraph(g);
+  };
+  const patchLogicName = (name) => {
+    logicNameRef.current = name;
+    setLogicName(name);
+    commitGraph(graphRef.current);
+  };
+  const deleteLogic = () => {
+    const id = activeLogicRef.current;
+    if (!id) return;
+    if (!window.confirm("이 로직을 삭제할까요? (이 로직을 쓰던 폴더는 일괄 적용으로 돌아갑니다)")) return;
+    api
+      .logicDelete(id)
+      .then((r) => {
+        const rest = r.logics || [];
+        setLogics(rest);
+        selectLogic(rest.length ? rest[0].id : "", rest);
+        api.foldersGet().then(setFolders).catch(() => {});
+      })
+      .catch((e) => flashBlock(e.message));
   };
   const patchNode = (id, patch) => {
     const g = graphRef.current;
@@ -803,7 +890,7 @@ export default function App() {
       if (dragRef.current) {
         dragRef.current = null;
         setDragId(null);
-        api.blocksPost({ graph: graphRef.current }).catch(() => {});
+        commitGraph(graphRef.current);
       }
       if (pendingRef.current) {
         const p = pendingRef.current;
@@ -1280,17 +1367,49 @@ export default function App() {
             </button>
           </div>
         )}
-        {shownNodes.map((n) => (
-          <div key={n.id} className="node">
-            <div className="row">
-              <span className={`status ${n.status === "online" ? "done" : ""}`}>{n.status}</span>
-              <span className="jname">{n.name}</span>
-              {n.currentJob && <span className="jmeta">busy: {n.currentJob.slice(0, 8)}…</span>}
-              <span className="jmeta">{n.ffmpegVersion.split(" ").slice(0, 3).join(" ")}</span>
+        {shownNodes.map((n) => {
+          // live stats line (from the node's heartbeat; old binaries → hidden)
+          const sp = [];
+          if (n.cpuPct != null) sp.push(`CPU ${Math.round(n.cpuPct)}%`);
+          if (n.ramUsedMb != null && n.ramTotalMb != null)
+            sp.push(`RAM ${fmtSize(n.ramUsedMb * 1048576)} / ${fmtSize(n.ramTotalMb * 1048576)}`);
+          if (n.gpuTemp != null)
+            sp.push(`GPU ${n.gpuTemp}°C${n.gpuUtil != null ? ` · ${n.gpuUtil}%` : ""}`);
+          return (
+            <div key={n.id} className="node">
+              <div className="row">
+                <span className={`status ${n.status === "online" ? "done" : ""}`}>{n.status}</span>
+                <span className="jname" title={n.name === (n.displayName || n.name) ? undefined : `등록명: ${n.name}`}>
+                  {n.displayName || n.name}
+                </span>
+                {n.currentJob && <span className="jmeta">busy: {n.currentJob.slice(0, 8)}…</span>}
+                <span className="jmeta">{n.ffmpegVersion.split(" ").slice(0, 3).join(" ")}</span>
+                {n.maxJobs > 1 && (
+                  <span className="chip c-vp8" title="동시 인코딩 수 (노드 설정)">×{n.maxJobs}</span>
+                )}
+                {(n.enabledBackends || []).length > 0 && (
+                  <span className="chip c-h264" title="워커로 허용된 가속 백엔드 (체크 안 한 백엔드는 배정되지 않음)">
+                    {n.enabledBackends.join(" · ")}
+                  </span>
+                )}
+                {n.allowSoftware === false && (
+                  <span className="chip c-vp9" title="소프트웨어 인코딩 폴백 비활성 — 이 노드는 HW 잡만 받음">
+                    HW만
+                  </span>
+                )}
+                <button
+                  className="gear"
+                  title="노드 설정 — 이름 · 워커 자원 · 동시 작업"
+                  onClick={() => openNodeCfg(n)}
+                >
+                  ⚙
+                </button>
+              </div>
+              <AccelPanel accels={n.accels} flat={n.hwEncoders} />
+              {sp.length > 0 && <div className="nodestats">{sp.join("  ·  ")}</div>}
             </div>
-            <AccelPanel accels={n.accels} flat={n.hwEncoders} />
-          </div>
-        ))}
+          );
+        })}
 
         {discovered.length > 0 && (
           <>
@@ -1314,6 +1433,79 @@ export default function App() {
           </>
         )}
       </section>
+
+      {/* node worker-settings modal (gear) */}
+      {nodeCfg && (
+        <div className="overlay" onClick={() => setNodeCfg(null)}>
+          <div className="cfgmodal" onClick={(e) => e.stopPropagation()}>
+            <h3>
+              노드 설정 — {nodeCfg.name || nodeCfg.regName}
+            </h3>
+            <label className="cfglabel">
+              표시 이름
+              <input
+                value={nodeCfg.name}
+                placeholder={nodeCfg.regName}
+                onChange={(e) => patchNodeCfg({ name: e.target.value })}
+              />
+              <span className="meta">비워두면 등록명 ({nodeCfg.regName})을 씁니다</span>
+            </label>
+            <div className="cfglabel">
+              워커로 사용할 자원
+              <span className="meta">
+                체크를 끄면 그 백엔드로 잡을 배정하지 않습니다 — 예: iGPU 가속이
+                dGPU 인코딩과 CPU를 두고 경쟁해 병목이 될 때 iGPU 끄기
+              </span>
+            </div>
+            <div className="cfgchecks">
+              {nodeCfgBackends(nodeCfg).map(([b, devs]) => (
+                <label key={b}>
+                  <input
+                    type="checkbox"
+                    checked={nodeCfg.backends.has(b)}
+                    onChange={() => toggleNodeBackend(b)}
+                  />
+                  <code>{b}</code>
+                  <span className="meta">{devs.join(" / ")}</span>
+                </label>
+              ))}
+              <label>
+                <input
+                  type="checkbox"
+                  checked={nodeCfg.allowSw}
+                  onChange={(e) => patchNodeCfg({ allowSw: e.target.checked })}
+                />
+                소프트웨어 인코딩 (HW로 못 쓰는 코덱의 최종 폴백)
+              </label>
+            </div>
+            <label className="cfglabel">
+              동시 인코딩 수
+              <input
+                type="number"
+                className="num"
+                min={1}
+                max={16}
+                value={nodeCfg.maxJobs}
+                onChange={(e) =>
+                  patchNodeCfg({
+                    maxJobs: Math.max(1, Math.min(16, Number(e.target.value) || 1)),
+                  })
+                }
+              />
+              <span className="meta">
+                예: 2-슬라이스 NVENC GPU는 2~3개 동시 인코딩까지 성능 손해가 적음
+              </span>
+            </label>
+            <div className="cfgactions">
+              <span className="meta">{nodeCfg.msg}</span>
+              <button onClick={() => setNodeCfg(null)}>취소</button>
+              <button className="primary" onClick={saveNodeCfg}>
+                저장
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
         </>
       )}
 
@@ -1323,10 +1515,11 @@ export default function App() {
           <section className="card auto">
             <h2>폴더 관리</h2>
             <div className="hint">
-              감시할 폴더를 리스트에 추가/제거하고, 폴더별 <b>기본 인코딩 설정</b>을
-              정하세요. 스캔 시 새로 발견된 영상을 자동 큐잉합니다 — <b>로직 탭의
-              블록 조건이 먼저 적용</b>되고, 안 맞으면 폴더 기본 설정을 씁니다. 결과는
-              원본 옆에 저장되며 원본은 건드리지 않습니다.
+              감시할 폴더를 리스트에 추가/제거하고, 폴더별 처리 방식을 정하세요.{" "}
+              <b>로직</b>을 고르면 저장해 둔 로직(노드 그래프)이 적용되고,
+              <b> “없음”</b>이면 아래 <b>기본 인코딩 설정을 일괄 적용</b>합니다.
+              스캔 시 새로 발견된 영상을 자동 큐잉하며, 결과는 원본 옆에
+              저장되고 원본은 건드리지 않습니다.
             </div>
             <div className="search">
               <input
@@ -1367,7 +1560,27 @@ export default function App() {
                       ✕
                     </button>
                   </div>
-                  <div className="frow">
+                  <div className={"frow" + (f.logicId ? " logic-on" : "")}>
+                    <label className="logicpick">
+                      로직
+                      <select
+                        value={f.logicId || ""}
+                        onChange={(e) =>
+                          patchFolder(f.id, (x) => ({
+                            ...x,
+                            logicId: e.target.value || null,
+                          }))
+                        }
+                        title="로직을 쓰면 그 그래프가 우선 — 아무 액션에도 안 맞은 파일만 아래 일괄 설정으로 처리"
+                      >
+                        <option value="">없음 — 아래 설정으로 일괄 적용</option>
+                        {logics.map((l) => (
+                          <option key={l.id} value={l.id}>
+                            {l.name}
+                          </option>
+                        ))}
+                      </select>
+                    </label>
                     <label>
                       비디오
                       <select
@@ -1609,19 +1822,41 @@ export default function App() {
             </div>
             <div className="gtoolbar">
               <label className="scopesel">
-                대상
-                <select value={logicScope} onChange={(e) => switchScope(e.target.value)}>
-                  <option value="global">전체 (모든 폴더)</option>
-                  {folders.map((f) => (
-                    <option key={f.id} value={f.id}>
-                      폴더: {(f.path || "").split("/").filter(Boolean).pop() || f.id}
+                로직
+                <select
+                  value={activeLogic}
+                  onChange={(e) => selectLogic(e.target.value)}
+                >
+                  {logics.map((l) => (
+                    <option key={l.id} value={l.id}>
+                      {l.name}
                     </option>
                   ))}
+                  {!activeLogic && <option value="">＋ 새 로직 (미저장)</option>}
                 </select>
               </label>
+              <input
+                className="logicname"
+                value={logicName}
+                placeholder="로직 이름"
+                onChange={(e) => patchLogicName(e.target.value)}
+                title="로직 이름 — 수정하면 즉시 저장"
+              />
+              <button onClick={() => selectLogic("")} disabled={!activeLogic} title="빈 캔버스로 새 로직 만들기">
+                새 로직
+              </button>
+              <button
+                className="rm-del"
+                onClick={deleteLogic}
+                disabled={!activeLogic}
+                title="선택된 로직 삭제"
+              >
+                삭제
+              </button>
               <span className="meta dim">
                 노드: 헤더로 드래그 · 제목 더블클릭 = 이름 변경 · 와이어 클릭 = 끊기 ·
-                캔버스 드래그 = 이동 · 휠 = 확대/축소
+                캔버스 드래그 = 이동 · 휠 = 확대/축소 — 저장된 로직은{" "}
+                <b>라이브러리 탭</b>에서 폴더에 배정합니다
               </span>
               {blockMsg && <span className="meta ok-text">{blockMsg}</span>}
             </div>

@@ -174,6 +174,10 @@ pub struct Accel {
 pub struct Node {
     pub id: String,
     pub name: String,
+    /// UI display-name override (rename from the dashboard gear). None = use
+    /// the registration name (which the node itself keeps sending).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub display_name: Option<String>,
     pub ffmpeg_version: String,
     /// HW acceleration methods from `ffmpeg -haccels` (cuda, vaapi, qsv, ...).
     pub haccels: Vec<String>,
@@ -181,11 +185,43 @@ pub struct Node {
     pub hw_encoders: Vec<String>,
     /// Grouped per physical device (GPU #0 nvenc, CPU #0 qsv/vaapi, ...).
     pub accels: Vec<Accel>,
+    /// Worker-resource selection (dashboard gear): which accel backends this
+    /// node may be used for (e.g. disable the Intel iGPU because its encodes
+    /// contend with the dGPU for CPU). `None` (key absent = never configured)
+    /// = all backends; `Some(list)` = exactly that list — an empty list
+    /// disables ALL HW workers (software only if `allow_software`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub enabled_backends: Option<Vec<String>>,
+    /// When false, the node is never given a software-encoder fallback job.
+    #[serde(default = "default_true")]
+    pub allow_software: bool,
+    /// How many jobs the node may run at once (e.g. a 2-slice NVENC GPU can
+    /// do 2-3 encodes without losing throughput). Default 1.
+    #[serde(default = "default_one")]
+    pub max_jobs: u32,
     pub status: String,          // online | offline
     pub last_heartbeat: i64,
     /// When this node was first seen in the registry (epoch ms; persisted in Redis).
     pub first_seen: i64,
     pub current_job: Option<String>,
+    // ── live stats (latest heartbeat) ──
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cpu_pct: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ram_used_mb: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ram_total_mb: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub gpu_temp: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub gpu_util: Option<u64>,
+}
+
+/// The name shown in the UI: display override, else the registration name.
+impl Node {
+    pub fn display(&self) -> &str {
+        self.display_name.as_deref().filter(|s| !s.is_empty()).unwrap_or(&self.name)
+    }
 }
 
 /// A node seen via mDNS LAN discovery (may not have registered yet).
@@ -399,21 +435,37 @@ fn parse_node(id: &str, h: &NodeHash, online: bool) -> Option<Node> {
     let mut accels: Vec<Accel> = serde_json::from_str(hash_get(h, "accels").unwrap_or("[]")).unwrap_or_default();
     let hw_encoders: Vec<String> = serde_json::from_str(hash_get(h, "hwEncoders").unwrap_or("[]")).unwrap_or_default();
     let haccels: Vec<String> = serde_json::from_str(hash_get(h, "haccels").unwrap_or("[]")).unwrap_or_default();
+    let enabled_backends: Option<Vec<String>> = hash_get(h, "enabledBackends")
+        .map(|s| serde_json::from_str(s).unwrap_or_default());
     let first_seen = hash_get(h, "firstSeen").and_then(|s| s.parse::<i64>().ok()).unwrap_or_else(now_ms);
     let last_heartbeat = hash_get(h, "lastHeartbeat").and_then(|s| s.parse::<i64>().ok()).unwrap_or_else(now_ms);
     let cur = hash_get(h, "currentJob").unwrap_or("");
+    let display_name = hash_get(h, "displayName").map(|s| s.to_string()).filter(|s| !s.is_empty());
+    let allow_software = hash_get(h, "allowSoftware").map(|s| s == "true").unwrap_or(true);
+    let max_jobs = hash_get(h, "maxJobs").and_then(|s| s.parse::<u32>().ok()).unwrap_or(1).clamp(1, 16);
+    let stat_u64 = |k: &str| -> Option<u64> { hash_get(h, k).and_then(|s| s.parse::<u64>().ok()) };
+    let stat_f64 = |k: &str| -> Option<f64> { hash_get(h, k).and_then(|s| s.parse::<f64>().ok()) };
     accels.sort_by(|a, b| a.backend.cmp(&b.backend));
     Some(Node {
         id: id.to_string(),
         name,
+        display_name,
         ffmpeg_version: hash_get(h, "ffmpegVersion").unwrap_or("").to_string(),
         hw_encoders,
         haccels,
         accels,
+        enabled_backends,
+        allow_software,
+        max_jobs,
         status: if online { "online".into() } else { "offline".into() },
         last_heartbeat,
         first_seen,
         current_job: if cur.is_empty() { None } else { Some(cur.to_string()) },
+        cpu_pct: stat_f64("cpuPct"),
+        ram_used_mb: stat_u64("ramUsedMb"),
+        ram_total_mb: stat_u64("ramTotalMb"),
+        gpu_temp: stat_u64("gpuTemp"),
+        gpu_util: stat_u64("gpuUtil"),
     })
 }
 
@@ -485,21 +537,63 @@ async fn reg_node(
     hgetall_node(c.clone(), &id).await.unwrap_or(Node {
         id,
         name: name.to_string(),
+        display_name: None,
         ffmpeg_version: ffmpeg_version.to_string(),
         hw_encoders: hw_encoders.to_vec(),
         haccels: haccels.to_vec(),
         accels: accels.to_vec(),
+        enabled_backends: None,
+        allow_software: true,
+        max_jobs: 1,
         status: "online".into(),
         last_heartbeat: now,
         first_seen,
         current_job: None,
+        cpu_pct: None,
+        ram_used_mb: None,
+        ram_total_mb: None,
+        gpu_temp: None,
+        gpu_util: None,
     })
 }
 
-/// Heartbeat: refresh liveness + last_heartbeat. None if the node is unknown.
-async fn beat_node(c: RConn, id: &str) -> Option<Node> {
+/// Heartbeat: refresh liveness + last_heartbeat + optional live stats
+/// (CPU/RAM/GPU sampled by the node). None if the node is unknown.
+#[derive(serde::Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct HeartbeatStats {
+    pub cpu_pct: Option<f64>,
+    pub ram_used_mb: Option<u64>,
+    pub ram_total_mb: Option<u64>,
+    pub gpu_temp: Option<u64>,
+    pub gpu_util: Option<u64>,
+}
+
+async fn beat_node(c: RConn, id: &str, stats: &HeartbeatStats) -> Option<Node> {
     let mut pipe = redis::pipe();
     pipe.cmd("HSET").arg(rk_node(id)).arg("lastHeartbeat").arg(now_ms());
+    // Stats: report when present, clear when the node stopped reporting
+    // (older node binary) so the dashboard doesn't show stale numbers.
+    pipe.cmd("HSET")
+        .arg(rk_node(id))
+        .arg("cpuPct")
+        .arg(stats.cpu_pct.map(|x| format!("{x:.1}")).unwrap_or_default());
+    pipe.cmd("HSET")
+        .arg(rk_node(id))
+        .arg("ramUsedMb")
+        .arg(stats.ram_used_mb.map(|x| x.to_string()).unwrap_or_default());
+    pipe.cmd("HSET")
+        .arg(rk_node(id))
+        .arg("ramTotalMb")
+        .arg(stats.ram_total_mb.map(|x| x.to_string()).unwrap_or_default());
+    pipe.cmd("HSET")
+        .arg(rk_node(id))
+        .arg("gpuTemp")
+        .arg(stats.gpu_temp.map(|x| x.to_string()).unwrap_or_default());
+    pipe.cmd("HSET")
+        .arg(rk_node(id))
+        .arg("gpuUtil")
+        .arg(stats.gpu_util.map(|x| x.to_string()).unwrap_or_default());
     pipe.cmd("SETEX").arg(rk_online(id)).arg(ONLINE_TTL_SECS).arg("1");
     let mut c = c;
     let _: () = pipe.query_async(&mut c).await.ok()?;
@@ -555,27 +649,31 @@ async fn list_nodes_redis(c: RConn, status: &str, backend: Option<&str>, family:
 
 /// Auto-pick a node: prefer an online node with an HW encoder for the
 /// requested codec family, else any online node.
-async fn pick_node_redis(c: RConn, family: &str) -> Option<Node> {
-    let online = list_nodes_redis(c, "online", None, None).await;
-    for n in &online {
-        if n.hw_encoders.iter().any(|h| codec_family(h) == family) {
-            return Some(n.clone());
+/// Pick a node index from the online list: a node with FREE capacity (its
+/// overall active jobs < its maxJobs) that has an HW encoder for the family
+/// (respecting the per-node worker-resource selection) is preferred; else
+/// any free node.
+fn pick_node_idx(online: &[Node], counts: &std::collections::HashMap<String, u32>, family: &str) -> Option<usize> {
+    let free = |n: &Node| counts.get(&n.id).copied().unwrap_or(0) < n.max_jobs;
+    for (i, n) in online.iter().enumerate() {
+        if free(n) && usable_hw_encoders(n).iter().any(|h| codec_family(h) == family) {
+            return Some(i);
         }
     }
-    online.first().cloned()
+    online.iter().position(|n| free(n))
 }
 
-/// Forced codec (forceCodec=true): pick an online node that actually has this
-/// exact encoder — e.g. forced hevc_vaapi must not go to a node without VA-API.
-/// If no node lists it (e.g. a pure SW encoder), fall back to any online node.
-async fn pick_node_encoder(c: RConn, encoder: &str) -> Option<Node> {
-    let online = list_nodes_redis(c, "online", None, None).await;
-    for n in &online {
-        if n.hw_encoders.iter().any(|h| h == encoder) {
-            return Some(n.clone());
+/// Forced codec (forceCodec=true): pick a node that actually has this exact
+/// encoder within its enabled backends (e.g. forced hevc_vaapi must not go to
+/// a node with VA-API disabled or without it).
+fn pick_node_encoder_idx(online: &[Node], counts: &std::collections::HashMap<String, u32>, encoder: &str) -> Option<usize> {
+    let free = |n: &Node| counts.get(&n.id).copied().unwrap_or(0) < n.max_jobs;
+    for (i, n) in online.iter().enumerate() {
+        if free(n) && usable_hw_encoders(n).iter().any(|h| h == encoder) {
+            return Some(i);
         }
     }
-    online.first().cloned()
+    online.iter().position(|n| free(n))
 }
 
 // ============================================================
@@ -1372,14 +1470,23 @@ pub struct FolderRule {
     pub enabled: bool,
     #[serde(default)]
     pub target: TargetCfg,
+    /// Named-logic reference (dashboard "로직" selector): when set, this
+    /// folder's new files are processed by that saved logic graph. None =
+    /// bulk-apply the folder's default target below.
+    #[serde(default)]
+    pub logic_id: Option<String>,
     /// Per-folder node graph — takes precedence over the global library
     /// graph when it has condition/action nodes (empty = inherit global).
+    /// Legacy: superseded by `logic_id` + the named-logic store.
     #[serde(default)]
     pub graph: WorkflowGraph,
 }
 
 fn default_true() -> bool {
     true
+}
+fn default_one() -> u32 {
+    1
 }
 
 /// Block condition — which newly found files the block applies to.
@@ -1438,6 +1545,16 @@ pub struct LogicBlock {
     pub label: Option<String>,
 }
 
+/// One saved (named) logic graph, picked from the library tab per folder.
+#[derive(Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct NamedLogic {
+    pub id: String,
+    pub name: String,
+    #[serde(default)]
+    pub graph: WorkflowGraph,
+}
+
 #[derive(Clone, Serialize, Deserialize, Default)]
 pub struct LibraryConfig {
     #[serde(default)]
@@ -1449,6 +1566,9 @@ pub struct LibraryConfig {
     /// linear-chain fallback (auto-migrated for display).
     #[serde(default)]
     pub graph: WorkflowGraph,
+    /// Saved named logics — the library tab assigns one (or none) per folder.
+    #[serde(default)]
+    pub logics: Vec<NamedLogic>,
     /// Basenames of re-encoded outputs ever produced (tombstone). Skipped by
     /// rescans so a folder removed+re-added (or a server restart) never
     /// picks up our own outputs and re-encodes them.
@@ -1559,6 +1679,12 @@ fn load_lib_cfg() -> LibraryConfig {
         .unwrap_or_default()
 }
 
+/// Process-wide lock for library.json read-modify-write cycles. The file is
+/// written whole (folders + logics + blocks + tombstones) by several handlers,
+/// so without this a concurrent scan's `persist_catalog` can commit a stale
+/// snapshot and silently delete logics/folders added in the meantime.
+static LIB_CFG_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 fn save_lib_cfg(c: &LibraryConfig) -> std::io::Result<()> {
     std::fs::write(lib_cfg_path(), serde_json::to_string_pretty(c)?)
 }
@@ -1577,6 +1703,10 @@ fn load_catalog() -> Vec<LibraryEntry> {
 /// Persist the in-memory catalog to disk and grow the re-encoded-name
 /// tombstone (see LibraryConfig::tombstone).
 fn persist_catalog(store: &Store) {
+    let _g = LIB_CFG_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    persist_catalog_locked(store);
+}
+fn persist_catalog_locked(store: &Store) {
     let entries = store.lock().unwrap().list_library();
     let _ = std::fs::write(
         catalog_path(),
@@ -1624,6 +1754,7 @@ pub async fn blocks_get(State(_store): State<Store>) -> impl IntoResponse {
 /// POST /api/library/blocks — save the block list and/or the node graph.
 /// A saved non-empty graph takes precedence at evaluation time.
 pub async fn blocks_post(State(_store): State<Store>, Json(b): Json<BlocksBody>) -> Response {
+    let _g = LIB_CFG_LOCK.lock().unwrap_or_else(|p| p.into_inner());
     let mut c = load_lib_cfg();
     if let Some(blocks) = b.blocks.clone() {
         c.blocks = blocks;
@@ -1658,6 +1789,7 @@ pub async fn folder_blocks_post(
     UrlPath(id): UrlPath<String>,
     Json(b): Json<BlocksBody>,
 ) -> Response {
+    let _g = LIB_CFG_LOCK.lock().unwrap_or_else(|p| p.into_inner());
     let mut c = load_lib_cfg();
     match c.folders.iter_mut().find(|f| f.id == id) {
         Some(f) => {
@@ -1684,10 +1816,72 @@ pub async fn folders_get(State(_store): State<Store>) -> impl IntoResponse {
     Json(json!({ "folders": load_lib_cfg().folders }))
 }
 
+// ── saved named logics (assigned per folder from the library tab) ──
+
+/// GET /api/logic — the saved logic list.
+pub async fn logics_get(State(_store): State<Store>) -> impl IntoResponse {
+    Json(json!({ "logics": load_lib_cfg().logics }))
+}
+
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct LogicBody {
+    /// Existing id when updating (absent = create new).
+    pub id: Option<String>,
+    pub name: String,
+    #[serde(default)]
+    pub graph: WorkflowGraph,
+}
+
+/// POST /api/logic — create (no id) or update (with id) a named logic.
+pub async fn logics_post(State(_store): State<Store>, Json(b): Json<LogicBody>) -> Response {
+    let _g = LIB_CFG_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let mut c = load_lib_cfg();
+    let name = b.name.trim();
+    if name.is_empty() {
+        return (StatusCode::BAD_REQUEST, Json(json!({ "error": "name required" }))).into_response();
+    }
+    match b.id.as_deref().and_then(|id| c.logics.iter_mut().find(|l| l.id == id)) {
+        Some(l) => {
+            l.name = name.to_string();
+            l.graph = b.graph;
+        }
+        None => {
+            c.logics.push(NamedLogic {
+                id: uuid::Uuid::new_v4().to_string(),
+                name: name.to_string(),
+                graph: b.graph,
+            });
+        }
+    }
+    let logic = c.logics.last().unwrap().clone();
+    match save_lib_cfg(&c) {
+        Ok(_) => Json(json!({ "ok": true, "logic": logic, "logics": c.logics })).into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": e.to_string() }))).into_response(),
+    }
+}
+
+/// DELETE /api/logic/:id — remove a named logic. Folders still referencing it
+/// fall back to their bulk target (a dangling id is harmless at scan time).
+pub async fn logic_delete(State(_store): State<Store>, UrlPath(id): UrlPath<String>) -> Response {
+    let _g = LIB_CFG_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let mut c = load_lib_cfg();
+    let before = c.logics.len();
+    c.logics.retain(|l| l.id != id);
+    if c.logics.len() == before {
+        return (StatusCode::NOT_FOUND, Json(json!({ "error": "logic not found" }))).into_response();
+    }
+    match save_lib_cfg(&c) {
+        Ok(_) => Json(json!({ "ok": true, "logics": c.logics })).into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": e.to_string() }))).into_response(),
+    }
+}
+
 /// POST /api/library/folders — save the folder list. Catalog entries of
 /// removed folders are KEPT (marked "제거됨" in the UI) so re-adding the
 /// folder restores their done state instead of re-queueing everything.
 pub async fn folders_post(State(store): State<Store>, Json(mut b): Json<FoldersBody>) -> Response {
+    let _g = LIB_CFG_LOCK.lock().unwrap_or_else(|p| p.into_inner());
     let mut c = load_lib_cfg();
     // Preserve per-folder graphs: the frontend's folder list is loaded at tab
     // open and may predate a later graph edit, so an empty incoming graph
@@ -1706,7 +1900,7 @@ pub async fn folders_post(State(store): State<Store>, Json(mut b): Json<FoldersB
     if let Err(e) = save_lib_cfg(&c) {
         return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": e.to_string() }))).into_response();
     }
-    persist_catalog(&store);
+    persist_catalog_locked(&store);
     Json(json!({ "ok": true, "folders": b.folders })).into_response()
 }
 
@@ -1782,11 +1976,39 @@ fn resolve_lib_source(lp: &str, store: &Store) -> Option<PathBuf> {
 /// constraint — a specific backend ("nvenc", "videotoolbox", "vaapi", …) or
 /// a device class ("gpu"/"cpu"). `None` constraint = best HW encoder for the
 /// family overall. Returns `None` when no HW encoder fits.
+/// Accel devices the node is ALLOWED to use as a worker (dashboard gear
+/// setting `enabledBackends`; `None` = never configured = everything enabled,
+/// `Some([])` = no HW workers at all).
+fn usable_accels(node: &Node) -> Vec<Accel> {
+    match &node.enabled_backends {
+        None => node.accels.clone(),
+        Some(list) => node
+            .accels
+            .iter()
+            .filter(|a| list.iter().any(|b| *b == a.backend))
+            .cloned()
+            .collect(),
+    }
+}
+
+/// Flat HW-encoder list restricted to the node's enabled backends.
+fn usable_hw_encoders(node: &Node) -> Vec<String> {
+    let mut v = Vec::new();
+    for a in usable_accels(node) {
+        for e in a.encoders {
+            if !v.contains(&e) {
+                v.push(e);
+            }
+        }
+    }
+    v
+}
+
 fn node_accel_encoder(node: &Node, family: &str, accel: Option<&str>) -> Option<String> {
     let accel = accel.map(|a| a.to_lowercase());
     if let Some(a) = accel {
         let is_class = a == "gpu" || a == "cpu";
-        for acc in &node.accels {
+        for acc in &usable_accels(node) {
             let ok = if is_class {
                 acc.kind == a
             } else if a == "vt" {
@@ -1802,27 +2024,36 @@ fn node_accel_encoder(node: &Node, family: &str, accel: Option<&str>) -> Option<
         }
         return None;
     }
-    best_hw_encoder(&node.hw_encoders, family)
+    best_hw_encoder(&usable_hw_encoders(node), family)
 }
 
 /// Walk an encoder-preference list on ONE node: the first choice the node can
 /// run (HW) wins. Returns (choice index, concrete encoder, accelerated). When
-/// no choice is HW-satisfiable, the first choice runs on a software encoder.
-fn resolve_choices_on_node(node: &Node, choices: &[TargetChoice]) -> (usize, String, bool) {
+/// no choice is HW-satisfiable the first choice runs on a software encoder —
+/// unless this node has software fallback disabled, in which case None (the
+/// node is not eligible for this job at all).
+fn resolve_choices_on_node(node: &Node, choices: &[TargetChoice]) -> Option<(usize, String, bool)> {
     if choices.is_empty() {
-        return (0, "libx264".into(), false);
+        return (if node.allow_software {
+            Some((0, "libx264".into(), false))
+        } else {
+            None
+        });
     }
     for (i, ch) in choices.iter().enumerate() {
         let fam = codec_family(ch.video_codec.as_deref().unwrap_or("h264"));
         if let Some(enc) = node_accel_encoder(node, &fam, ch.accel.as_deref()) {
-            return (i, enc, true);
+            return Some((i, enc, true));
         }
+    }
+    if !node.allow_software {
+        return None;
     }
     let fam = codec_family(choices[0].video_codec.as_deref().unwrap_or("h264"));
     let sw = family_default_encoder(&fam)
         .map(|s| s.to_string())
         .unwrap_or_else(|| choices[0].video_codec.clone().unwrap_or_else(|| "libx264".into()));
-    (0, sw, false)
+    Some((0, sw, false))
 }
 
 /// Active (queued/dispatched/running) jobs per node id — used to spread a
@@ -1877,16 +2108,27 @@ async fn resolve_choice_dispatch(
         .collect();
     let prefix = folder_key.map(|k| format!("{k}/"));
     let counts = active_jobs_by_node(store, prefix.as_deref());
-    let all_idx: Box<[usize]> = (0..online.len()).collect::<Vec<_>>().into_boxed_slice();
+    // Node CAPACITY counts ALL folders (a node running at its max is full,
+    // whatever the folder is); the balance load (counts) is folder-scoped.
+    let overall = active_jobs_by_node(store, None);
+    let free = |n: &Node| overall.get(&n.id).copied().unwrap_or(0) < n.max_jobs;
     let hw_idx: Box<[usize]> = (0..online.len())
-        .filter(|i| caps[*i].is_some())
+        .filter(|i| caps[*i].is_some() && free(&online[*i]))
         .collect::<Vec<_>>()
         .into_boxed_slice();
-    let pool: &[usize] = if hw_idx.is_empty() {
-        // No HW fit anywhere: any online node, software fallback.
-        &all_idx
-    } else {
+    let sw_idx: Box<[usize]> = (0..online.len())
+        .filter(|i| online[*i].allow_software && free(&online[*i]))
+        .collect::<Vec<_>>()
+        .into_boxed_slice();
+    // No HW fit on a free node: software fallback on a free node that allows
+    // it. Both empty -> nothing can take the job right now (entry stays
+    // pending; a rescan/requeue retries once capacity frees up).
+    let pool: &[usize] = if !hw_idx.is_empty() {
         &hw_idx
+    } else if !sw_idx.is_empty() {
+        &sw_idx
+    } else {
+        return None;
     };
     // (load, earliest-choice-index) — lowest wins; list order breaks the rest.
     let mut best = pool[0];
@@ -1904,7 +2146,11 @@ async fn resolve_choice_dispatch(
         }
     }
     let node = online[best].clone();
-    let (ci, effective, accelerated) = resolve_choices_on_node(&node, &t.choices);
+    let (ci, effective, accelerated) =
+        match resolve_choices_on_node(&node, &t.choices) {
+            Some(r) => r,
+            None => return None,
+        };
     let ch = &t.choices[ci];
     // Choice fields override target-level defaults (container/mode/crf are
     // usually set once at the target; per-choice codec+accel differ).
@@ -1917,7 +2163,8 @@ async fn resolve_choice_dispatch(
         bitrate_pct: ch.bitrate_pct.or(t.bitrate_pct),
         choices: Vec::new(),
     };
-    Some((node.id, node.name, effective, accelerated, eff))
+    let node_name = node.display().to_string();
+    Some((node.id, node_name, effective, accelerated, eff))
 }
 
 /// Queue one library entry for re-encoding on a node with the given target
@@ -1943,14 +2190,17 @@ async fn dispatch_lib_job(store: &Store, e: &LibraryEntry, t: &TargetCfg) -> boo
                 .unwrap_or_else(|| "h264".into());
             let node = {
                 let c = store.lock().unwrap().redis();
-                match pick_node_redis(c, &codec_family(&vcodec)).await {
-                    Some(n) => n,
+                let online = list_nodes_redis(c, "online", None, None).await;
+                let counts = active_jobs_by_node(store, None);
+                match pick_node_idx(&online, &counts, &codec_family(&vcodec)) {
+                    Some(i) => online[i].clone(),
                     None => return false,
                 }
             };
-            let (effective, accelerated) = resolve_video_codec(&vcodec, &node.hw_encoders);
+            let (effective, accelerated) = resolve_video_codec(&vcodec, &usable_hw_encoders(&node));
             eff_owned = None;
-            (node.id, node.name, effective, accelerated, t)
+            let node_name = node.display().to_string();
+            (node.id, node_name, effective, accelerated, t)
         } else {
             let (node_id, node_name, effective, accelerated, eff) =
                 match resolve_choice_dispatch(store, t, e.folder.as_deref()).await {
@@ -2038,7 +2288,7 @@ fn cond_matches(c: &Condition, e: &LibraryEntry, online: &[Node]) -> bool {
         "nodeHasHw" => online.iter().any(|n| {
             let fam = c.hw_family.as_deref().unwrap_or("");
             let cls = c.accel_class.as_deref();
-            n.accels.iter().any(|a| {
+            usable_accels(n).iter().any(|a| {
                 (cls.is_none() || a.kind == cls.unwrap_or(""))
                     && a.encoders.iter().any(|e| codec_family(e) == fam)
             })
@@ -2468,17 +2718,19 @@ pub async fn library_scan(State(store): State<Store>, Json(req): Json<ScanReq>) 
         if e.status != "pending" {
             continue;
         }
-        let folder_target: TargetCfg = libcfg
+        let folder = libcfg
             .folders
             .iter()
-            .find(|f| e.folder.as_deref() == Some(f.id.as_str()))
-            .map(|f| f.target.clone())
-            .unwrap_or_default();
-        // Per-folder graph takes precedence over the global library graph.
-        let folder_graph: Option<&WorkflowGraph> = libcfg
-            .folders
-            .iter()
-            .find(|f| e.folder.as_deref() == Some(f.id.as_str()))
+            .find(|f| e.folder.as_deref() == Some(f.id.as_str()));
+        let folder_target: TargetCfg = folder.map(|f| f.target.clone()).unwrap_or_default();
+        // Graph precedence: 1) the folder's chosen NAMED logic (library-tab
+        // assignment), 2) legacy per-folder inline graph, 3) global library
+        // graph. None of them -> the folder's bulk target below.
+        let logic_graph: Option<&WorkflowGraph> = folder
+            .and_then(|f| f.logic_id.as_deref())
+            .and_then(|lid| libcfg.logics.iter().find(|l| l.id == lid))
+            .map(|l| &l.graph);
+        let folder_graph: Option<&WorkflowGraph> = folder
             .filter(|f| {
                 f.graph
                     .nodes
@@ -2487,7 +2739,7 @@ pub async fn library_scan(State(store): State<Store>, Json(req): Json<ScanReq>) 
             })
             .map(|f| &f.graph);
         let decision: Option<(TargetCfg, bool)> = {
-            let g = folder_graph.or(eff_graph.as_ref());
+            let g = logic_graph.or(folder_graph).or(eff_graph.as_ref());
             if let Some(g) = g {
                 // Walk the node graph; first action reached wins.
                 eval_graph(g, e, &online, &folder_target).or_else(|| {
@@ -2710,14 +2962,102 @@ pub async fn node_register(State(store): State<Store>, Json(req): Json<RegisterR
     Json(json!({"nodeId": node.id, "new": already.is_none()})).into_response()
 }
 
-/// POST /api/nodes/:id/heartbeat — liveness.
-pub async fn node_heartbeat(State(store): State<Store>, UrlPath(id): UrlPath<String>) -> Response {
+/// POST /api/nodes/:id/heartbeat — liveness (+ optional live stats). The
+/// body is optional: older node binaries POST without one.
+pub async fn node_heartbeat(
+    State(store): State<Store>,
+    UrlPath(id): UrlPath<String>,
+    body: Option<Json<HeartbeatStats>>,
+) -> Response {
+    let stats = body.map(|b| b.0).unwrap_or_default();
     let c = store.lock().unwrap().redis();
-    match beat_node(c, &id).await {
+    match beat_node(c, &id, &stats).await {
         Some(n) => match serde_json::to_value(n) {
             Ok(v) => Json(json!({"ok": true, "node": v})).into_response(),
             Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e.to_string()}))).into_response(),
         },
+        None => (StatusCode::NOT_FOUND, Json(json!({"error": "unknown node"}))).into_response(),
+    }
+}
+
+/// PATCH /api/nodes/:id — worker settings from the dashboard gear:
+/// display name, which accel backends the node may be used for, software
+/// fallback toggle, and max concurrent jobs.
+#[derive(serde::Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+struct NodeConfigBody {
+    /// New display name (JSON key `name`). `""` clears the override (back to
+    /// the registration name); absent leaves it unchanged.
+    #[serde(alias = "displayName")]
+    pub name: Option<String>,
+    /// Backends allowed as workers (empty = all). Absent = unchanged.
+    pub enabled_backends: Option<Vec<String>>,
+    /// Absent = unchanged.
+    pub allow_software: Option<bool>,
+    /// Absent = unchanged. Clamped 1..=16.
+    pub max_jobs: Option<u32>,
+}
+
+pub async fn node_config_patch(
+    State(store): State<Store>,
+    UrlPath(id): UrlPath<String>,
+    Json(body): Json<NodeConfigBody>,
+) -> Response {
+    let mut c = store.lock().unwrap().redis();
+    // Read current so we can validate + return the merged node.
+    let before: NodeHash = match redis::cmd("HGETALL")
+        .arg(rk_node(&id))
+        .query_async(&mut c)
+        .await
+    {
+        Ok(h) => h,
+        Err(e) => {
+            return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e.to_string()})))
+                .into_response();
+        }
+    };
+    if before.get("name").is_none() {
+        return (StatusCode::NOT_FOUND, Json(json!({"error": "unknown node"}))).into_response();
+    }
+    let mut pipe = redis::pipe();
+    if let Some(name) = &body.name {
+        if name.is_empty() {
+            pipe.cmd("HDEL").arg(rk_node(&id)).arg("displayName");
+        } else {
+            pipe.cmd("HSET").arg(rk_node(&id)).arg("displayName").arg(name.as_str());
+        }
+    }
+    if let Some(bk) = &body.enabled_backends {
+        // Ignore the backend names the node doesn't actually have.
+        let valid: Vec<String> = {
+            let accels: Vec<Accel> = serde_json::from_str(before.get("accels").map(|s| s.as_str()).unwrap_or("[]")).unwrap_or_default();
+            let have: std::collections::HashSet<&str> = accels.iter().map(|a| a.backend.as_str()).collect();
+            bk.iter().filter(|b| have.contains(b.as_str())).cloned().collect()
+        };
+        pipe.cmd("HSET")
+            .arg(rk_node(&id))
+            .arg("enabledBackends")
+            .arg(serde_json::to_string(&valid).unwrap_or_else(|_| "[]".into()));
+    }
+    if let Some(sw) = body.allow_software {
+        pipe.cmd("HSET").arg(rk_node(&id)).arg("allowSoftware").arg(if sw { "true" } else { "false" });
+    }
+    if let Some(m) = body.max_jobs {
+        pipe.cmd("HSET")
+            .arg(rk_node(&id))
+            .arg("maxJobs")
+            .arg(m.clamp(1, 16).to_string());
+    }
+    let _: () = match pipe.query_async(&mut c).await {
+        Ok(v) => v,
+        Err(e) => {
+            return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e.to_string()})))
+                .into_response();
+        }
+    };
+    match hgetall_node(c, &id).await {
+        Some(n) => Json(json!({"ok": true, "node": serde_json::to_value(n).unwrap_or_default()}))
+            .into_response(),
         None => (StatusCode::NOT_FOUND, Json(json!({"error": "unknown node"}))).into_response(),
     }
 }
@@ -2850,14 +3190,22 @@ pub async fn get_node(State(store): State<Store>, UrlPath(id): UrlPath<String>) 
     }
 }
 
-/// GET /api/nodes/:id/poll — long-poll (up to 20s) for the next dispatched job.
+/// GET /api/nodes/:id/poll — long-poll (up to 20s) for the next dispatched
+/// job. The response also carries the node's worker settings so the node can
+/// adapt (e.g. raise/lower its concurrent-job pool).
 pub async fn node_poll(State(store): State<Store>, UrlPath(id): UrlPath<String>) -> Response {
-    {
+    let node = {
         let c = store.lock().unwrap().redis();
-        if hgetall_node(c, &id).await.is_none() {
-            return (StatusCode::NOT_FOUND, Json(json!({"error": "unknown node"}))).into_response();
+        match hgetall_node(c, &id).await {
+            Some(n) => n,
+            None => return (StatusCode::NOT_FOUND, Json(json!({"error": "unknown node"}))).into_response(),
         }
-    }
+    };
+    let cfg = json!({
+        "maxJobs": node.max_jobs,
+        "enabledBackends": node.enabled_backends.clone(),
+        "allowSoftware": node.allow_software,
+    });
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
     loop {
         let claimed = store.lock().unwrap().claim_for_node(&id);
@@ -2865,12 +3213,12 @@ pub async fn node_poll(State(store): State<Store>, UrlPath(id): UrlPath<String>)
             let c = store.lock().unwrap().redis();
             let _ = set_current_job(c, &id, Some(&job.id)).await;
             return match serde_json::to_value(job) {
-                Ok(v) => Json(json!({"job": v})).into_response(),
+                Ok(v) => Json(json!({"job": v, "config": cfg})).into_response(),
                 Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e.to_string()}))).into_response(),
             };
         }
         if std::time::Instant::now() >= deadline {
-            return Json(json!({"job": null})).into_response();
+            return Json(json!({"job": null, "config": cfg})).into_response();
         }
         tokio::time::sleep(std::time::Duration::from_millis(300)).await;
     }
@@ -3209,24 +3557,26 @@ pub async fn dispatch(State(store): State<Store>, Json(req): Json<DispatchReq>) 
 
     let (node_id, node_name, effective, accelerated) = {
         let c = store.lock().unwrap().redis();
-        let node = if let Some(nid) = &req.node_id {
-            hgetall_node(c, nid).await
+        let online = list_nodes_redis(c, "online", None, None).await;
+        let counts = active_jobs_by_node(&store, None);
+        let idx = if let Some(nid) = &req.node_id {
+            online.iter().position(|n| n.id == *nid)
         } else if req.force_codec.unwrap_or(false) {
             // Forced encoder: must land on a node that actually has it.
-            pick_node_encoder(c, &vcodec).await
+            pick_node_encoder_idx(&online, &counts, &vcodec)
         } else {
-            pick_node_redis(c, &codec_family(&vcodec)).await
+            pick_node_idx(&online, &counts, &codec_family(&vcodec))
         };
-        let node = match node {
-            Some(n) => n,
+        let node = match idx {
+            Some(i) => online[i].clone(),
             None => return (StatusCode::BAD_REQUEST, Json(json!({"error": "no available node"}))).into_response(),
         };
         let (effective, accelerated) = if req.force_codec.unwrap_or(false) {
             (vcodec.clone(), false)
         } else {
-            resolve_video_codec(&vcodec, &node.hw_encoders)
+            resolve_video_codec(&vcodec, &usable_hw_encoders(&node))
         };
-        (node.id.clone(), node.name.clone(), effective, accelerated)
+        (node.id.clone(), node.display().to_string(), effective, accelerated)
     };
     // lock dropped here
 
@@ -3324,6 +3674,8 @@ async fn main() {
         .route("/api/library/auto", get(auto_get).post(auto_post))
         .route("/api/library/folders", get(folders_get).post(folders_post))
         .route("/api/library/blocks", get(blocks_get).post(blocks_post))
+        .route("/api/logic", get(logics_get).post(logics_post))
+        .route("/api/logic/:id", axum::routing::delete(logic_delete))
         .route(
             "/api/library/folders/:id/blocks",
             get(folder_blocks_get).post(folder_blocks_post),
@@ -3341,7 +3693,7 @@ async fn main() {
         .route("/api/nodes/discovered", get(list_discovered_nodes))
         .route("/api/nodes/search", post(search_node))
         .route("/api/nodes/register", post(node_register))
-        .route("/api/nodes/:id", get(get_node))
+        .route("/api/nodes/:id", get(get_node).patch(node_config_patch))
         .route("/api/nodes/:id/heartbeat", post(node_heartbeat))
         .route("/api/nodes/:id/poll", get(node_poll))
         .route("/api/nodes/:id/report", post(node_report))

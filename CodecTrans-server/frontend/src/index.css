@@ -840,8 +840,9 @@ code {
   font-size: 11px;
   font-family: ui-monospace, monospace;
   color: var(--muted);
-  width: 52px;
-  flex: 0 0 auto;
+  min-width: 52px;
+  width: auto;
+  white-space: nowrap;
 }
 
 /* ── layout fixes (screenshot review pass) ─────────────────── */
@@ -1417,3 +1418,119 @@ button:disabled {
   cursor: pointer;
 }
 .gzoom button:hover { background: rgba(255, 255, 255, .1); }
+
+/* ── node worker settings (dashboard gear + modal) ─────────── */
+.node .row .gear {
+  margin-left: auto;
+  align-self: center;
+  background: transparent;
+  border: 1px solid var(--border);
+  color: var(--muted);
+  border-radius: 8px;
+  font-size: 14px;
+  line-height: 1;
+  padding: 5px 8px;
+  cursor: pointer;
+}
+.node .row .gear:hover {
+  color: var(--text);
+  border-color: var(--text);
+}
+.nodestats {
+  margin-top: 4px;
+  font-size: 12px;
+  color: var(--muted);
+  font-variant-numeric: tabular-nums;
+}
+
+.overlay {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.55);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 50;
+}
+.cfgmodal {
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 14px;
+  padding: 18px 20px;
+  width: min(520px, calc(100vw - 32px));
+  max-height: calc(100vh - 48px);
+  overflow: auto;
+  box-shadow: 0 18px 60px rgba(0, 0, 0, 0.5);
+}
+.cfgmodal h3 {
+  margin: 0 0 12px;
+  font-size: 15px;
+}
+.cfglabel {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  font-size: 12px;
+  color: var(--muted);
+  margin-bottom: 12px;
+}
+.cfglabel input[type="text"],
+.cfglabel input:not([type]) {
+  font-size: 13px;
+  padding: 7px 9px;
+  border-radius: 8px;
+  border: 1px solid var(--border);
+  background: var(--bg);
+  color: var(--text);
+}
+.cfglabel input[type="number"] {
+  width: 90px;
+}
+.cfgchecks {
+  display: flex;
+  flex-direction: column;
+  gap: 7px;
+  margin: -4px 0 14px;
+}
+.cfgchecks label {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 13px;
+  cursor: pointer;
+}
+.cfgchecks code {
+  color: var(--text);
+}
+.cfgchecks .meta {
+  font-size: 11px;
+}
+.cfgactions {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  margin-top: 4px;
+}
+.cfgactions .meta {
+  margin-right: auto;
+}
+
+/* ── logic tab: named-logic toolbar bits ───────────────────── */
+.logicname {
+  font-size: 13px;
+  padding: 6px 9px;
+  border-radius: 8px;
+  border: 1px solid var(--border);
+  background: var(--bg);
+  color: var(--text);
+  width: 180px;
+}
+
+/* ── library tab: per-folder logic pick ────────────────────── */
+.frow .logicpick {
+  flex: 1 1 200px;
+}
+/* a logic is assigned: the bulk-target row is a fallback, dim it */
+.frow.logic-on label:not(.logicpick) {
+  opacity: 0.55;
+}

@@ -20,6 +20,8 @@
 //!                set "auto" to discover the server on the LAN via mDNS
 //!   CT_NODE_NAME node name            (default: the OS account/user name)
 //!   CT_PORT      local API port       (default 8401)
+//!   CT_MAX_JOBS  max concurrent encode jobs (default 1; the server can
+//!                override this live via the poll response / dashboard gear)
 //!
 //! LAN discovery (mDNS, zero-config):
 //!   - This node always advertises itself as `_codectrans._tcp.local.` on the
@@ -808,7 +810,7 @@ fn parse_time(s: &str) -> Option<f64> {
 //  run a job locally
 // ============================================================
 
-async fn run_job(client: &reqwest::Client, state: &NState, server: &str, node_id: &str, job: RemoteJob) {
+async fn run_job(client: reqwest::Client, state: NState, server: String, node_id: String, job: RemoteJob) {
     let in_path = in_dir().join(&job.input_file);
     let out_path = out_dir().join(&job.output_file);
 
@@ -1210,10 +1212,174 @@ fn fresh_client() -> reqwest::Client {
         .unwrap()
 }
 
+// ============================================================
+//  live stats (CPU / RAM / GPU) — sampled per heartbeat
+// ============================================================
+
+/// Sample host stats. Runs on a blocking thread (some samples spawn a short
+/// external command); callers bound it with a timeout. Returns None fields
+/// when a metric can't be read on this OS (e.g. GPU temp on macOS needs
+/// root, so it's reported as absent).
+fn sample_stats() -> Value {
+    let mut v = json!({});
+    #[cfg(target_os = "linux")]
+    {
+        if let Some(pct) = linux_cpu_pct() {
+            v["cpuPct"] = json!(pct);
+        }
+        if let Some((used, total)) = linux_ram_mb() {
+            v["ramUsedMb"] = json!(used);
+            v["ramTotalMb"] = json!(total);
+        }
+        if let Some((temp, util)) = nvidia_gpu_stats() {
+            v["gpuTemp"] = json!(temp);
+            v["gpuUtil"] = json!(util);
+        }
+    }
+    #[cfg(target_os = "macos")]
+    {
+        if let Some(pct) = macos_cpu_pct() {
+            v["cpuPct"] = json!(pct);
+        }
+        if let Some((used, total)) = macos_ram_mb() {
+            v["ramUsedMb"] = json!(used);
+            v["ramTotalMb"] = json!(total);
+        }
+    }
+    v
+}
+
+/// CPU% since the previous sample (needs two /proc/stat reads ~3s apart).
+#[cfg(target_os = "linux")]
+fn linux_cpu_pct() -> Option<f64> {
+    use std::sync::Mutex;
+    use std::sync::OnceLock;
+    static PREV: OnceLock<Mutex<(u64, u64)>> = OnceLock::new();
+    let s = std::fs::read_to_string("/proc/stat").ok()?;
+    let line = s.lines().next()?;
+    let mut it = line.split_whitespace();
+    it.next()?; // "cpu"
+    let mut total = 0u64;
+    let mut idle = 0u64;
+    for (i, f) in it.enumerate() {
+        let v: u64 = f.parse().ok()?;
+        total += v;
+        if i == 3 || i == 4 {
+            idle += v; // idle + iowait
+        }
+    }
+    let prev = PREV.get_or_init(|| Mutex::new((0, 0)));
+    let mut g = prev.lock().ok()?;
+    let pct = if g.0 > 0 && total > g.0 {
+        let dtotal = total - g.0;
+        let didle = idle.saturating_sub(g.1);
+        100.0 * (dtotal.saturating_sub(didle)) as f64 / dtotal as f64
+    } else {
+        0.0
+    };
+    *g = (total, idle);
+    Some(pct)
+}
+
+#[cfg(target_os = "linux")]
+fn linux_ram_mb() -> Option<(u64, u64)> {
+    let s = std::fs::read_to_string("/proc/meminfo").ok()?;
+    let get = |key: &str| -> Option<u64> {
+        s.lines()
+            .find(|l| l.starts_with(key))?
+            .split_whitespace()
+            .nth(1)?
+            .parse::<u64>()
+            .ok()
+    };
+    let total_kb = get("MemTotal:")?;
+    let avail_kb = get("MemAvailable:")?;
+    Some((total_kb.saturating_sub(avail_kb) / 1024, total_kb / 1024))
+}
+
+/// NVIDIA GPU temp/util via nvidia-smi (first GPU). None when not NVIDIA.
+#[cfg(target_os = "linux")]
+fn nvidia_gpu_stats() -> Option<(u64, u64)> {
+    let out = std::process::Command::new("nvidia-smi")
+        .args([
+            "--query-gpu=temperature.gpu,utilization.gpu",
+            "--format=csv,noheader,nounits",
+        ])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let s = String::from_utf8_lossy(&out.stdout);
+    let line = s.lines().next()?;
+    let mut parts = line.split(',');
+    let temp = parts.next()?.trim().parse::<u64>().ok()?;
+    let util = parts.next()?.trim().parse::<u64>().ok()?;
+    Some((temp, util))
+}
+
+#[cfg(target_os = "macos")]
+fn macos_cpu_pct() -> Option<f64> {
+    let out = std::process::Command::new("top").args(["-l", "1", "-n", "0"]).output().ok()?;
+    let s = String::from_utf8_lossy(&out.stdout);
+    let line = s.lines().find(|l| l.starts_with("CPU usage"))?;
+    // "CPU usage: 2.30% user, 1.00% sys, 96.69% idle"
+    let nums: Vec<f64> = line
+        .split('%')
+        .filter_map(|p| p.trim().rsplit_once(' ').and_then(|(_, n)| n.parse().ok()))
+        .collect();
+    // first three numbers: user, sys, idle
+    let idle = nums.get(2)?;
+    Some((100.0 - idle).clamp(0.0, 100.0))
+}
+
+#[cfg(target_os = "macos")]
+fn macos_ram_mb() -> Option<(u64, u64)> {
+    let run = |cmd: &str, arg: &str| -> Option<String> {
+        let o = std::process::Command::new(cmd).arg(arg).output().ok()?;
+        if !o.status.success() {
+            return None;
+        }
+        String::from_utf8_lossy(&o.stdout).trim().to_string()
+    };
+    let total_bytes: u64 = run("sysctl", "-n hw.memsize")?.parse().ok()?;
+    let page_bytes: u64 = run("sysctl", "-n hw.pagesize")?.parse().ok()?;
+    let vm = run("vm_stat", "")?;
+    let pages = |key: &str| -> u64 {
+        vm.lines()
+            .find(|l| l.starts_with(key))
+            .and_then(|l| l.split(':').nth(1))
+            .and_then(|n| n.trim().trim_end_matches('.') .parse::<u64>().ok())
+            .unwrap_or(0)
+    };
+    let free = pages("Pages free");
+    let inactive = pages("Pages inactive");
+    let spec = pages("Pages speculative");
+    let total_pages = total_bytes / page_bytes;
+    let used_pages = total_pages.saturating_sub(free + inactive + spec);
+    Some((used_pages * page_bytes / 1024 / 1024, total_bytes / 1024 / 1024))
+}
+
+/// Heartbeat loop: liveness + live stats (CPU/RAM/GPU) every ~3s.
 async fn heartbeat_loop(mut client: reqwest::Client, server: String, name: String, caps: Caps, id: SharedId) {
     loop {
         let nid = id.lock().unwrap().clone();
-        let resp = client.post(format!("{}/api/nodes/{}/heartbeat", server, nid)).send().await;
+        // Stats can spawn short external commands (top -l 1, nvidia-smi) —
+        // keep them off the async runtime and bounded by a timeout.
+        let stats = match tokio::time::timeout(
+            std::time::Duration::from_secs(3),
+            tokio::task::spawn_blocking(|| sample_stats()),
+        )
+        .await
+        {
+            Ok(Ok(s)) => s,
+            _ => json!({}),
+        };
+        let resp = client
+            .post(format!("{}/api/nodes/{}/heartbeat", server, nid))
+            .json(&stats)
+            .send()
+            .await;
         match resp {
             Ok(r) => {
                 // 404 = unknown node (server restarted) → re-register
@@ -1230,48 +1396,97 @@ async fn heartbeat_loop(mut client: reqwest::Client, server: String, name: Strin
     }
 }
 
-/// Long-poll loop: blocks on /poll (server holds up to 20s), runs any job, repeats.
+/// Long-poll loop with a CONCURRENT worker pool: claims jobs while fewer
+/// than `maxJobs` are running (the server pushes maxJobs in the poll
+/// response; CT_MAX_JOBS seeds the default), spawns each claim as a task,
+/// and waits for a slot to free up before polling again.
 /// Re-registers automatically if the server no longer knows this node.
-async fn poll_loop(mut client: reqwest::Client, server: String, name: String, caps: Caps, id: SharedId, state: NState) {
+async fn poll_loop(
+    mut client: reqwest::Client,
+    server: String,
+    name: String,
+    caps: Caps,
+    id: SharedId,
+    state: NState,
+) {
+    let max_jobs: Arc<std::sync::atomic::AtomicU32> = Arc::new(std::sync::atomic::AtomicU32::new(
+        std::env::var("CT_MAX_JOBS").ok().and_then(|s| s.parse().ok()).unwrap_or(1).clamp(1, 16),
+    ));
+    let active: Arc<std::sync::atomic::AtomicU32> = Arc::new(std::sync::atomic::AtomicU32::new(0));
+    let slot_free = Arc::new(tokio::sync::Notify::new());
     loop {
-        let nid = id.lock().unwrap().clone();
-        let url = format!("{}/api/nodes/{}/poll", server, nid);
-        let resp = client.get(&url).send().await;
-        match resp {
-            Ok(r) if r.status() == reqwest::StatusCode::NOT_FOUND => {
-                // unknown node (server restart) → re-register, then retry immediately
-                println!("[node] not registered on server — re-registering");
-                let _ = do_register(&client, &server, &name, &caps, &id).await;
-                continue;
+        // Claim while under capacity.
+        loop {
+            if active.load(std::sync::atomic::Ordering::Relaxed)
+                >= max_jobs.load(std::sync::atomic::Ordering::Relaxed)
+            {
+                break;
             }
-            Ok(r) => {
-                if let Ok(v) = r.json::<Value>().await {
-                    if let Some(jobv) = v.get("job").filter(|j| !j.is_null()) {
-                        if let Ok(job) = serde_json::from_value::<RemoteJob>(jobv.clone()) {
-                            println!("[node] claimed job {} ({} -> {})", job.id, job.input_file, job.effective_video_codec);
-                            let nid2 = id.lock().unwrap().clone();
-                            run_job(&client, &state, &server, &nid2, job).await;
-                            continue; // immediately poll for the next
+            let nid = id.lock().unwrap().clone();
+            let url = format!("{}/api/nodes/{}/poll", server, nid);
+            let resp = client.get(&url).send().await;
+            match resp {
+                Ok(r) if r.status() == reqwest::StatusCode::NOT_FOUND => {
+                    // unknown node (server restart) → re-register, then retry
+                    println!("[node] not registered on server — re-registering");
+                    let _ = do_register(&client, &server, &name, &caps, &id).await;
+                    break;
+                }
+                Ok(r) => {
+                    if let Ok(v) = r.json::<Value>().await {
+                        // Server-pushed worker settings.
+                        if let Some(cfg) = v.get("config") {
+                            if let Some(m) = cfg.get("maxJobs").and_then(|x| x.as_u64()) {
+                                max_jobs.store(m.clamp(1, 16) as u32, std::sync::atomic::Ordering::Relaxed);
+                            }
+                        }
+                        if let Some(jobv) = v.get("job").filter(|j| !j.is_null()) {
+                            if let Ok(job) = serde_json::from_value::<RemoteJob>(jobv.clone()) {
+                                println!("[node] claimed job {} ({} -> {})", job.id, job.input_file, job.effective_video_codec);
+                                active.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                let client2 = client.clone();
+                                let state2 = state.clone();
+                                let server2 = server.clone();
+                                let nid2 = id.lock().unwrap().clone();
+                                let active2 = active.clone();
+                                let free2 = slot_free.clone();
+                                tokio::spawn(async move {
+                                    run_job(client2, state2, server2, nid2, job).await;
+                                    active2.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+                                    free2.notify_one();
+                                });
+                                continue; // claim the next one
+                            }
                         }
                     }
+                    break; // long-poll timed out with no job
                 }
-            }
-            Err(e) => {
-                let mut chain = String::new();
-                let mut src = std::error::Error::source(&e);
-                while let Some(s) = src {
-                    chain.push_str(&format!(" <- {}", s));
-                    src = s.source();
+                Err(e) => {
+                    let mut chain = String::new();
+                    let mut src = std::error::Error::source(&e);
+                    while let Some(s) = src {
+                        chain.push_str(&format!(" <- {}", s));
+                        src = s.source();
+                    }
+                    println!("[node] poll error: {} (retrying){}", e, chain);
+                    // Swap in a fresh client (new pool) — a stale keep-alive /
+                    // long-poll connection from a restarted server would
+                    // otherwise be reused for every retry and keep timing out.
+                    client = fresh_client();
+                    break;
                 }
-                println!("[node] poll error: {} (retrying){}", e, chain);
-                // Swap in a fresh client (new pool) — a stale keep-alive /
-                // long-poll connection from a restarted server would
-                // otherwise be reused by every retry and keep timing out.
-                client = fresh_client();
             }
         }
-        // poll returned empty or errored; small pause to avoid hammering
-        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+        // Wait: a free slot (job finished) or a short idle tick.
+        if active.load(std::sync::atomic::Ordering::Relaxed) > 0 {
+            let _ = tokio::time::timeout(
+                std::time::Duration::from_secs(2),
+                slot_free.notified(),
+            )
+            .await;
+        } else {
+            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+        }
     }
 }
 
@@ -1313,6 +1528,19 @@ async fn jobs(State(st): State<NState>) -> impl IntoResponse {
 // ============================================================
 //  main
 // ============================================================
+
+async fn node_stats() -> impl IntoResponse {
+    // Sample on demand (bounded; spawns short external commands).
+    match tokio::time::timeout(
+        std::time::Duration::from_secs(3),
+        tokio::task::spawn_blocking(|| sample_stats()),
+    )
+    .await
+    {
+        Ok(Ok(s)) => Json(s),
+        _ => Json(json!({})),
+    }
+}
 
 #[tokio::main]
 async fn main() {
@@ -1421,6 +1649,7 @@ async fn main() {
         .route("/api/health", get(health))
         .route("/api/capabilities", get(capabilities))
         .route("/api/jobs", get(jobs))
+        .route("/api/stats", get(node_stats))
         .with_state(state);
     let bind = bind_addr();
     let port = local_port();

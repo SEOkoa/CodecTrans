@@ -25,6 +25,14 @@ export const api = {
   job: (id) => jfetch(`/api/jobs/${id}`),
   nodes: (status = "all") =>
     jfetch(`/api/nodes?status=${encodeURIComponent(status)}`),
+  // worker settings (dashboard gear): display name, enabled backends,
+  // software fallback, max concurrent jobs.
+  nodeConfig: (id, body) =>
+    jfetch(`/api/nodes/${id}`, {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    }),
   discoveredNodes: () => jfetch("/api/nodes/discovered"),
   // "server finds a node": probe a node's local API (ip:port) and register it.
   searchNode: (ip, port) =>
@@ -134,6 +142,16 @@ export const api = {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(body),
     }),
+  // saved named logics (the logic tab edits these; the library tab assigns
+  // one per folder)
+  logicsGet: () => jfetch("/api/logic").then((r) => r.logics || []),
+  logicsPost: (body) =>
+    jfetch("/api/logic", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    }),
+  logicDelete: (id) => jfetch(`/api/logic/${id}`, { method: "DELETE" }),
 };
 
 export function fmtSize(bytes) {
