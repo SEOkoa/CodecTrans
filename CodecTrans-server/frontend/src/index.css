@@ -1106,7 +1106,9 @@ button:disabled {
   border-radius: 10px;
   overflow: hidden;
   border: 1px solid var(--border);
-  overflow: auto;
+  overflow: hidden;
+  flex: 1;
+  min-width: 0;
   background-color: #101318;
   background-image: radial-gradient(circle, #222b38 1px, transparent 1.4px);
   background-size: 22px 22px;
@@ -1153,12 +1155,29 @@ button:disabled {
   display: flex;
   align-items: center;
   gap: 6px;
-  padding: 6px 8px;
+  padding: 6px 20px 6px 18px;
   cursor: grab;
   user-select: none;
-  font-size: 12.5px;
-  font-weight: 700;
   border-radius: 9px 9px 0 0;
+}
+.gchip {
+  font-size: 10px;
+  font-weight: 700;
+  padding: 1px 7px;
+  border-radius: 8px;
+  flex: 0 0 auto;
+  background: rgba(255, 255, 255, .14);
+}
+.gchip.c-cond { background: rgba(255, 217, 138, .18); }
+.gchip.c-act { background: rgba(159, 242, 192, .18); }
+.gchip.c-start { background: rgba(159, 227, 255, .18); }
+.gtitle {
+  font-size: 12.5px;
+  font-weight: 600;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  min-width: 0;
 }
 .ghead:active { cursor: grabbing; }
 .gnode.kind-start .ghead { background: #123c4d; color: #9fe3ff; }
@@ -1227,3 +1246,90 @@ button:disabled {
 }
 .glab.t { color: #35d07f; }
 .glab.f { color: #e05555; }
+
+/* ── logic: palette + zoom ───────────────────────────────────── */
+.logic-flex {
+  display: flex;
+  gap: 12px;
+  align-items: stretch;
+}
+.gpals {
+  flex: 0 0 232px;
+  height: 620px;
+  overflow-y: auto;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: var(--card, #151a22);
+  padding: 10px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.gpals::-webkit-scrollbar { width: 8px; }
+.gpals::-webkit-scrollbar-thumb { background: #2a3342; border-radius: 4px; }
+.gpal-sec {
+  font-size: 10.5px;
+  font-weight: 700;
+  letter-spacing: .06em;
+  text-transform: uppercase;
+  color: var(--muted-foreground);
+  margin: 8px 0 2px;
+}
+.gpal-sec:first-child { margin-top: 0; }
+.gpal-item {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  text-align: left;
+  border: 1px solid var(--border);
+  background: rgba(255, 255, 255, .03);
+  color: var(--foreground);
+  border-radius: 8px;
+  padding: 7px 10px;
+  font-size: 12.5px;
+  font-weight: 600;
+  cursor: pointer;
+}
+.gpal-item span {
+  font-size: 11px;
+  font-weight: 400;
+  color: var(--muted-foreground);
+}
+.gpal-item:hover:not(:disabled) {
+  border-color: var(--accent);
+  background: rgba(255, 255, 255, .06);
+}
+.gpal-item:disabled { opacity: .45; cursor: default; }
+.gworld {
+  position: absolute;
+  top: 0;
+  left: 0;
+  width: 100%;
+  height: 100%;
+  transform-origin: 0 0;
+}
+.gzoom {
+  position: absolute;
+  right: 10px;
+  bottom: 10px;
+  z-index: 6;
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  background: rgba(13, 16, 20, .9);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 3px 6px;
+  font-size: 11.5px;
+}
+.gzoom button {
+  border: none;
+  background: transparent;
+  color: var(--foreground);
+  font-size: 14px;
+  line-height: 1;
+  padding: 2px 6px;
+  border-radius: 5px;
+  cursor: pointer;
+}
+.gzoom button:hover { background: rgba(255, 255, 255, .1); }

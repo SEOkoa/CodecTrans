@@ -1363,6 +1363,11 @@ pub struct Condition {
     /// node (h264, h265, av1, vp9)
     #[serde(default)]
     pub hw_family: Option<String>,
+    /// nodeHasHw: device class filter — "gpu" | "cpu" (None = either),
+    /// e.g. "av1 must be HW-encoded on a GPU (nvenc/videotoolbox), not
+    /// on an iGPU path (qsv/vaapi)".
+    #[serde(default)]
+    pub accel_class: Option<String>,
 }
 
 /// Block action — what to do with matching files.
@@ -1428,6 +1433,10 @@ pub struct GraphNode {
     pub action: Action,
     #[serde(default = "default_true")]
     pub enabled: bool,
+    /// Optional user-set header title (falls back to an auto-generated
+    /// description of the condition/action).
+    #[serde(default)]
+    pub label: Option<String>,
     #[serde(default)]
     pub x: f64,
     #[serde(default)]
@@ -1764,7 +1773,11 @@ fn cond_matches(c: &Condition, e: &LibraryEntry, online: &[Node]) -> bool {
         "bitrateLt" => br_mbps.unwrap_or(f64::INFINITY) < c.value.unwrap_or(f64::INFINITY),
         "nodeHasHw" => online.iter().any(|n| {
             let fam = c.hw_family.as_deref().unwrap_or("");
-            n.hw_encoders.iter().any(|h| codec_family(h) == fam)
+            let cls = c.accel_class.as_deref();
+            n.accels.iter().any(|a| {
+                (cls.is_none() || a.kind == cls.unwrap_or(""))
+                    && a.encoders.iter().any(|e| codec_family(e) == fam)
+            })
         }),
         "nameContains" => {
             let pat = c.pattern.as_deref().unwrap_or("").to_lowercase();

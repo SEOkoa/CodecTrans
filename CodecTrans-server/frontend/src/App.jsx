@@ -66,6 +66,49 @@ function wirePath(x1, y1, x2, y2) {
   return `M ${x1} ${y1} C ${x1 + dx} ${y1}, ${x2 - dx} ${y2}, ${x2} ${y2}`;
 }
 
+// Header title for a node — specific, not "조건"/"액션" only. Used when the
+// user hasn't set a custom label.
+function nodeTitle(n) {
+  if (n.label) return n.label;
+  const c = n.condition || {};
+  const a = n.action || {};
+  const codec = (id) => (id ? (id === "h265" ? "HEVC" : id.toUpperCase()) : "?");
+  switch (n.kind) {
+    case "start":
+      return "새 영상 발견";
+    case "condition":
+      switch (c.kind) {
+        case "srcCodec":
+          return "코덱 = " + (c.codec ? codec(c.codec) : "∅");
+        case "sizeGt":
+          return "크기 > " + (c.value ?? "∅") + " MB";
+        case "sizeLt":
+          return "크기 < " + (c.value ?? "∅") + " MB";
+        case "bitrateGt":
+          return "비트레이트 > " + (c.value ?? "∅") + " Mbps";
+        case "bitrateLt":
+          return "비트레이트 < " + (c.value ?? "∅") + " Mbps";
+        case "nameContains":
+          return "이름 '" + (c.pattern || "∅") + "' 포함";
+        case "nodeHasHw": {
+          const cls =
+            c.accelClass === "gpu" ? "GPU " : c.accelClass === "cpu" ? "iGPU " : "";
+          return "노드: " + cls + (c.hwFamily || "?") + " HW 인코더";
+        }
+        default:
+          return "항상 통과";
+      }
+    case "action":
+      if (a.kind === "skip") return "건너뛰기";
+      if (a.kind === "healthcheck") return "헬스체크";
+      const t = a.target || {};
+      const rate = t.mode === "crf" ? "CRF " + (t.crf ?? 23) : (t.bitratePct ?? 70) + "%";
+      return "인코딩 → " + (t.videoCodec ? codec(t.videoCodec) : "폴더 기본") + " · " + rate;
+    default:
+      return n.kind;
+  }
+}
+
 // node width in the logic canvas (must match .gnode CSS width)
 const NODE_W = 224;
 
@@ -535,20 +578,37 @@ export default function App() {
       action: { ...(n?.action || {}), target: { ...(n?.action?.target || {}), ...patch } },
     });
   };
-  const addNode = (kind) => {
+  const addNode = (kind, preset = {}) => {
     const g = graphRef.current;
+    if (kind === "start" && g.nodes.some((n) => n.kind === "start")) return;
     const id = `n${Date.now().toString(36)}${Math.floor(Math.random() * 999)}`;
     const base = {
       id,
-      kind,
       enabled: true,
-      x: 360 + (g.nodes.length % 4) * 48,
+      x: 380 + (g.nodes.length % 4) * 48,
       y: 50 + (g.nodes.length % 6) * 44,
     };
-    const node =
-      kind === "condition"
-        ? { ...base, condition: { kind: "always" } }
-        : { ...base, action: { kind: "encode", target: { videoCodec: "av1", container: "mp4", mode: "pct", bitratePct: 70 } } };
+    let node;
+    if (kind === "start") node = { ...base, kind: "start" };
+    else if (kind === "cond")
+      node = {
+        ...base,
+        kind: "condition",
+        condition:
+          preset.kind === "nodeHasHw"
+            ? { kind: "nodeHasHw", hwFamily: "av1" }
+            : { kind: preset.kind || "always" },
+      };
+    else if (kind === "act")
+      node = {
+        ...base,
+        kind: "action",
+        action:
+          preset.kind === "encode"
+            ? { kind: "encode", target: { videoCodec: "av1", container: "mp4", mode: "pct", bitratePct: 70 } }
+            : { kind: preset.kind || "skip" },
+      };
+    else return;
     commitGraph({ ...g, nodes: [...g.nodes, node] });
   };
   const removeNode = (id) => {
@@ -564,45 +624,81 @@ export default function App() {
     commitGraph({ ...g, edges: g.edges.filter((_, j) => j !== i) });
   };
 
-  // node drag + wire creation (window-level listeners; ref-driven so the
-  // mount-only effect always sees fresh state)
-  const canvasRef = useRef(null);
-  const dragRef = useRef(null); // { id, ox, oy }
-  const pendingRef = useRef(null); // { from, port }
-  const [dragId, setDragId] = useState(null);
-  const [pending, setPending] = useState(null); // { from, port, x, y }
+  // canvas view: pan (x,y) + zoom (k) applied to the .gworld wrapper
+  const [view, setView] = useState({ x: 20, y: 10, k: 1 });
+  const viewRef = useRef(view);
+  useEffect(() => {
+    viewRef.current = view;
+  }, [view]);
+  const zoomBy = (factor) => {
+    const v = viewRef.current;
+    const k = Math.max(0.4, Math.min(2.5, v.k * factor));
+    // zoom around the canvas center
+    const rect = canvasRef.current?.getBoundingClientRect();
+    const cx = rect ? rect.width / 2 : 400;
+    const cy = rect ? rect.height / 2 : 300;
+    setView({ x: cx - ((cx - v.x) / v.k) * k, y: cy - ((cy - v.y) / v.k) * k, k });
+  };
 
+  // node drag + wire creation + canvas pan (window-level listeners;
+  // ref-driven so the mount-only effect always sees fresh state)
+  const canvasRef = useRef(null);
+  const dragRef = useRef(null); // { id, ox, oy } — offsets in WORLD coords
+  const pendingRef = useRef(null); // { from, port }
+  const panRef = useRef(null); // { sx, sy, vx, vy }
+  const [dragId, setDragId] = useState(null);
+  const [pending, setPending] = useState(null); // { from, port, x, y } (world)
+
+  const toWorld = (e) => {
+    const rect = canvasRef.current.getBoundingClientRect();
+    const v = viewRef.current;
+    return { x: (e.clientX - rect.left - v.x) / v.k, y: (e.clientY - rect.top - v.y) / v.k };
+  };
   const onNodeDown = (e, n) => {
     if (e.target.closest("input,select,button,label,textarea")) return;
-    const rect = canvasRef.current.getBoundingClientRect();
-    dragRef.current = { id: n.id, ox: e.clientX - rect.left - n.x, oy: e.clientY - rect.top - n.y };
+    const w = toWorld(e);
+    dragRef.current = { id: n.id, ox: w.x - n.x, oy: w.y - n.y };
     setDragId(n.id);
     e.preventDefault();
   };
   const onSocketDown = (e, n, port) => {
     e.stopPropagation();
     e.preventDefault();
-    const rect = canvasRef.current.getBoundingClientRect();
+    const w = toWorld(e);
     pendingRef.current = { from: n.id, port };
-    setPending({ from: n.id, port, x: e.clientX - rect.left, y: e.clientY - rect.top });
+    setPending({ from: n.id, port, x: w.x, y: w.y });
+  };
+  // dragging empty canvas = pan the view
+  const onCanvasDown = (e) => {
+    if (e.target.closest(".gnode,.gsock,.ghit,.gzoom")) return;
+    const v = viewRef.current;
+    panRef.current = { sx: e.clientX, sy: e.clientY, vx: v.x, vy: v.y };
   };
   useEffect(() => {
     const move = (e) => {
-      const rect = canvasRef.current?.getBoundingClientRect();
-      if (!rect) return;
+      if (panRef.current) {
+        const p = panRef.current;
+        setView((v) => ({ ...v, x: p.vx + (e.clientX - p.sx), y: p.vy + (e.clientY - p.sy) }));
+        return;
+      }
+      const w = toWorld(e);
       const d = dragRef.current;
       if (d) {
-        const x = Math.max(0, e.clientX - rect.left - d.ox);
-        const y = Math.max(0, e.clientY - rect.top - d.oy);
+        const x = Math.max(-200, w.x - d.ox);
+        const y = Math.max(-100, w.y - d.oy);
         setGraph((g) => ({
           ...g,
           nodes: g.nodes.map((n) => (n.id === d.id ? { ...n, x, y } : n)),
         }));
       }
       const p = pendingRef.current;
-      if (p) setPending({ ...p, x: e.clientX - rect.left, y: e.clientY - rect.top });
+      if (p) setPending({ ...p, x: w.x, y: w.y });
     };
     const up = (e) => {
+      if (panRef.current) {
+        panRef.current = null;
+        return;
+      }
       if (dragRef.current) {
         dragRef.current = null;
         setDragId(null);
@@ -626,11 +722,25 @@ export default function App() {
         }
       }
     };
+    // wheel zoom (native, non-passive so preventDefault works)
+    const wheel = (e) => {
+      if (!canvasRef.current || !e.target.closest(".gcanvas")) return;
+      e.preventDefault();
+      const v = viewRef.current;
+      const factor = e.deltaY < 0 ? 1.1 : 1 / 1.1;
+      const k = Math.max(0.4, Math.min(2.5, v.k * factor));
+      const rect = canvasRef.current.getBoundingClientRect();
+      const cx = e.clientX - rect.left;
+      const cy = e.clientY - rect.top;
+      setView({ x: cx - ((cx - v.x) / v.k) * k, y: cy - ((cy - v.y) / v.k) * k, k });
+    };
     window.addEventListener("mousemove", move);
     window.addEventListener("mouseup", up);
+    window.addEventListener("wheel", wheel, { passive: false });
     return () => {
       window.removeEventListener("mousemove", move);
       window.removeEventListener("mouseup", up);
+      window.removeEventListener("wheel", wheel);
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
@@ -1382,224 +1492,200 @@ export default function App() {
         </>
       )}
 
-            {/* ═══ 로직 — ComfyUI-style node graph automation ═══ */}
+                  {/* ═══ 로직 — ComfyUI-style node graph automation ═══ */}
       {tab === "logic" && (
         <>
           <section className="card auto">
             <h2>자동화 로직</h2>
             <div className="hint">
-              노드 그래프(워크플로) 방식입니다. <b>시작</b> 노드에서 <b>조건</b> 노드,
-              <b> 액션</b> 노드로 소켓(●)을 드래그해 와이어를 이어주세요. 새 영상이
-              시작에서 들어와 와이어를 따라가다가 <b>첫 도착한 액션 노드</b>에서
-              처리됩니다. 조건 노드는 <b style={{ color: "#35d07f" }}>✓(맞으면)</b> /
-              <b style={{ color: "#e05555" }}> ✗(안 맞으면)</b> 두 갈래로
-              갈립니다 — 직렬로 잇면 AND, 나란히 잇면 OR. 어떤 액션에도 도달하지
-              않으면 폴더 기본 설정을 씁니다.
+              노드 그래프(워크플로) 방식입니다. <b>왼쪽 팔레트에서 노드를 클릭</b>해
+              캔버스에 추가하고, 소켓(●)을 드래그해 와이어를 이어주세요. 새 영상이{" "}
+              <b>시작</b>에서 들어와 와이어를 따라가다가 <b>첫 도착한 액션 노드</b>
+              에서 처리됩니다. 조건 노드는{" "}
+              <b style={{ color: "#35d07f" }}>✓(맞으면)</b> /{" "}
+              <b style={{ color: "#e05555" }}> ✗(안 맞으면)</b> 두 갈래 —
+              직렬은 AND, 나란히는 OR. 어떤 액션에도 못 가면 폴더 기본 설정을 씁니다.
             </div>
             <div className="gtoolbar">
-              <button onClick={() => addNode("condition")}>＋ 조건 노드</button>
-              <button onClick={() => addNode("action")}>＋ 액션 노드</button>
               <span className="meta dim">
-                노드는 헤더로 드래그 · 와이어는 클릭하면 끊김 · 노드 ✕ 는 삭제
+                노드: 헤더로 드래그 · 제목 더블클릭 = 이름 변경 · 와이어 클릭 = 끊기 ·
+                캔버스 드래그 = 이동 · 휠 = 확대/축소
               </span>
               {blockMsg && <span className="meta ok-text">{blockMsg}</span>}
             </div>
-            <div className="gcanvas" ref={canvasRef}>
-              <svg className="gwires" width="100%" height="100%">
-                {graph.edges.map((e, i) => {
-                  const a = graph.nodes.find((n) => n.id === e.from);
-                  const b = graph.nodes.find((n) => n.id === e.to);
-                  if (!a || !b) return null;
-                  const [x1, y1] = [a.x + NODE_W, e.fromPort === "false" ? a.y + 33 : a.y + 15];
-                  const [x2, y2] = [b.x, b.y + 15];
-                  const d = wirePath(x1, y1, x2, y2);
-                  const cls = e.fromPort === "false" ? "false" : e.fromPort === "true" ? "true" : "base";
-                  return (
-                    <g key={i}>
-                      <path d={d} className={`gwire ${cls}`} />
-                      <path
-                        d={d}
-                        className="ghit"
-                        onClick={() => removeEdgeAt(i)}
-                      />
-                    </g>
-                  );
-                })}
-                {pending &&
-                  (() => {
-                    const a = graph.nodes.find((n) => n.id === pending.from);
-                    if (!a) return null;
-                    const x1 = a.x + NODE_W;
-                    const y1 = pending.port === "false" ? a.y + 33 : a.y + 15;
+            <div className="logic-flex">
+              <aside className="gpals">
+                <div className="gpal-sec">시작</div>
+                <button
+                  className="gpal-item"
+                  disabled={graph.nodes.some((n) => n.kind === "start")}
+                  onClick={() => addNode("start")}
+                >
+                  ▶ 시작
+                  <span>새 영상이 발견되면</span>
+                </button>
+                <div className="gpal-sec">📹 영상 조건</div>
+                <button className="gpal-item" onClick={() => addNode("cond", { kind: "srcCodec" })}>
+                  원본 코덱 =
+                  <span>h264 / hevc / av1 …</span>
+                </button>
+                <button className="gpal-item" onClick={() => addNode("cond", { kind: "sizeGt" })}>
+                  파일 크기 &gt;
+                  <span>MB 단위로</span>
+                </button>
+                <button className="gpal-item" onClick={() => addNode("cond", { kind: "sizeLt" })}>
+                  파일 크기 &lt;
+                  <span>MB 단위로</span>
+                </button>
+                <button className="gpal-item" onClick={() => addNode("cond", { kind: "bitrateGt" })}>
+                  원본 비트레이트 &gt;
+                  <span>Mbps 단위로</span>
+                </button>
+                <button className="gpal-item" onClick={() => addNode("cond", { kind: "bitrateLt" })}>
+                  원본 비트레이트 &lt;
+                  <span>Mbps 단위로</span>
+                </button>
+                <button className="gpal-item" onClick={() => addNode("cond", { kind: "nameContains" })}>
+                  이름에 포함
+                  <span>예: 4K, raw, .mkv</span>
+                </button>
+                <div className="gpal-sec">🖥 노드(서버) 조건</div>
+                <button className="gpal-item" onClick={() => addNode("cond", { kind: "nodeHasHw" })}>
+                  HW 가속 지원
+                  <span>코덱 + GPU/CPU 구분 — 예: “av1을 GPU 가속으로 하는 노드가 있으면”</span>
+                </button>
+                <div className="gpal-sec">⚙ 액션</div>
+                <button className="gpal-item" onClick={() => addNode("act", { kind: "encode" })}>
+                  인코딩 시작
+                  <span>코덱 · CRF 또는 원본 %</span>
+                </button>
+                <button className="gpal-item" onClick={() => addNode("act", { kind: "healthcheck" })}>
+                  헬스체크
+                  <span>노드 온라인 시만</span>
+                </button>
+                <button className="gpal-item" onClick={() => addNode("act", { kind: "skip" })}>
+                  건너뛰기
+                  <span>인코딩하지 않음</span>
+                </button>
+              </aside>
+              <div
+                className="gcanvas"
+                ref={canvasRef}
+                onMouseDown={(e) => onCanvasDown(e)}
+              >
+                <div
+                  className="gworld"
+                  style={{ transform: `translate(${view.x}px, ${view.y}px) scale(${view.k})` }}
+                >
+                  <svg className="gwires" width="10" height="10" style={{ overflow: "visible" }}>
+                    {graph.edges.map((e, i) => {
+                      const a = graph.nodes.find((n) => n.id === e.from);
+                      const b = graph.nodes.find((n) => n.id === e.to);
+                      if (!a || !b) return null;
+                      const [x1, y1] = [a.x + NODE_W, e.fromPort === "false" ? a.y + 33 : a.y + 15];
+                      const [x2, y2] = [b.x, b.y + 15];
+                      const d = wirePath(x1, y1, x2, y2);
+                      const cls = e.fromPort === "false" ? "false" : e.fromPort === "true" ? "true" : "base";
+                      return (
+                        <g key={i}>
+                          <path d={d} className={`gwire ${cls}`} />
+                          <path d={d} className="ghit" onClick={() => removeEdgeAt(i)} />
+                        </g>
+                      );
+                    })}
+                    {pending &&
+                      (() => {
+                        const a = graph.nodes.find((n) => n.id === pending.from);
+                        if (!a) return null;
+                        const x1 = a.x + NODE_W;
+                        const y1 = pending.port === "false" ? a.y + 33 : a.y + 15;
+                        return (
+                          <path
+                            d={wirePath(x1, y1, pending.x, pending.y)}
+                            className="gwire tmp"
+                          />
+                        );
+                      })()}
+                  </svg>
+                  {graph.nodes.map((n) => {
+                    const isCond = n.kind === "condition";
+                    const isAct = n.kind === "action";
+                    const mode = n.action?.target?.mode || "pct";
                     return (
-                      <path
-                        d={wirePath(x1, y1, pending.x, pending.y)}
-                        className="gwire tmp"
-                      />
-                    );
-                  })()}
-              </svg>
-              {graph.nodes.map((n) => {
-                const isCond = n.kind === "condition";
-                const isAct = n.kind === "action";
-                const mode = n.action?.target?.mode || "pct";
-                return (
-                  <div
-                    key={n.id}
-                    className={`gnode kind-${n.kind}${dragId === n.id ? " dragging" : ""}`}
-                    style={{ left: n.x, top: n.y }}
-                  >
-                    <div className="ghead" onMouseDown={(e) => onNodeDown(e, n)}>
-                      <span className="gtitle">
-                        {n.kind === "start" && "▶ 시작"}
-                        {isCond && "조건"}
-                        {isAct && "액션"}
-                      </span>
-                      <span className="gfill" />
-                      <label
-                        className="gchk"
-                        title="활성/비활성"
-                        onMouseDown={(e) => e.stopPropagation()}
+                      <div
+                        key={n.id}
+                        className={`gnode kind-${n.kind}${dragId === n.id ? " dragging" : ""}`}
+                        style={{ left: n.x, top: n.y }}
                       >
-                        <input
-                          type="checkbox"
-                          checked={!!n.enabled}
-                          onChange={() => patchNode(n.id, { enabled: !n.enabled })}
-                        />
-                      </label>
-                      {n.kind !== "start" && (
-                        <button
-                          className="gdel"
-                          title="노드 삭제"
-                          onMouseDown={(e) => e.stopPropagation()}
-                          onClick={() => removeNode(n.id)}
-                        >
-                          ✕
-                        </button>
-                      )}
-                    </div>
-                    <div className="gbody">
-                      {n.kind === "start" && (
-                        <div className="gsub">스캔에서 새 영상이 발견되면</div>
-                      )}
-                      {isCond && (
-                        <>
-                          <select
-                            value={n.condition?.kind || "always"}
-                            onChange={(e) => patchCond(n.id, { kind: e.target.value })}
+                        <div className="ghead" onMouseDown={(e) => onNodeDown(e, n)}>
+                          <span
+                            className={
+                              "gchip " +
+                              (n.kind === "start" ? "c-start" : isCond ? "c-cond" : "c-act")
+                            }
                           >
-                            <option value="always">항상</option>
-                            <option value="srcCodec">원본 코덱 =</option>
-                            <option value="sizeGt">파일 크기 &gt;</option>
-                            <option value="sizeLt">파일 크기 &lt;</option>
-                            <option value="bitrateGt">원본 비트레이트 &gt;</option>
-                            <option value="bitrateLt">원본 비트레이트 &lt;</option>
-                            <option value="nameContains">이름에 포함</option>
-                            <option value="nodeHasHw">노드가 HW 가속 지원 (코덱)</option>
-                          </select>
-                          {n.condition?.kind === "srcCodec" && (
-                            <select
-                              value={n.condition?.codec || ""}
-                              onChange={(e) =>
-                                patchCond(n.id, { codec: e.target.value || null })
-                              }
-                            >
-                              <option value="">(어떤 코덱이든)</option>
-                              {(codecs?.videoCodecs || [])
-                                .filter((c) => c.id !== "copy")
-                                .map((c) => (
-                                  <option key={c.id} value={c.id}>
-                                    {c.label}
-                                  </option>
-                                ))}
-                            </select>
-                          )}
-                          {(n.condition?.kind === "sizeGt" ||
-                            n.condition?.kind === "sizeLt") && (
-                            <span className="lunit">
-                              <input
-                                type="number"
-                                className="num"
-                                min="0"
-                                value={n.condition?.value ?? ""}
-                                onChange={(e) =>
-                                  patchCond(n.id, {
-                                    value:
-                                      e.target.value === "" ? null : Number(e.target.value),
-                                  })
-                                }
-                              />
-                              MB
-                            </span>
-                          )}
-                          {(n.condition?.kind === "bitrateGt" ||
-                            n.condition?.kind === "bitrateLt") && (
-                            <span className="lunit">
-                              <input
-                                type="number"
-                                className="num"
-                                min="0"
-                                value={n.condition?.value ?? ""}
-                                onChange={(e) =>
-                                  patchCond(n.id, {
-                                    value:
-                                      e.target.value === "" ? null : Number(e.target.value),
-                                  })
-                                }
-                              />
-                              Mbps
-                            </span>
-                          )}
-                          {n.condition?.kind === "nameContains" && (
+                            {n.kind === "start" ? "시작" : isCond ? "조건" : "액션"}
+                          </span>
+                          <span
+                            className="gtitle"
+                            title={n.label ? "더블클릭: 이름 변경" : "더블클릭: 이름 붙이기"}
+                            onDoubleClick={() => {
+                              const t = prompt("노드 이름 (비우면 자동 이름)", n.label || "");
+                              if (t !== null) patchNode(n.id, { label: t.trim() || undefined });
+                            }}
+                          >
+                            {nodeTitle(n)}
+                          </span>
+                          <span className="gfill" />
+                          <label
+                            className="gchk"
+                            title="활성/비활성"
+                            onMouseDown={(e) => e.stopPropagation()}
+                          >
                             <input
-                              type="text"
-                              className="txt"
-                              placeholder="예: 4K, raw, .mkv"
-                              value={n.condition?.pattern || ""}
-                              onChange={(e) =>
-                                patchCond(n.id, { pattern: e.target.value || null })
-                              }
+                              type="checkbox"
+                              checked={!!n.enabled}
+                              onChange={() => patchNode(n.id, { enabled: !n.enabled })}
                             />
-                          )}
-                          {n.condition?.kind === "nodeHasHw" && (
-                            <select
-                              value={n.condition?.hwFamily || "av1"}
-                              onChange={(e) =>
-                                patchCond(n.id, { hwFamily: e.target.value })
-                              }
+                          </label>
+                          {n.kind !== "start" && (
+                            <button
+                              className="gdel"
+                              title="노드 삭제"
+                              onMouseDown={(e) => e.stopPropagation()}
+                              onClick={() => removeNode(n.id)}
                             >
-                              {["h264", "h265", "av1", "vp9"].map((fam) => (
-                                <option key={fam} value={fam}>
-                                  {fam}
-                                </option>
-                              ))}
-                            </select>
+                              ✕
+                            </button>
                           )}
-                        </>
-                      )}
-                      {isAct && (
-                        <>
-                          <select
-                            value={n.action?.kind || "encode"}
-                            onChange={(e) => patchAct(n.id, { kind: e.target.value })}
-                          >
-                            <option value="encode">인코딩 시작</option>
-                            <option value="healthcheck">헬스체크 (노드 온라인 시만)</option>
-                            <option value="skip">건너뛰기</option>
-                          </select>
-                          {n.action?.kind === "encode" && (
+                        </div>
+                        <div className="gbody">
+                          {n.kind === "start" && (
+                            <div className="gsub">스캔에서 새 영상이 발견되면</div>
+                          )}
+                          {isCond && (
                             <>
-                              <label>
-                                비디오
+                              <select
+                                value={n.condition?.kind || "always"}
+                                onChange={(e) => patchCond(n.id, { kind: e.target.value })}
+                              >
+                                <option value="always">항상</option>
+                                <option value="srcCodec">원본 코덱 =</option>
+                                <option value="sizeGt">파일 크기 &gt;</option>
+                                <option value="sizeLt">파일 크기 &lt;</option>
+                                <option value="bitrateGt">원본 비트레이트 &gt;</option>
+                                <option value="bitrateLt">원본 비트레이트 &lt;</option>
+                                <option value="nameContains">이름에 포함</option>
+                                <option value="nodeHasHw">노드가 HW 가속 지원</option>
+                              </select>
+                              {n.condition?.kind === "srcCodec" && (
                                 <select
-                                  value={n.action?.target?.videoCodec || ""}
+                                  value={n.condition?.codec || ""}
                                   onChange={(e) =>
-                                    patchActTarget(n.id, {
-                                      videoCodec: e.target.value || null,
-                                    })
+                                    patchCond(n.id, { codec: e.target.value || null })
                                   }
                                 >
-                                  <option value="">폴더 기본</option>
+                                  <option value="">(어떤 코덱이든)</option>
                                   {(codecs?.videoCodecs || [])
                                     .filter((c) => c.id !== "copy")
                                     .map((c) => (
@@ -1608,96 +1694,215 @@ export default function App() {
                                       </option>
                                     ))}
                                 </select>
-                              </label>
-                              <label>
-                                오디오
-                                <select
-                                  value={n.action?.target?.audioCodec || ""}
-                                  onChange={(e) =>
-                                    patchActTarget(n.id, {
-                                      audioCodec: e.target.value || null,
-                                    })
-                                  }
-                                >
-                                  <option value="">원본 유지</option>
-                                  <option value="aac">AAC</option>
-                                  <option value="opus">Opus</option>
-                                </select>
-                              </label>
-                              <div className="rateval">
-                                <div className="ratemode">
-                                  <button
-                                    type="button"
-                                    className={`rm-opt ${mode === "crf" ? "on" : ""}`}
-                                    onClick={() => patchActTarget(n.id, { mode: "crf" })}
-                                  >
-                                    CRF
-                                  </button>
-                                  <button
-                                    type="button"
-                                    className={`rm-opt ${mode !== "crf" ? "on" : ""}`}
-                                    onClick={() => patchActTarget(n.id, { mode: "pct" })}
-                                  >
-                                    %
-                                  </button>
-                                </div>
+                              )}
+                              {(n.condition?.kind === "sizeGt" ||
+                                n.condition?.kind === "sizeLt") && (
+                                <span className="lunit">
+                                  <input
+                                    type="number"
+                                    className="num"
+                                    min="0"
+                                    value={n.condition?.value ?? ""}
+                                    onChange={(e) =>
+                                      patchCond(n.id, {
+                                        value:
+                                          e.target.value === "" ? null : Number(e.target.value),
+                                      })
+                                    }
+                                  />
+                                  MB
+                                </span>
+                              )}
+                              {(n.condition?.kind === "bitrateGt" ||
+                                n.condition?.kind === "bitrateLt") && (
+                                <span className="lunit">
+                                  <input
+                                    type="number"
+                                    className="num"
+                                    min="0"
+                                    value={n.condition?.value ?? ""}
+                                    onChange={(e) =>
+                                      patchCond(n.id, {
+                                        value:
+                                          e.target.value === "" ? null : Number(e.target.value),
+                                      })
+                                    }
+                                  />
+                                  Mbps
+                                </span>
+                              )}
+                              {n.condition?.kind === "nameContains" && (
                                 <input
-                                  type="number"
-                                  className="num"
-                                  min={mode === "crf" ? 0 : 10}
-                                  max={mode === "crf" ? 51 : 100}
-                                  value={
-                                    mode === "crf"
-                                      ? n.action?.target?.crf ?? 23
-                                      : n.action?.target?.bitratePct ?? 70
-                                  }
+                                  type="text"
+                                  className="txt"
+                                  placeholder="예: 4K, raw, .mkv"
+                                  value={n.condition?.pattern || ""}
                                   onChange={(e) =>
-                                    patchActTarget(
-                                      n.id,
-                                      mode === "crf"
-                                        ? { crf: Number(e.target.value) }
-                                        : { bitratePct: Number(e.target.value) }
-                                    )
+                                    patchCond(n.id, { pattern: e.target.value || null })
                                   }
                                 />
-                              </div>
+                              )}
+                              {n.condition?.kind === "nodeHasHw" && (
+                                <>
+                                  <select
+                                    value={n.condition?.hwFamily || "av1"}
+                                    onChange={(e) =>
+                                      patchCond(n.id, { hwFamily: e.target.value })
+                                    }
+                                  >
+                                    {["h264", "h265", "av1", "vp9"].map((fam) => (
+                                      <option key={fam} value={fam}>
+                                        {fam}
+                                      </option>
+                                    ))}
+                                  </select>
+                                  <select
+                                    value={n.condition?.accelClass || ""}
+                                    onChange={(e) =>
+                                      patchCond(n.id, {
+                                        accelClass: e.target.value || null,
+                                      })
+                                    }
+                                  >
+                                    <option value="">가속기: 어떤 것이든</option>
+                                    <option value="gpu">GPU 전용 (nvenc/videotoolbox)</option>
+                                    <option value="cpu">iGPU 전용 (qsv/vaapi)</option>
+                                  </select>
+                                </>
+                              )}
                             </>
                           )}
-                        </>
-                      )}
-                    </div>
-                    {n.kind !== "start" && (
-                      <div className="gsock in" data-node-in={n.id} title="입력 소켓" />
-                    )}
-                    {n.kind === "start" && (
-                      <div
-                        className="gsock out"
-                        style={{ top: 9 }}
-                        onMouseDown={(e) => onSocketDown(e, n, "")}
-                        title="출력 — 새 영상"
-                      />
-                    )}
-                    {isCond && (
-                      <>
-                        <div
-                          className="gsock out t"
-                          style={{ top: 9 }}
-                          onMouseDown={(e) => onSocketDown(e, n, "true")}
-                          title="✓ 조건이 맞으면"
-                        />
-                        <div
-                          className="gsock out f"
-                          style={{ top: 27 }}
-                          onMouseDown={(e) => onSocketDown(e, n, "false")}
-                          title="✗ 조건이 안 맞으면"
-                        />
-                        <div className="glab t" style={{ top: 9 }}>✓</div>
-                        <div className="glab f" style={{ top: 27 }}>✗</div>
-                      </>
-                    )}
-                  </div>
-                );
-              })}
+                          {isAct && (
+                            <>
+                              <select
+                                value={n.action?.kind || "encode"}
+                                onChange={(e) => patchAct(n.id, { kind: e.target.value })}
+                              >
+                                <option value="encode">인코딩 시작</option>
+                                <option value="healthcheck">헬스체크 (노드 온라인 시만)</option>
+                                <option value="skip">건너뛰기</option>
+                              </select>
+                              {n.action?.kind === "encode" && (
+                                <>
+                                  <label>
+                                    비디오
+                                    <select
+                                      value={n.action?.target?.videoCodec || ""}
+                                      onChange={(e) =>
+                                        patchActTarget(n.id, {
+                                          videoCodec: e.target.value || null,
+                                        })
+                                      }
+                                    >
+                                      <option value="">폴더 기본</option>
+                                      {(codecs?.videoCodecs || [])
+                                        .filter((c) => c.id !== "copy")
+                                        .map((c) => (
+                                          <option key={c.id} value={c.id}>
+                                            {c.label}
+                                          </option>
+                                        ))}
+                                    </select>
+                                  </label>
+                                  <label>
+                                    오디오
+                                    <select
+                                      value={n.action?.target?.audioCodec || ""}
+                                      onChange={(e) =>
+                                        patchActTarget(n.id, {
+                                          audioCodec: e.target.value || null,
+                                        })
+                                      }
+                                    >
+                                      <option value="">원본 유지</option>
+                                      <option value="aac">AAC</option>
+                                      <option value="opus">Opus</option>
+                                    </select>
+                                  </label>
+                                  <div className="rateval">
+                                    <div className="ratemode">
+                                      <button
+                                        type="button"
+                                        className={`rm-opt ${mode === "crf" ? "on" : ""}`}
+                                        onClick={() => patchActTarget(n.id, { mode: "crf" })}
+                                      >
+                                        CRF
+                                      </button>
+                                      <button
+                                        type="button"
+                                        className={`rm-opt ${mode !== "crf" ? "on" : ""}`}
+                                        onClick={() => patchActTarget(n.id, { mode: "pct" })}
+                                      >
+                                        %
+                                      </button>
+                                    </div>
+                                    <input
+                                      type="number"
+                                      className="num"
+                                      min={mode === "crf" ? 0 : 10}
+                                      max={mode === "crf" ? 51 : 100}
+                                      value={
+                                        mode === "crf"
+                                          ? n.action?.target?.crf ?? 23
+                                          : n.action?.target?.bitratePct ?? 70
+                                      }
+                                      onChange={(e) =>
+                                        patchActTarget(
+                                          n.id,
+                                          mode === "crf"
+                                            ? { crf: Number(e.target.value) }
+                                            : { bitratePct: Number(e.target.value) }
+                                        )
+                                      }
+                                    />
+                                  </div>
+                                </>
+                              )}
+                            </>
+                          )}
+                        </div>
+                        {n.kind !== "start" && (
+                          <div className="gsock in" data-node-in={n.id} title="입력 소켓" />
+                        )}
+                        {n.kind === "start" && (
+                          <div
+                            className="gsock out"
+                            style={{ top: 9 }}
+                            onMouseDown={(e) => onSocketDown(e, n, "")}
+                            title="출력 — 새 영상"
+                          />
+                        )}
+                        {isCond && (
+                          <>
+                            <div
+                              className="gsock out t"
+                              style={{ top: 9 }}
+                              onMouseDown={(e) => onSocketDown(e, n, "true")}
+                              title="✓ 조건이 맞으면"
+                            />
+                            <div
+                              className="gsock out f"
+                              style={{ top: 27 }}
+                              onMouseDown={(e) => onSocketDown(e, n, "false")}
+                              title="✗ 조건이 안 맞으면"
+                            />
+                            <div className="glab t" style={{ top: 9 }}>✓</div>
+                            <div className="glab f" style={{ top: 27 }}>✗</div>
+                          </>
+                        )}
+                      </div>
+                    );
+                  })}
+                </div>
+                <div className="gzoom">
+                  <button onClick={() => zoomBy(1 / 1.2)} title="축소">−</button>
+                  <span>{Math.round(view.k * 100)}%</span>
+                  <button onClick={() => zoomBy(1.2)} title="확대">+</button>
+                  <button onClick={() => setView({ x: 20, y: 10, k: 1 })} title="100%로 재설정">
+                    ⟲
+                  </button>
+                </div>
+              </div>
             </div>
           </section>
         </>
