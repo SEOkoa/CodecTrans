@@ -4,18 +4,12 @@
 #
 # GETTING THE IMAGES (compose alone cannot download app images — it only
 # pulls them; they must exist in a registry or be built locally):
-#   A) Docker Hub (recommended — public images, zero auth on the NAS):
-#        on your build box:  docker/push-images.sh <your-hub-user>
-#        then set REGISTRY below to your hub user and just `docker compose up -d`.
-#   B) GHCR:  docker/push-images.sh <your-hub-user> ghcr
-#        then pull+tag on the NAS:
-#        docker pull ghcr.io/<user>/codectrans/codectrans-server:latest \
-#          && docker tag  ghcr.io/<user>/codectrans/codectrans-server:latest codectrans/server:latest
-#        (same for codectrans-node) — then `docker compose up -d`.
-#   C) No registry:  on the build box `docker save` both images into one
-#        tar, copy it to the NAS (File Station), `docker load -i`, then up.
-#   The `build:` blocks below are kept for local building — delete the
-#   pulled images first if you want `up` to build instead of using the tag.
+#   The images are published to Docker Hub, public (no auth on the NAS):
+#     docker.io/seokoa/codectrans-server:latest
+#     docker.io/seokoa/codectrans-node:latest
+#   `docker compose up -d` pulls them. After code changes, re-publish from
+#   any docker build box with `docker/push-images.sh seokoa` (or use the
+#   GHCR / docker-save options documented in the README "Running on a NAS").
 #
 # BEFORE STARTING:
 #   1. Media mounts (server service): one line per shared folder. On a QNAP
@@ -51,9 +45,9 @@ services:
       retries: 12
 
   server:
-    # A) replace with your hub user, e.g. image: docker.io/youruser/codectrans-server:latest
-    image: codectrans/server:latest
-    # B) or build locally (needs the repo source on this box):
+    # images are published to Docker Hub (public — no auth on the NAS):
+    image: docker.io/seokoa/codectrans-server:latest
+    # or build locally instead (needs the repo source on this box):
     # build:
     #   context: ..
     #   dockerfile: docker/server.Dockerfile
@@ -80,7 +74,7 @@ services:
     restart: unless-stopped
 
   node:
-    image: codectrans/node:latest
+    image: docker.io/seokoa/codectrans-node:latest
     # build:
     #   context: ..
     #   dockerfile: docker/node.Dockerfile

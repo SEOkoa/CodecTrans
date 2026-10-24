@@ -19,3 +19,6 @@ CodecTrans-server/auto.json
 # runtime artifacts
 CodecTrans-server/catalog.json
 CodecTrans-server/library.json
+
+# local docker image tarballs (pushed to the registry instead)
+dist-images/
