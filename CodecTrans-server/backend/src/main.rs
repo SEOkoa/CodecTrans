@@ -1909,25 +1909,39 @@ async fn decode_health_check(path: &str, duration: f64, depths: &[(String, u32)]
 }
 
 /// Decode the [seek, seek+len] window to null. Healthy = clean exit AND no
-/// error output — `-v error` makes ffmpeg print only real errors.
+/// error output — `-v error` makes ffmpeg print only real errors. A
+/// TIMEOUT is not proof of corruption: under CPU load (parallel health
+/// checks, 4K/10-bit material) the realtime budget blows — retry once at
+/// 3x before declaring the source broken.
 async fn decode_window_ok(path: &str, seek: f64, len: f64, timeout_s: u64) -> bool {
-    let mut cmd = tokio::process::Command::new("ffmpeg");
-    cmd.arg("-v").arg("error").arg("-nostdin").arg("-threads").arg("4");
-    if seek > 0.0 {
-        cmd.arg("-ss").arg(format!("{seek:.3}"));
-    }
-    cmd.arg("-i").arg(path);
-    cmd.arg("-t").arg(format!("{len:.3}"));
-    cmd.args(["-f", "null", "-"]);
-    cmd.stdout(std::process::Stdio::piped());
-    cmd.stderr(std::process::Stdio::piped());
-    let fut = cmd.output();
-    let Ok(Ok(o)) = tokio::time::timeout(std::time::Duration::from_secs(timeout_s), fut).await
-    else {
-        return false; // spawn failure or timeout -> fail
+    let build = || {
+        let mut c = tokio::process::Command::new("ffmpeg");
+        c.arg("-v").arg("error").arg("-nostdin").arg("-threads").arg("4");
+        if seek > 0.0 {
+            c.arg("-ss").arg(format!("{seek:.3}"));
+        }
+        c.arg("-i").arg(path);
+        c.arg("-t").arg(format!("{len:.3}"));
+        c.args(["-f", "null", "-"]);
+        c.stdout(std::process::Stdio::piped());
+        c.stderr(std::process::Stdio::piped());
+        c
     };
-    let err = String::from_utf8_lossy(&o.stderr);
-    o.status.success() && err.trim().is_empty()
+    let r = tokio::time::timeout(std::time::Duration::from_secs(timeout_s), build().output()).await;
+    if let Ok(Ok(o)) = r {
+        let err = String::from_utf8_lossy(&o.stderr);
+        return o.status.success() && err.trim().is_empty();
+    }
+    // Timeout (or a transient spawn hiccup) — retry once, 3x the budget.
+    let retry_s = timeout_s.saturating_mul(3).max(60);
+    let r = tokio::time::timeout(std::time::Duration::from_secs(retry_s), build().output()).await;
+    match r {
+        Ok(Ok(o)) => {
+            let err = String::from_utf8_lossy(&o.stderr);
+            o.status.success() && err.trim().is_empty()
+        }
+        _ => false,
+    }
 }
 
 /// Legacy `blocks` → linear graph: start → c1 →a1; c1(false) → c2 →a2; …
