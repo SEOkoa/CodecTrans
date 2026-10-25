@@ -687,13 +687,27 @@ async fn list_nodes_redis(c: RConn, status: &str, backend: Option<&str>, family:
 /// (respecting the per-node worker-resource selection) is preferred; else
 /// any free node.
 fn pick_node_idx(online: &[Node], counts: &std::collections::HashMap<String, u32>, family: &str) -> Option<usize> {
-    let free = |n: &Node| counts.get(&n.id).copied().unwrap_or(0) < n.max_jobs;
-    for (i, n) in online.iter().enumerate() {
-        if free(n) && usable_hw_encoders(n).iter().any(|h| codec_family(h) == family) {
-            return Some(i);
-        }
-    }
-    online.iter().position(|n| free(n))
+    let load = |n: &Node| counts.get(&n.id).copied().unwrap_or(0);
+    // 1) free node with a hardware encoder of the family,
+    // 2) any free node (software fallback),
+    // 3) ALL BUSY — still queue on the least-loaded capable node. The node
+    //    enforces its own max_jobs (claim_for_node only hands a job out when
+    //    the node asks), so queued work just waits its turn. Without this,
+    //    large scans leave thousands of entries stuck "pending" until the
+    //    next scan happens to run with free capacity.
+    online
+        .iter()
+        .position(|n| load(n) < n.max_jobs && usable_hw_encoders(n).iter().any(|h| codec_family(h) == family))
+        .or_else(|| online.iter().position(|n| load(n) < n.max_jobs))
+        .or_else(|| {
+            online
+                .iter()
+                .enumerate()
+                .filter(|(_, n)| usable_hw_encoders(n).iter().any(|h| codec_family(h) == family))
+                .min_by_key(|(_, n)| load(n))
+                .map(|(i, _)| i)
+        })
+        .or_else(|| online.iter().enumerate().min_by_key(|(_, n)| load(n)).map(|(i, _)| i))
 }
 
 /// Forced codec (forceCodec=true): pick a node that actually has this exact
@@ -1837,10 +1851,15 @@ fn src_health_depths(graphs: &[&WorkflowGraph]) -> Vec<(String, u32)> {
 /// window), "front" decodes the first pct%, "random" decodes the front
 /// pct% PLUS one random-position pct% window (the front is always part of
 /// the random check). Healthy = every window decodes without ffmpeg errors.
-async fn decode_health_check(path: &str, duration: f64, depths: &[(String, u32)]) -> bool {
-    if duration <= 0.0 {
-        return false;
-    }
+///
+/// `duration` may be UNKNOWN (None) — webm/matroska captures frequently
+/// carry no duration metadata. An unknown duration is NOT corruption: fall
+/// back to a fixed 3s front window (enough to exercise the decode
+/// pipeline) instead of auto-failing the file.
+async fn decode_health_check(path: &str, duration: Option<f64>, depths: &[(String, u32)]) -> bool {
+    const UNKNOWN_WINDOW_S: f64 = 3.0;
+    let known = duration.map_or(false, |d| d > 0.0);
+    let d = duration.unwrap_or(0.0);
     // Absolute cap for spot-check windows: the point is to exercise the
     // decode pipeline, not to watch the movie. Without it a 10% window on
     // a 3-hour file means 18 minutes of CPU decoding per file and the scan
@@ -1848,29 +1867,39 @@ async fn decode_health_check(path: &str, duration: f64, depths: &[(String, u32)]
     const MAX_WINDOW_S: f64 = 15.0;
     let mut windows: Vec<(f64, f64)> = Vec::new(); // (seek, len)
     for (m, pct) in depths {
-        let pct_win = duration * ((*pct as f64) / 100.0);
+        let pct_win = if known {
+            d * ((*pct as f64) / 100.0)
+        } else {
+            UNKNOWN_WINDOW_S
+        };
         match m.as_str() {
             "all" => {
-                windows = vec![(0.0, duration)];
+                if known {
+                    windows = vec![(0.0, d)];
+                } else {
+                    // Unknown length: can't decode "all" — best effort is
+                    // the front window.
+                    windows.push((0.0, UNKNOWN_WINDOW_S));
+                }
                 break;
             }
             "random" => {
                 let win = pct_win.min(MAX_WINDOW_S);
                 windows.push((0.0, win));
-                if duration > 2.0 * win {
+                if known && d > 2.0 * win {
                     // Random window inside the remainder — re-seeded per
                     // scan, so different spots get spot-checked over time.
-                    let span = (duration - 2.0 * win) as u64;
+                    let span = (d - 2.0 * win) as u64;
                     let now = std::time::SystemTime::now()
                         .duration_since(std::time::UNIX_EPOCH)
                         .map(|d| d.as_nanos() as u64)
                         .unwrap_or(0);
                     let start = (fnv1a(path) ^ now) % span;
                     windows.push((start as f64 + win, win));
-                } else if duration > win {
+                } else if known && d > win {
                     // Too short for front + separate window — one tail
                     // window covers the rest of the file.
-                    windows.push((duration - win, win));
+                    windows.push((d - win, win));
                 }
             }
             _ => windows.push((0.0, pct_win.min(MAX_WINDOW_S))), // "front"
@@ -1896,7 +1925,7 @@ async fn decode_health_check(path: &str, duration: f64, depths: &[(String, u32)]
         // software decode), clamped. Window decodes max out at 15 min; a
         // full-file "all" decode at 1 hour.
         let scaled = (len * 8.0) as u64;
-        let timeout_s = if len >= duration - 0.5 {
+        let timeout_s = if known && len >= d - 0.5 {
             scaled.clamp(30, 3600)
         } else {
             scaled.clamp(30, 900)
@@ -1916,7 +1945,10 @@ async fn decode_health_check(path: &str, duration: f64, depths: &[(String, u32)]
 async fn decode_window_ok(path: &str, seek: f64, len: f64, timeout_s: u64) -> bool {
     let build = || {
         let mut c = tokio::process::Command::new("ffmpeg");
-        c.arg("-v").arg("error").arg("-nostdin").arg("-threads").arg("4");
+        // -threads 2 (not 4): the scan runs up to 4 health decodes in
+        // parallel — 4 x 2 threads fills an 8-core box exactly instead of
+        // 4 x 4 oversubscribing it into thrash.
+        c.arg("-v").arg("error").arg("-nostdin").arg("-threads").arg("2");
         if seek > 0.0 {
             c.arg("-ss").arg(format!("{seek:.3}"));
         }
@@ -2078,6 +2110,12 @@ static SCAN_STATE: std::sync::Mutex<ScanState> = std::sync::Mutex::new(ScanState
     finished_queued: 0,
     finished_skipped: 0,
 });
+
+/// One library scan at a time — a second request gets a visible
+/// "already running" reply (with the live progress) instead of silently
+/// overwriting SCAN_STATE and making the first scan's progress vanish.
+static SCAN_LOCK: std::sync::LazyLock<tokio::sync::Mutex<()>> =
+    std::sync::LazyLock::new(|| tokio::sync::Mutex::new(()));
 
 fn scan_scope_label(roots: &[(Option<String>, PathBuf)], libcfg: &LibraryConfig) -> String {
     if roots.iter().any(|(f, _)| f.is_none()) {
@@ -3859,6 +3897,22 @@ async fn library_scan(State(store): State<Store>, Json(req): Json<ScanReq>) -> R
             .into_response();
     }
     let limit = req.limit.unwrap_or(5000).max(1).min(20000);
+    // Serialize scans: a second request (manual click or the auto-scan
+    // tick) gets a visible "already running" reply with the live progress
+    // of the running scan — instead of silently overwriting SCAN_STATE
+    // and making the first scan's progress vanish from the UI.
+    let _scan_guard = match SCAN_LOCK.try_lock() {
+        Ok(g) => g,
+        Err(_) => {
+            let st = SCAN_STATE.lock().unwrap().clone();
+            return Json(json!({
+                "ok": true,
+                "alreadyRunning": true,
+                "progress": st,
+            }))
+            .into_response();
+        }
+    };
 
     // Re-encode outputs land NEXT TO their source inside the folder — a
     // naive rescan would discover them as new videos and re-encode them in
@@ -3919,37 +3973,105 @@ async fn library_scan(State(store): State<Store>, Json(req): Json<ScanReq>) -> R
         finished_queued: 0,
         finished_skipped: 0,
     };
-    let mut entries: Vec<LibraryEntry> = Vec::new();
+    // Carry-forward + probe-reuse both need the previous catalog — fetch
+    // it once (the queue phase below reuses the live-job set too).
+    let (old_entries, live) = {
+        let s = store.lock().unwrap();
+        let live: std::collections::HashSet<String> = s
+            .list()
+            .into_iter()
+            .filter(|j| j.lib_path.is_some() && !["done", "error"].contains(&j.status.as_str()))
+            .map(|j| j.input_file)
+            .collect();
+        (s.list_library(), live)
+    };
+    let old_map: std::collections::HashMap<String, LibraryEntry> =
+        old_entries.iter().map(|o| (o.key(), o.clone())).collect();
+
+    // Probe in parallel (bounded). A file already in the catalog with the
+    // SAME size and a non-error status is unchanged — reuse its probe
+    // instead of re-running ffprobe. This is what keeps the 5-minute
+    // auto-scan cheap on a big library (only new/changed files pay the
+    // probe cost) while a first scan still probes everything.
+    let sem = std::sync::Arc::new(tokio::sync::Semaphore::new(6));
+    let mut handles: Vec<tokio::task::JoinHandle<Option<LibraryEntry>>> =
+        Vec::with_capacity(plan.len());
     for (fid, rootp, rel) in &plan {
         let full = rootp.join(rel);
         let pstr = full.to_string_lossy().to_string();
         let size = std::fs::metadata(&full).map(|m| m.len()).unwrap_or(0);
-        let ext = full.extension().and_then(|x| x.to_str()).unwrap_or("").to_string();
-        let info = probe_full(&pstr).await;
-        entries.push(LibraryEntry {
-            path: rel.to_string_lossy().to_string(),
-            name: full.file_name().and_then(|x| x.to_str()).unwrap_or("").to_string(),
-            size,
-            duration: info.duration,
-            video_codec: info.video_codec,
-            audio_codec: info.audio_codec,
-            container: info
-                .container
-                .clone()
-                .or_else(|| if ext.is_empty() { None } else { Some(ext) }),
-            width: info.width,
-            height: info.height,
-            fps: info.fps,
-            video_bit_rate: info.video_bit_rate,
-            pix_fmt: info.pix_fmt,
-            folder: fid.clone(),
-            status: "pending".into(),
-            reencoded: None,
-            new_size: None,
-            new_codec: None,
-            error: None,
-        });
-        SCAN_STATE.lock().unwrap().scanned += 1;
+        let ext = full
+            .extension()
+            .and_then(|x| x.to_str())
+            .unwrap_or("")
+            .to_string();
+        let rel = rel.clone();
+        let fid = fid.clone();
+        let key = match &fid {
+            Some(f) => format!("{f}/{}", rel.to_string_lossy()),
+            None => rel.to_string_lossy().to_string(),
+        };
+        let reuse = old_map
+            .get(&key)
+            .filter(|o| o.size == size && o.status != "error")
+            .cloned();
+        let sem = sem.clone();
+        handles.push(tokio::spawn(async move {
+            let _g = sem.acquire_owned().await.expect("probe semaphore");
+            let info = match reuse {
+                Some(o) => MediaInfo {
+                    duration: o.duration,
+                    size: None,
+                    container: o.container,
+                    bit_rate: None,
+                    video_codec: o.video_codec,
+                    video_profile: None,
+                    width: o.width,
+                    height: o.height,
+                    pix_fmt: o.pix_fmt,
+                    fps: o.fps,
+                    video_bit_rate: o.video_bit_rate,
+                    audio_codec: o.audio_codec,
+                    audio_sample_rate: None,
+                    audio_channels: None,
+                    audio_bit_rate: None,
+                },
+                None => probe_full(&pstr).await,
+            };
+            Some(LibraryEntry {
+                path: rel.to_string_lossy().to_string(),
+                name: full
+                    .file_name()
+                    .and_then(|x| x.to_str())
+                    .unwrap_or("")
+                    .to_string(),
+                size,
+                duration: info.duration,
+                video_codec: info.video_codec,
+                audio_codec: info.audio_codec,
+                container: info
+                    .container
+                    .or_else(|| if ext.is_empty() { None } else { Some(ext) }),
+                width: info.width,
+                height: info.height,
+                fps: info.fps,
+                video_bit_rate: info.video_bit_rate,
+                pix_fmt: info.pix_fmt,
+                folder: fid,
+                status: "pending".into(),
+                reencoded: None,
+                new_size: None,
+                new_codec: None,
+                error: None,
+            })
+        }));
+    }
+    let mut entries: Vec<LibraryEntry> = Vec::with_capacity(plan.len());
+    for h in handles {
+        if let Ok(Some(e)) = h.await {
+            entries.push(e);
+            SCAN_STATE.lock().unwrap().scanned += 1;
+        }
     }
 
     // Carry-forward (read-only): a rescan must not reset files already
@@ -3957,29 +4079,21 @@ async fn library_scan(State(store): State<Store>, Json(req): Json<ScanReq>) -> R
     // library job still exists for the file — otherwise the entry goes back
     // to "pending" so it can be re-queued.
     let (carried, old, live) = {
-        let s = store.lock().unwrap();
         let scanned_fids: std::collections::HashSet<String> =
             roots.iter().filter_map(|(f, _)| f.clone()).collect();
         let adhoc = roots.iter().any(|(f, _)| f.is_none());
         // Non-destructive catalog: entries of folders that weren't part of
         // this scan stay untouched (as do ad-hoc entries when registered
         // folders are being scanned).
-        let carried = s
-            .list_library()
-            .into_iter()
+        let carried = old_entries
+            .iter()
             .filter(|e| match &e.folder {
                 Some(fid) => !scanned_fids.contains(fid),
                 None => !adhoc,
             })
+            .cloned()
             .collect::<Vec<_>>();
-        let old = s.list_library();
-        let live: std::collections::HashSet<String> = s
-            .list()
-            .into_iter()
-            .filter(|j| j.lib_path.is_some() && !["done", "error"].contains(&j.status.as_str()))
-            .map(|j| j.input_file)
-            .collect();
-        (carried, old, live)
+        (carried, old_entries, live)
     };
     for e in entries.iter_mut() {
         let key = e.key();
@@ -4042,14 +4156,10 @@ async fn library_scan(State(store): State<Store>, Json(req): Json<ScanReq>) -> R
     } else {
         None
     };
-    let mut queued: Vec<String> = Vec::new();
-    let mut skipped: Vec<String> = Vec::new();
     // srcHealth condition support: when ANY applicable graph has the
     // condition, run the decode-based integrity check on EVERY pending
     // entry's source (per-file; each file is checked at the depth its
-    // graph asks for). The scan already ffprobed every file during the
-    // walk, so the entry's own probe result is reused — the decode windows
-    // are the slow part and run with bounded parallelism (2 at a time).
+    // graph asks for).
     let health_depths: Vec<(String, u32)> = {
         let mut graphs: Vec<&WorkflowGraph> = Vec::new();
         if let Some(g) = eff_graph.as_ref() {
@@ -4063,190 +4173,196 @@ async fn library_scan(State(store): State<Store>, Json(req): Json<ScanReq>) -> R
         }
         src_health_depths(&graphs)
     };
-    let mut health: std::collections::HashMap<String, bool> =
-        std::collections::HashMap::new();
-    if !health_depths.is_empty() {
-        let pending: Vec<(String, PathBuf, Option<f64>, bool)> = entries
-            .iter()
-            .filter(|e| e.status == "pending")
-            .filter(|e| {
-                // Disabled folders are index-only — their files never reach
-                // the graph evaluation, so the expensive decode check would
-                // be pure waste. (Unknown folder ids fall through to
-                // checked: they may be ad-hoc / to-be-restored.)
-                e.folder
-                    .as_deref()
-                    .map_or(true, |fid| {
-                        libcfg
-                            .folders
-                            .iter()
-                            .find(|f| f.id == fid)
-                            .map_or(true, |f| f.enabled)
-                    })
-            })
-            .filter_map(|e| {
-                resolve_lib_source(&e.key(), &store)
-                    .map(|p| (e.key(), p, e.duration, e.video_codec.is_some()))
-            })
-            .collect();
-        let sem = std::sync::Arc::new(tokio::sync::Semaphore::new(2));
-        let mut handles = Vec::with_capacity(pending.len());
-        for (key, p, dur, has_video) in pending {
-            let sem = sem.clone();
-            let depths = health_depths.clone();
-            handles.push(tokio::spawn(async move {
-                let _g = sem.acquire_owned().await.expect("sem");
-                let ok = if !has_video || dur.unwrap_or(0.0) <= 0.0 {
-                    false
-                } else {
-                    decode_health_check(
-                        &p.to_string_lossy(),
-                        dur.unwrap_or(0.0),
-                        &depths,
-                    )
-                    .await
-                };
-                (key, ok)
-            }));
-        }
-        for h in handles {
-            if let Ok((key, ok)) = h.await {
-                health.insert(key, ok);
-            }
-        }
-    }
-    for e in entries.iter_mut() {
-        if e.status != "pending" {
+
+    // ---- Streaming gate + health + dispatch -------------------------
+    // Each pending file flows through as its own task:
+    //   (notvideo gate, below) → health decode (bounded, 4 at a time)
+    //   → graph decision → job dispatch
+    // and the job is queued THE MOMENT that file's own check finishes.
+    // The queue therefore fills incrementally while the scan is still
+    // working through later files — instead of every file waiting for the
+    // LAST one to be health-checked before a single bulk dispatch.
+    //
+    // Pass 1 — cheap per-entry gates (no concurrency needed).
+    let mut todo: Vec<usize> = Vec::new();
+    for i in 0..entries.len() {
+        if entries[i].status != "pending" {
             continue;
         }
         // Non-video gate — camera thumbnails (single-frame mjpeg in a .mp4
-        // shell, jpeg_pipe container, no duration) and other non-video files
-        // are catalogued but NEVER queued for processing. MPEG family
-        // containers (mpeg-PS .mpg/.mpeg, .vob, .psv/.evo, raw .m2v)
-        // frequently carry no duration metadata at all — a real video stream
-        // there is still encodable, so the duration check is exempted.
-        let mpeg_family = e
+        // shell, jpeg_pipe container, no duration) and other non-video
+        // files are catalogued but NEVER queued for processing. Containers
+        // that frequently carry no duration metadata are exempt: the MPEG-PS
+        // family (mpeg-PS .mpg/.mpeg, .vob, .psv/.evo, raw .m2v) AND
+        // webm/matroska captures (stream recordings) — a real video stream
+        // there is still encodable; genuinely broken files get caught by
+        // the srcHealth decode (or simply encode as a tiny clip).
+        let no_duration_meta = entries[i]
+            .container
+            .as_deref()
+            .is_some_and(|c| {
+                let c = c.to_ascii_lowercase();
+                c.contains("webm") || c.contains("matroska")
+            });
+        let mpeg_family = entries[i]
             .container
             .as_deref()
             .is_some_and(|c| matches!(c.to_ascii_lowercase().as_str(), "mpeg" | "mpegvideo" | "vcd" | "svcd" | "dvd video"))
-            || e
+            || entries[i]
                 .name
                 .rsplit_once('.')
                 .map(|(_, x)| x.to_ascii_lowercase())
                 .is_some_and(|x| matches!(x.as_str(), "mpg" | "mpeg" | "vob" | "psv" | "evo" | "m2v"));
-        let not_video = if e.video_codec.is_none() {
+        let not_video = if entries[i].video_codec.is_none() {
             Some("no video stream".to_string())
-        } else if e.video_codec.as_deref() == Some("mjpeg") {
+        } else if entries[i].video_codec.as_deref() == Some("mjpeg") {
             Some("still image (mjpeg)".to_string())
-        } else if !mpeg_family && e.duration.map_or(true, |d| d < 1.0) {
+        } else if !mpeg_family && !no_duration_meta && entries[i].duration.map_or(true, |d| d < 1.0) {
             Some("no real duration (<1s)".to_string())
         } else {
             None
         };
         if let Some(reason) = not_video {
-            e.status = "notvideo".into();
-            e.error = Some(format!("비영상 — {reason}"));
+            entries[i].status = "notvideo".into();
+            entries[i].error = Some(format!("비영상 — {reason}"));
             continue;
         }
-        let folder = libcfg
-            .folders
-            .iter()
-            .find(|f| e.folder.as_deref() == Some(f.id.as_str()));
         // Disabled folder = index only: the file shows up in the catalog
         // but is never auto-queued (no graph evaluation, no target). Flip
         // the folder back on and the next scan picks these files up.
-        if folder.is_some_and(|f| !f.enabled) {
+        // (Unknown folder ids fall through to queued: ad-hoc roots.)
+        let disabled = entries[i]
+            .folder
+            .as_deref()
+            .and_then(|fid| libcfg.folders.iter().find(|f| f.id == fid))
+            .is_some_and(|f| !f.enabled);
+        if disabled {
             continue;
         }
-        let folder_target: TargetCfg = folder.map(|f| f.target.clone()).unwrap_or_default();
-        // Graph precedence: 1) the folder's chosen NAMED logic (library-tab
-        // assignment), 2) legacy per-folder inline graph, 3) global library
-        // graph. None of them -> the folder's bulk target below.
-        let logic_graph: Option<&WorkflowGraph> = folder
-            .and_then(|f| f.logic_id.as_deref())
-            .and_then(|lid| libcfg.logics.iter().find(|l| l.id == lid))
-            .map(|l| &l.graph);
-        let folder_graph: Option<&WorkflowGraph> = folder
-            .filter(|f| {
-                f.graph
-                    .nodes
-                    .iter()
-                    .any(|n| n.kind == "condition" || n.kind == "action")
-            })
-            .map(|f| &f.graph);
-        let decision: Option<GraphDecision> = {
-            let g = logic_graph.or(folder_graph).or(eff_graph.as_ref());
-            if let Some(g) = g {
-                // Walk the node graph; first action reached wins, its
-                // output port carries the post-encode plan. No action
-                // reached -> the folder's bulk default below.
-                Some(
-                    eval_graph(g, e, &online, &folder_target, &health)
-                        .unwrap_or_else(|| {
-                            if folder_target.video_codec.is_some() {
-                                GraphDecision::Encode {
-                                    target: folder_target.clone(),
-                                    post: Vec::new(),
-                                    hw_only: false,
-                                }
-                            } else {
-                                GraphDecision::Skip
-                            }
-                        }),
-                )
-            } else if e.folder.is_some() {
-                if folder_target.video_codec.is_some() {
-                    Some(GraphDecision::Encode {
-                        target: folder_target,
-                        post: Vec::new(),
-                        hw_only: false,
-                    })
-                } else {
-                    Some(GraphDecision::Skip)
-                }
+        todo.push(i);
+    }
+    // Pass 2 — one streaming task per surviving file.
+    let online = std::sync::Arc::new(online);
+    let eff_graph = std::sync::Arc::new(eff_graph);
+    let health_depths = std::sync::Arc::new(health_depths);
+    let live = std::sync::Arc::new(live);
+    let health_sem = std::sync::Arc::new(tokio::sync::Semaphore::new(4));
+    let libcfg = std::sync::Arc::new(libcfg);
+    let store_t = store.clone();
+    let mut handles: Vec<tokio::task::JoinHandle<(String, Option<String>)>> = Vec::new();
+    for i in todo {
+        let e = entries[i].clone();
+        let online = online.clone();
+        let eff_graph = eff_graph.clone();
+        let health_depths = health_depths.clone();
+        let live = live.clone();
+        let health_sem = health_sem.clone();
+        let libcfg = libcfg.clone();
+        let store_t = store_t.clone();
+        handles.push(tokio::spawn(async move {
+            let key = e.key();
+            let folder = libcfg
+                .folders
+                .iter()
+                .find(|f| e.folder.as_deref() == Some(f.id.as_str()));
+            let folder_target: TargetCfg =
+                folder.map(|f| f.target.clone()).unwrap_or_default();
+            // srcHealth decode for THIS file's source — the slow part,
+            // bounded to 4 parallel decodes across the whole scan. An
+            // unknown duration is not corruption: decode_health_check
+            // falls back to a short front window.
+            let health = if health_depths.is_empty() {
+                true
             } else {
-                let ac = load_auto();
-                if ac.enabled {
-                    Some(GraphDecision::Encode {
-                        target: ac.into(),
-                        post: Vec::new(),
-                        hw_only: false,
-                    })
+                match resolve_lib_source(&key, &store_t) {
+                    Some(p) => {
+                        let _g = health_sem.acquire_owned().await.expect("health sem");
+                        decode_health_check(&p.to_string_lossy(), e.duration, &health_depths).await
+                    }
+                    None => false,
+                }
+            };
+            let hmap = std::collections::HashMap::from([(key.clone(), health)]);
+            // Graph precedence: 1) the folder's chosen NAMED logic
+            // (library-tab assignment), 2) legacy per-folder inline graph,
+            // 3) global library graph. None of them -> the folder's bulk
+            // default below.
+            let logic_graph: Option<&WorkflowGraph> = folder
+                .and_then(|f| f.logic_id.as_deref())
+                .and_then(|lid| libcfg.logics.iter().find(|l| l.id == lid))
+                .map(|l| &l.graph);
+            let folder_graph: Option<&WorkflowGraph> = folder
+                .filter(|f| {
+                    f.graph
+                        .nodes
+                        .iter()
+                        .any(|n| n.kind == "condition" || n.kind == "action")
+                })
+                .map(|f| &f.graph);
+            let decision: Option<GraphDecision> = {
+                let g = logic_graph
+                    .or(folder_graph)
+                    .or_else(|| eff_graph.as_ref().as_ref());
+                if let Some(g) = g {
+                    // Walk the node graph; first action reached wins, its
+                    // output port carries the post-encode plan. No action
+                    // reached -> the folder's bulk default below.
+                    Some(
+                        eval_graph(g, &e, &online[..], &folder_target, &hmap)
+                            .unwrap_or_else(|| {
+                                if folder_target.video_codec.is_some() {
+                                    GraphDecision::Encode {
+                                        target: folder_target.clone(),
+                                        post: Vec::new(),
+                                        hw_only: false,
+                                    }
+                                } else {
+                                    GraphDecision::Skip
+                                }
+                            }),
+                    )
+                } else if e.folder.is_some() {
+                    if folder_target.video_codec.is_some() {
+                        Some(GraphDecision::Encode {
+                            target: folder_target,
+                            post: Vec::new(),
+                            hw_only: false,
+                        })
+                    } else {
+                        Some(GraphDecision::Skip)
+                    }
                 } else {
-                    None
-                }
-            }
-        };
-        if let Some(dec) = decision {
-            match dec {
-                GraphDecision::Skip => {
-                    e.status = "skipped".into();
-                    // Skip list: remember WHY (shown in the library sheet).
-                    // Skipped entries survive rescans — re-arm with ⟳.
-                    e.error = Some("자동 스킵 — 로직/폴더 설정에 따라 처리하지 않음 (⟳으로 재큐잉)".into());
-                    skipped.push(e.key());
-                }
-                GraphDecision::FailToFolder => {
-                    // Pre-encode failure path (✗ branch of a condition, e.g.
-                    // srcHealth): quarantine the source in the fail folder.
-                    match move_to_fail_folder(&store, e, "source health check failed") {
-                        Ok(fp) => {
-                            e.status = "failed".into();
-                            e.error = Some(format!("quarantined → {}", fp.display()));
-                        }
-                        Err(m) => {
-                            e.status = "error".into();
-                            e.error = Some(m);
-                        }
+                    let ac = load_auto();
+                    if ac.enabled {
+                        Some(GraphDecision::Encode {
+                            target: ac.into(),
+                            post: Vec::new(),
+                            hw_only: false,
+                        })
+                    } else {
+                        None
                     }
                 }
-                GraphDecision::Encode {
+            };
+            let outcome: Option<String> = match decision {
+                None => None,
+                Some(GraphDecision::Skip) => Some("skip".into()),
+                Some(GraphDecision::FailToFolder) => {
+                    // Pre-encode failure path (✗ branch of a condition,
+                    // e.g. srcHealth): quarantine the source.
+                    match move_to_fail_folder(&store_t, &e, "source health check failed") {
+                        Ok(fp) => Some(format!("failed:{}", fp.display())),
+                        Err(m) => Some(format!("error:{}", m)),
+                    }
+                }
+                Some(GraphDecision::Encode {
                     target: t,
                     mut post,
                     hw_only,
-                } => {
-                    // Legacy target flags (folder-row checkboxes / old graphs)
-                    // still mean the same thing when no post nodes are chained.
+                }) => {
+                    // Legacy target flags (folder-row checkboxes / old
+                    // graphs) still mean the same thing when no post nodes
+                    // are chained.
                     if post.is_empty() {
                         if t.verify_output {
                             post.push(PostOp::Verify {
@@ -4259,28 +4375,59 @@ async fn library_scan(State(store): State<Store>, Json(req): Json<ScanReq>) -> R
                             post.push(PostOp::Replace);
                         }
                     }
-                    // Never create a second job for a file that already has a
-                    // live (queued/dispatched/running) one — requeue+scan races
-                    // would otherwise double-encode the same file.
-                    if live.contains(&e.key()) {
-                        e.status = "queued".into();
-                        queued.push(e.key());
-                        continue;
-                    }
-                    match dispatch_lib_job(&store, e, &t, &post, hw_only).await {
-                        Ok(true) => {
-                            e.status = "queued".into();
-                            queued.push(e.key());
-                        }
-                        Ok(false) => {
-                            // stays pending — a later scan retries it
-                        }
-                        Err(msg) => {
-                            e.status = "error".into();
-                            e.error = Some(msg);
+                    // Never create a second job for a file that already has
+                    // a live (queued/dispatched/running) one.
+                    if live.contains(&key) {
+                        Some("queued".into())
+                    } else {
+                        match dispatch_lib_job(&store_t, &e, &t, &post, hw_only).await {
+                            Ok(true) => Some("queued".into()),
+                            Ok(false) => None, // stays pending — a later scan retries it
+                            Err(msg) => Some(format!("error:{}", msg)),
                         }
                     }
                 }
+            };
+            (key, outcome)
+        }));
+    }
+    // Collect outcomes as each file's task finishes (streaming: the queue
+    // is already filling while this loop is still waiting on the tail).
+    let mut queued: Vec<String> = Vec::new();
+    let mut skipped: Vec<String> = Vec::new();
+    for h in handles {
+        if let Ok((key, outcome)) = h.await {
+            let mark = outcome.unwrap_or_default();
+            if let Some(e2) = entries.iter_mut().find(|x| x.key() == key) {
+                match mark.as_str() {
+                    "skip" => {
+                        e2.status = "skipped".into();
+                        // Skip list: remember WHY (shown in the library sheet).
+                        // Skipped entries survive rescans — re-arm with ⟳.
+                        e2.error = Some("자동 스킵 — 로직/폴더 설정에 따라 처리하지 않음 (⟳으로 재큐잉)".into());
+                    }
+                    "queued" => e2.status = "queued".into(),
+                    s if s.starts_with("failed:") => {
+                        e2.status = "failed".into();
+                        e2.error = Some(format!("quarantined → {}", s["failed:".len()..].trim()));
+                    }
+                    s if s.starts_with("error:") => {
+                        e2.status = "error".into();
+                        e2.error = Some(s["error:".len()..].to_string());
+                    }
+                    _ => {}
+                }
+            }
+            match mark.as_str() {
+                "queued" => {
+                    queued.push(key);
+                    SCAN_STATE.lock().unwrap().finished_queued += 1;
+                }
+                "skip" => {
+                    skipped.push(key);
+                    SCAN_STATE.lock().unwrap().finished_skipped += 1;
+                }
+                _ => {}
             }
         }
     }
@@ -5895,13 +6042,12 @@ async fn spawn_mdns(store: &Store, port: u16) {
                     continue;
                 }
                 let scanning = SCAN_STATE.lock().unwrap().active;
-                let busy = {
-                    let s = store.lock().unwrap();
-                    s.list()
-                        .iter()
-                        .any(|j| j.lib_path.is_some() && !["done", "error", "cancelled"].contains(&j.status.as_str()))
-                };
-                if scanning || busy {
+                // No "busy" gate: with probe-reuse (unchanged files cost
+                // nothing) and scan serialization (SCAN_LOCK), rescanning
+                // while jobs run is cheap and safe — and without this, a
+                // long queue would freeze auto-detection of NEW files until
+                // every job finished.
+                if scanning {
                     continue;
                 }
                 let resp = library_scan(

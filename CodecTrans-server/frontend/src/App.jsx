@@ -658,6 +658,28 @@ export default function App() {
     scanTimer.current = setInterval(poll, 800);
     try {
       const l = await api.libraryScan(undefined, undefined, folderId);
+      if (l.alreadyRunning) {
+        // A scan is already running (the POST returned instantly). Keep
+        // polling its live progress until it actually finishes.
+        flashBlock(
+          `스캔이 이미 진행 중 — ${l.progress?.scanned ?? 0}/${l.progress?.total ?? "?"} 완료 대기`
+        );
+        const waitDone = setInterval(async () => {
+          try {
+            const p = await api.scanProgress();
+            setScanProg(p);
+            if (!p.active) {
+              clearInterval(waitDone);
+              stopScanPoll();
+              setScanning(false);
+              setScanFolder("");
+            }
+          } catch (e) {
+            /* best-effort */
+          }
+        }, 1000);
+        return;
+      }
       setLibrary({ root: "", entries: l.entries || [] });
       flashBlock(
         l.queued?.length
