@@ -1,5 +1,10 @@
 version: '3.8'
 
+# QNAP Container Station의 Applications 목록에서 보이는 이름
+# (기본은 compose 파일이 있는 폴더명 — "compose"로 뜨는 원인).
+# Compose spec의 top-level name: 프로젝트 이름 지정.
+name: codec-trans
+
 # CodecTrans (server + node + redis) — QNAP 3050 구성
 # 기존 Tdarr compose 패턴 호환: host 네트워킹 + /share 마운트 + privileged GPU
 #
