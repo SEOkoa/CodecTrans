@@ -372,6 +372,24 @@ export default function App() {
       api.nodes().then(setNodes).catch(() => {});
       api.discoveredNodes().then(setDiscovered).catch(() => {});
       api.library().then(setLibrary).catch(() => {});
+      // Keep the folder list in sync when it changes in ANOTHER window or
+      // session (a deleted folder must disappear from the sheets). Compare
+      // signatures so an in-flight local edit is never clobbered: if local
+      // state already differs from the server, keep local until the POST
+      // lands (then both sides agree).
+      api
+        .foldersGet()
+        .then((f) => {
+          const sig = (x) =>
+            JSON.stringify(
+              x.map((y) => [y.id, y.path, y.enabled, y.logicId, y.target]),
+            );
+          setFolders((cur) => (sig(f) === sig(cur) ? cur : f));
+          setLibSel((cur) =>
+            cur === "all" || f.some((y) => y.id === cur) ? cur : "all",
+          );
+        })
+        .catch(() => {});
       if (tab === "dashboard") api.serverStats().then(setStats).catch(() => {});
       // keep the active job's progress bar live until it's terminal
       const aj = activeJobRef.current;
@@ -597,10 +615,11 @@ export default function App() {
     }
   }
 
-  // Scan all enabled registered folders (read-only); the server auto-queues
-  // newly found videos per the saved automation (logic blocks first, then the
-  // folder default target). With a folderId: scan only that registered
-  // folder (the per-folder 스캔 button).
+  // Scan ALL registered folders (read-only; disabled folders are indexed
+  // but never auto-queued); the server auto-queues newly found videos per
+  // the saved automation (logic blocks first, then the folder default
+  // target). With a folderId: scan only that registered folder (the
+  // per-folder 스캔 button).
   const [scanProg, setScanProg] = useState(null); // live {active, scanned, total, scope}
   const [scanFolder, setScanFolder] = useState(""); // "" = whole-library scan
   const scanTimer = useRef(null);
@@ -779,6 +798,12 @@ export default function App() {
     setFolders(next);
     try {
       await api.foldersPost(next);
+      // The server deletes removed folders' catalog entries with the
+      // folder — refetch so the sheet list drops them immediately.
+      const l = await api.library();
+      setLibrary(l);
+      if (l.root) setLibRoot(l.root);
+      if (!next.some((f) => f.id === libSel)) setLibSel("all");
       flashFolder("폴더 저장됨 ✓");
     } catch (err) {
       flashFolder(err.message);
@@ -2079,16 +2104,27 @@ export default function App() {
           <section className="card lib2">
             <h2>Library</h2>
             <div className="hint">
-              활성 폴더를 <b>read-only</b>로 스캔합니다 — 파일은 절대
-              건드리지 않습니다. 아래 <b>시트</b>에서 라이브러리별로 대상
-              영상을 확인하고, 각 라이브러리의 처리 방식을 바로 조정하세요.
+              등록된 폴더 전체를 <b>read-only</b>로 스캔합니다 — 파일은
+              절대 건드리지 않습니다. <b>비활성 폴더</b>의 영상은 목록에
+              표시되지만 자동 큐에 들어가지 않습니다. 아래 <b>시트</b>에서
+              라이브러리별로 대상 영상을 확인하고, 각 라이브러리의 처리
+              방식을 바로 조정하세요.
             </div>
             <div className="search">
               <button
                 onClick={() => doScan()}
-                disabled={scanning || !folders.some((f) => f.enabled)}
+                disabled={scanning || folders.length === 0}
+                title={
+                  folders.length === 0
+                    ? "등록된 폴더가 없습니다 — 폴더 관리에서 먼저 추가하세요"
+                    : undefined
+                }
               >
-                {scanning ? "Scanning…" : "전체 다시 스캔"}
+                {scanning
+                  ? "Scanning…"
+                  : folders.length === 0
+                  ? "폴더 추가 후 스캔"
+                  : "전체 다시 스캔"}
               </button>
               {scanning && (
                 <span className="scanprog" title={`스캔 범위: ${scanProg?.scope || "…"}`}>
@@ -2568,7 +2604,11 @@ export default function App() {
                   )}
                   <button
                     className="mini"
-                    title="이 폴더만 스캔 — 새 영상은 로직/인코딩 설정대로 큐잉"
+                    title={
+                      f.enabled
+                        ? "이 폴더만 스캔 — 새 영상은 로직/인코딩 설정대로 큐잉"
+                        : "이 폴더만 스캔 — 비활성 폴더라 목록에만 들어가고 큐에는 안 들어감"
+                    }
                     disabled={scanning}
                     onClick={() => doScan(f.id)}
                   >

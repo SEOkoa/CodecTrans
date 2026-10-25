@@ -1963,7 +1963,7 @@ struct ScanState {
     total: usize,
     /// Unix ms when the current/last run started.
     started_at: i64,
-    /// Human scope: "all enabled folders" | "folder: /path" | ad-hoc root.
+    /// Human scope: "all folders" | "folder: /path" | ad-hoc root.
     scope: String,
     /// Result of the last finished run (kept for the UI after it ends).
     finished_queued: usize,
@@ -1993,7 +1993,7 @@ fn scan_scope_label(roots: &[(Option<String>, PathBuf)], libcfg: &LibraryConfig)
             .map(|f| format!("folder: {}", f.path))
             .unwrap_or_else(|| "folder".into());
     }
-    format!("{} enabled folders", roots.len())
+    format!("{} folders", roots.len())
 }
 
 fn save_lib_cfg(c: &LibraryConfig) -> std::io::Result<()> {
@@ -2189,8 +2189,9 @@ async fn logic_delete(State(_store): State<Store>, UrlPath(id): UrlPath<String>)
 }
 
 /// POST /api/library/folders — save the folder list. Catalog entries of
-/// removed folders are KEPT (marked "제거됨" in the UI) so re-adding the
-/// folder restores their done state instead of re-queueing everything.
+/// removed folders are DELETED with the folder (the library list must not
+/// keep showing files of a removed folder); ad-hoc entries (folder == None)
+/// are kept.
 async fn folders_post(State(store): State<Store>, Json(mut b): Json<FoldersBody>) -> Response {
     let _g = LIB_CFG_LOCK.lock().unwrap_or_else(|p| p.into_inner());
     let mut c = load_lib_cfg();
@@ -2210,6 +2211,26 @@ async fn folders_post(State(store): State<Store>, Json(mut b): Json<FoldersBody>
     c.folders = b.folders.clone();
     if let Err(e) = save_lib_cfg(&c) {
         return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": e.to_string() }))).into_response();
+    }
+    // Drop catalog entries that belonged to removed folders.
+    {
+        let mut s = store.lock().unwrap();
+        let kept: Vec<String> = b
+            .folders
+            .iter()
+            .map(|f| f.id.clone())
+            .collect();
+        let before = s.library.len();
+        s.library.retain(|_, e| {
+            e.folder
+                .as_deref()
+                .map(|fid| kept.contains(&fid.to_string()))
+                .unwrap_or(true)
+        });
+        let removed = before - s.library.len();
+        if removed > 0 {
+            eprintln!("[CodecTrans] folders_post: removed {removed} orphaned catalog entries");
+        }
     }
     persist_catalog_locked(&store);
     Json(json!({ "ok": true, "folders": b.folders })).into_response()
@@ -3547,13 +3568,16 @@ fn sub_str_of(p: &std::path::Path) -> String {
 }
 
 /// POST /api/library/scan — {root} for an ad-hoc one-shot folder, or (no
-/// root) all registered+enabled folders. Builds the in-memory catalog by
+/// root) all registered folders (disabled ones are indexed but never
+/// auto-queued). Builds the in-memory catalog by
 /// ffprobing each video (non-destructive: entries of folders not scanned
 /// this time are kept) and auto-queues newly found files per the saved
 /// automation (logic blocks first, then the folder's default target).
 async fn library_scan(State(store): State<Store>, Json(req): Json<ScanReq>) -> Response {
     // Resolve roots: an explicit {root} wins (ad-hoc, no folder id);
-    // then {folderId} (per-folder scan); otherwise all enabled folders.
+    // then {folderId} (per-folder scan); otherwise ALL registered folders
+    // — a manual scan is an explicit action; `enabled` only gates
+    // auto-queueing, never whether a folder can be scanned.
     let libcfg = load_lib_cfg();
     let roots: Vec<(Option<String>, PathBuf)> =
         if let Some(r) = req.root.filter(|r| !r.trim().is_empty()) {
@@ -3590,7 +3614,6 @@ async fn library_scan(State(store): State<Store>, Json(req): Json<ScanReq>) -> R
             libcfg
                 .folders
                 .iter()
-                .filter(|f| f.enabled)
                 .map(|f| (Some(f.id.clone()), PathBuf::from(f.path.clone())))
                 .filter(|(_, p)| p.is_dir())
                 .collect()
@@ -3854,6 +3877,12 @@ async fn library_scan(State(store): State<Store>, Json(req): Json<ScanReq>) -> R
             .folders
             .iter()
             .find(|f| e.folder.as_deref() == Some(f.id.as_str()));
+        // Disabled folder = index only: the file shows up in the catalog
+        // but is never auto-queued (no graph evaluation, no target). Flip
+        // the folder back on and the next scan picks these files up.
+        if folder.is_some_and(|f| !f.enabled) {
+            continue;
+        }
         let folder_target: TargetCfg = folder.map(|f| f.target.clone()).unwrap_or_default();
         // Graph precedence: 1) the folder's chosen NAMED logic (library-tab
         // assignment), 2) legacy per-folder inline graph, 3) global library
