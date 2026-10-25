@@ -1635,6 +1635,34 @@ pub struct LibraryConfig {
     /// picks up our own outputs and re-encodes them.
     #[serde(default)]
     pub tombstone: Vec<String>,
+    /// Failure-quarantine folder (settings tab). Files that fail a source
+    /// health check or a post-encode verify (on_failure = "failFolder") are
+    /// MOVED here as `<failDir>/<library folder name>/<original relative
+    /// path>`, with a `<name>.ctfail.json` sidecar (original path + reason)
+    /// so the dashboard's 보관함 tab can list/restore/delete them.
+    #[serde(default)]
+    pub fail_dir: Option<String>,
+}
+
+/// One quarantined file under `fail_dir` (dashboard 보관함 tab).
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FailItem {
+    /// Relative to fail_dir: "<library>/<rel>" — the API call payload.
+    pub path: String,
+    /// First path segment — the library (registered folder) name.
+    pub library: String,
+    /// File name without the sidecar.
+    pub name: String,
+    pub size: u64,
+    /// File mtime (ms).
+    pub mtime: i64,
+    /// Sidecar: where the file came from (absolute).
+    pub original_path: Option<String>,
+    /// Sidecar: why it was quarantined.
+    pub reason: Option<String>,
+    /// Sidecar: moved timestamp (ms).
+    pub moved_at: Option<i64>,
 }
 
 // ── node-graph workflow (ComfyUI style) ─────────────────────────
@@ -2090,6 +2118,331 @@ fn resolve_lib_source(lp: &str, store: &Store) -> Option<PathBuf> {
     } else {
         None
     }
+}
+
+/// Move a library source into the fail (quarantine) folder:
+/// `<failDir>/<library folder name>/<original relative path>`, plus a
+/// `<name>.ctfail.json` sidecar (original path + reason + timestamp) so the
+/// dashboard 보관함 tab can list / restore / delete it. `fail_dir` unset →
+/// Err (the caller errors the entry with the message).
+fn move_to_fail_folder(store: &Store, e: &LibraryEntry, reason: &str) -> Result<PathBuf, String> {
+    let cfg = load_lib_cfg();
+    let base = cfg
+        .fail_dir
+        .clone()
+        .filter(|p| !p.trim().is_empty())
+        .ok_or_else(|| "실패 보관 폴더가 세팅되어 있지 않습니다 (세팅 탭에서 지정하세요)".to_string())?;
+    let base = PathBuf::from(base);
+    // Library name = the registered folder's own name — the first level
+    // under the fail dir (failDir/라이브러리폴더명/…).
+    let lib_name = match e.folder.as_deref() {
+        Some(fid) => cfg
+            .folders
+            .iter()
+            .find(|f| f.id == fid)
+            .and_then(|f| f.path.rsplit('/').next())
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| "unregistered".into()),
+        None => "unregistered".into(),
+    };
+    let src =
+        resolve_lib_source(&e.key(), store).ok_or_else(|| "원본 파일이 이미 없습니다".to_string())?;
+    let dest = base.join(&lib_name).join(&e.path);
+    if let Some(parent) = dest.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|e| format!("fail folder mkdir: {e}"))?;
+    }
+    // rename (fast, same filesystem) with a copy+delete fallback (cross-device)
+    let moved = std::fs::rename(&src, &dest).is_ok()
+        || {
+            let ok = std::fs::copy(&src, &dest).is_ok() && std::fs::remove_file(&src).is_ok();
+            ok
+        };
+    if !moved {
+        let _ = std::fs::remove_file(&dest);
+        return Err("실패 폴더로 파일을 이동할 수 없습니다".into());
+    }
+    let fname = dest
+        .file_name()
+        .and_then(|x| x.to_str())
+        .unwrap_or("file")
+        .to_string();
+    let sidecar = dest.with_file_name(format!("{fname}.ctfail.json"));
+    let payload = json!({
+        "originalPath": src.to_string_lossy().to_string(),
+        "library": lib_name,
+        "rel": e.path.clone(),
+        "reason": reason,
+        "movedAt": now_ms(),
+    });
+    let _ = std::fs::write(
+        &sidecar,
+        serde_json::to_string_pretty(&payload).unwrap_or_default(),
+    );
+    Ok(dest)
+}
+
+// ── settings (server-level, persisted in library.json) ──────────
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SettingsBody {
+    fail_dir: Option<String>,
+}
+
+/// GET /api/settings — server-level settings (currently: the fail folder).
+async fn settings_get(State(_store): State<Store>) -> impl IntoResponse {
+    Json(json!({ "failDir": load_lib_cfg().fail_dir }))
+}
+
+/// POST /api/settings — currently: the fail (quarantine) folder.
+async fn settings_post(State(_store): State<Store>, Json(b): Json<SettingsBody>) -> Response {
+    let _g = LIB_CFG_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let mut c = load_lib_cfg();
+    c.fail_dir = b
+        .fail_dir
+        .map(|p| p.trim().to_string())
+        .filter(|p| !p.is_empty());
+    match save_lib_cfg(&c) {
+        Ok(_) => Json(json!({ "ok": true, "failDir": c.fail_dir })).into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "error": e.to_string() })),
+        )
+            .into_response(),
+    }
+}
+
+// ── fail quarantine (보관함 tab) ────────────────────────────────
+/// Resolve + confine a user-supplied fail-dir-relative path to inside the
+/// fail folder (canonicalized, no `..` escapes, must be a file).
+fn confined_fail_file(rel: &str) -> Option<(PathBuf, PathBuf)> {
+    let cfg = load_lib_cfg();
+    let root = PathBuf::from(
+        cfg.fail_dir
+            .clone()
+            .filter(|p| !p.trim().is_empty())?,
+    );
+    let canon_root = root.canonicalize().ok()?;
+    let canon = canon_root.join(rel).canonicalize().ok()?;
+    if !canon.starts_with(&canon_root) || canon.is_dir() {
+        return None;
+    }
+    Some((canon_root, canon))
+}
+
+/// GET /api/failures — list everything quarantined under the fail folder
+/// (files that carry a `.ctfail.json` sidecar).
+async fn failures_get(State(_store): State<Store>) -> impl IntoResponse {
+    let cfg = load_lib_cfg();
+    let base = cfg.fail_dir.clone().filter(|p| !p.trim().is_empty());
+    let mut items: Vec<FailItem> = Vec::new();
+    fn walk(dir: &std::path::Path, rel: &std::path::Path, items: &mut Vec<FailItem>) {
+        let rd = match std::fs::read_dir(dir) {
+            Ok(r) => r,
+            Err(_) => return,
+        };
+        for ent in rd.flatten() {
+            let name = ent.file_name().to_string_lossy().to_string();
+            let p = ent.path();
+            if name.ends_with(".ctfail.json") {
+                continue;
+            }
+            let r = rel.join(&name);
+            if p.is_dir() {
+                walk(&p, &r, items);
+            } else if p.with_file_name(format!("{name}.ctfail.json")).is_file() {
+                let meta = p.metadata();
+                let s = std::fs::read_to_string(
+                    p.with_file_name(format!("{name}.ctfail.json")),
+                )
+                .ok()
+                .and_then(|t| serde_json::from_str::<serde_json::Value>(&t).ok());
+                items.push(FailItem {
+                    path: r.to_string_lossy().to_string(),
+                    library: r
+                        .components()
+                        .next()
+                        .map(|c| c.as_os_str().to_string_lossy().to_string())
+                        .unwrap_or_default(),
+                    name: name.clone(),
+                    size: meta.as_ref().map(|m| m.len()).unwrap_or(0),
+                    mtime: meta
+                        .ok()
+                        .and_then(|m| m.modified().ok())
+                        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                        .map(|d| d.as_millis() as i64)
+                        .unwrap_or(0),
+                    original_path: s
+                        .as_ref()
+                        .and_then(|v| v.get("originalPath").and_then(|x| x.as_str()))
+                        .map(|x| x.to_string()),
+                    reason: s
+                        .as_ref()
+                        .and_then(|v| v.get("reason").and_then(|x| x.as_str()))
+                        .map(|x| x.to_string()),
+                    moved_at: s
+                        .as_ref()
+                        .and_then(|v| v.get("movedAt").and_then(|x| x.as_i64())),
+                });
+            }
+        }
+    }
+    if let Some(b) = &base {
+        let root = PathBuf::from(b);
+        if root.is_dir() {
+            walk(&root, std::path::Path::new(""), &mut items);
+        }
+    }
+    items.sort_by(|a, b| a.path.cmp(&b.path));
+    Json(json!({ "failDir": base, "items": items }))
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct FailReq {
+    path: String,
+}
+
+/// POST /api/failures/restore — move the quarantined file back to its
+/// original path (sidecar) and re-arm the matching catalog entry (pending)
+/// so the next scan re-queues it.
+async fn failure_restore(State(store): State<Store>, Json(req): Json<FailReq>) -> Response {
+    let (_root, file) = match confined_fail_file(&req.path) {
+        Some(x) => x,
+        None => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({ "error": "fail folder 안의 파일 경로를 지정하세요" })),
+            )
+                .into_response();
+        }
+    };
+    let sidecar = file.with_file_name(format!(
+        "{}.ctfail.json",
+        file.file_name().and_then(|x| x.to_str()).unwrap_or("file")
+    ));
+    let s: Option<serde_json::Value> = std::fs::read_to_string(&sidecar)
+        .ok()
+        .and_then(|t| serde_json::from_str(&t).ok());
+    let orig = s
+        .as_ref()
+        .and_then(|v| v.get("originalPath").and_then(|x| x.as_str()))
+        .map(PathBuf::from);
+    let orig = match orig {
+        Some(p) if p.is_file() => {
+            return (
+                StatusCode::CONFLICT,
+                Json(json!({ "error": format!("원본 경로에 이미 파일이 있습니다: {}", p.display()) })),
+            )
+                .into_response();
+        }
+        Some(p) => p,
+        None => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({ "error": "원본 경로가 기록된 sidecar가 없습니다" })),
+            )
+                .into_response();
+        }
+    };
+    if let Some(parent) = orig.parent() {
+        if let Err(e) = std::fs::create_dir_all(parent) {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({ "error": format!("원본 폴더 생성 실패: {e}") })),
+            )
+                .into_response();
+        }
+    }
+    let moved = std::fs::rename(&file, &orig).is_ok()
+        || {
+            let ok = std::fs::copy(&file, &orig).is_ok() && std::fs::remove_file(&file).is_ok();
+            ok
+        };
+    if !moved {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "error": "원본 경로로 복원 이동 실패" })),
+        )
+            .into_response();
+    }
+    let _ = std::fs::remove_file(&sidecar);
+    // Re-arm the catalog entry whose source is this path → pending.
+    // (inline the path resolution — resolve_lib_source would re-lock the
+    // store we already hold.)
+    {
+        let mut s = store.lock().unwrap();
+        let cfg = load_lib_cfg();
+        let root = s.storage_root().to_string();
+        let resolve = |key: &str| -> Option<PathBuf> {
+            if let Some((fid, rel)) = key.split_once('/') {
+                if let Some(f) = cfg.folders.iter().find(|f| f.id == fid) {
+                    let p = PathBuf::from(f.path.clone()).join(rel);
+                    if p.is_file() {
+                        return Some(p);
+                    }
+                }
+            }
+            let p = PathBuf::from(&root).join(key);
+            if p.is_file() {
+                Some(p)
+            } else {
+                None
+            }
+        };
+        for e in s.library.values_mut() {
+            if resolve(&e.key()) == Some(orig.clone()) {
+                e.status = "pending".into();
+                e.error = None;
+            }
+        }
+    }
+    persist_catalog(&store);
+    Json(json!({ "ok": true, "originalPath": orig.to_string_lossy().to_string() }))
+        .into_response()
+}
+
+/// POST /api/failures/delete — delete the quarantined file + sidecar.
+/// Catalog entries stay (status "failed") — the 보관함 list is disk-driven.
+async fn failure_delete(State(store): State<Store>, Json(req): Json<FailReq>) -> Response {
+    let (root, file) = match confined_fail_file(&req.path) {
+        Some(x) => x,
+        None => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({ "error": "fail folder 안의 파일 경로를 지정하세요" })),
+            )
+                .into_response();
+        }
+    };
+    let sidecar = file.with_file_name(format!(
+        "{}.ctfail.json",
+        file.file_name().and_then(|x| x.to_str()).unwrap_or("file")
+    ));
+    if std::fs::remove_file(&file).is_err() && std::fs::remove_file(&sidecar).is_err() {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(json!({ "error": "파일을 찾을 수 없습니다" })),
+        )
+            .into_response();
+    }
+    let _ = std::fs::remove_file(&sidecar);
+    // Best-effort: prune the now-empty library dir (never the fail root).
+    let mut up = file.parent().map(|p| p.to_path_buf());
+    while let Some(d) = up {
+        if d == root {
+            break;
+        }
+        if std::fs::read_dir(&d).map(|mut r| r.next().is_none()).unwrap_or(false) {
+            let _ = std::fs::remove_dir(&d);
+            up = d.parent().map(|p| p.to_path_buf());
+        } else {
+            break;
+        }
+    }
+    let _ = store; // (catalog untouched — entries remain as "failed")
+    Json(json!({ "ok": true })).into_response()
 }
 
 /// Concrete HW encoder for `family` on `node` satisfying the `accel`
@@ -2593,11 +2946,23 @@ async fn dispatch_lib_job(
 }
 
 /// Does a block condition match a newly found library entry?
-fn cond_matches(c: &Condition, e: &LibraryEntry, online: &[Node]) -> bool {
+/// `health` maps catalog key → source-file health (ffprobe: video stream +
+/// positive duration). Only consulted by the `srcHealth` condition; the map
+/// is built (awaited, non-blocking) by the caller when a graph uses it.
+fn cond_matches(
+    c: &Condition,
+    e: &LibraryEntry,
+    online: &[Node],
+    health: &std::collections::HashMap<String, bool>,
+) -> bool {
     let size_mb = e.size as f64 / 1_048_576.0;
     let br_mbps = e.video_bit_rate.map(|b| b as f64 / 1_000_000.0);
     match c.kind.as_str() {
         "always" => true,
+        // Source file must probe as playable video. Unchecked/missing →
+        // treated as UNHEALTHY (✗ branch) so a probe hiccup never sends a
+        // possibly corrupt source to the encoder.
+        "srcHealth" => health.get(&e.key()).copied().unwrap_or(false),
         "srcCodec" => e.video_codec.as_deref() == c.codec.as_deref(),
         "sizeGt" => size_mb > c.value.unwrap_or(f64::INFINITY),
         "sizeLt" => size_mb < c.value.unwrap_or(f64::INFINITY),
@@ -2619,12 +2984,34 @@ fn cond_matches(c: &Condition, e: &LibraryEntry, online: &[Node]) -> bool {
     }
 }
 
+/// The verdict for one file after walking its logic graph.
+enum GraphDecision {
+    /// Encode with this target; `post` is the post-encode chain
+    /// (verify → replace → …).
+    Encode { target: TargetCfg, post: Vec<PostOp>, hw_only: bool },
+    /// No action matched (explicit skip, no node online, …) — the caller
+    /// marks the entry skipped or applies the folder bulk default.
+    Skip,
+    /// Pre-encode failure path (e.g. ✗ source-health branch): nothing is
+    /// encoded; the SOURCE is moved to the fail folder (settings).
+    FailToFolder,
+}
+
+/// True when the graph has an enabled `srcHealth` condition — the scan must
+/// then ffprobe the pending entries' sources (awaited) and hand the result
+/// map to `cond_matches`.
+fn g_has_srchealth(g: &WorkflowGraph) -> bool {
+    g.nodes
+        .iter()
+        .any(|n| n.kind == "condition" && n.enabled && n.condition.kind == "srcHealth")
+}
+
 /// Evaluate the node graph for one file: from every `start` node follow the
 /// edges — a condition's ✓ port is taken when the condition matches (a
 /// disabled condition acts as an open gate), ✗ when it doesn't — and the
 /// FIRST `action` node reached wins. The encode action's OUTPUT port is
 /// then walked for the post-encode chain (verify → replace → … → requeue).
-/// Returns (target, do_encode, post_plan, hw_only).
+/// `health` feeds the `srcHealth` condition (source ffprobe result map).
 /// None = the file reached no action (caller falls back to the folder
 /// default).
 fn eval_graph(
@@ -2632,7 +3019,8 @@ fn eval_graph(
     e: &LibraryEntry,
     online: &[Node],
     folder_target: &TargetCfg,
-) -> Option<(TargetCfg, bool, Vec<PostOp>, bool)> {
+    health: &std::collections::HashMap<String, bool>,
+) -> Option<GraphDecision> {
     use std::collections::HashSet;
     if g.nodes.is_empty() {
         return None;
@@ -2711,14 +3099,15 @@ fn eval_graph(
         e: &LibraryEntry,
         online: &[Node],
         folder_target: &TargetCfg,
-    ) -> Option<(TargetCfg, bool, Vec<PostOp>, bool)> {
+        health: &std::collections::HashMap<String, bool>,
+    ) -> Option<GraphDecision> {
         if !visited.insert(i) {
             return None;
         }
         let n = &g.nodes[i];
         let result: bool = match n.kind.as_str() {
             "start" => true,
-            "condition" => !n.enabled || cond_matches(&n.condition, e, online),
+            "condition" => !n.enabled || cond_matches(&n.condition, e, online, health),
             "action" => {
                 if !n.enabled {
                     return None;
@@ -2732,21 +3121,29 @@ fn eval_graph(
                         let hw_only = n.action.hw_only;
                         let mut plan = Vec::new();
                         post_chain(i, g, out, visited, &mut plan);
-                        Some((t, true, plan, hw_only))
+                        Some(GraphDecision::Encode {
+                            target: t,
+                            post: plan,
+                            hw_only,
+                        })
                     }
+                    // "failToFolder" action: pre-encode failure path —
+                    // quarantine the source, encode nothing.
+                    "failToFolder" => Some(GraphDecision::FailToFolder),
                     "healthcheck" => {
-                        if online.iter().any(|n| n.status == "online") {
-                            Some((
-                                folder_target.clone(),
-                                folder_target.video_codec.is_some(),
-                                Vec::new(),
-                                false,
-                            ))
+                        if online.iter().any(|n| n.status == "online")
+                            && folder_target.video_codec.is_some()
+                        {
+                            Some(GraphDecision::Encode {
+                                target: folder_target.clone(),
+                                post: Vec::new(),
+                                hw_only: false,
+                            })
                         } else {
-                            Some((TargetCfg::default(), false, Vec::new(), false))
+                            Some(GraphDecision::Skip)
                         }
                     }
-                    _ => Some((TargetCfg::default(), false, Vec::new(), false)), // skip
+                    _ => Some(GraphDecision::Skip), // skip
                 };
             }
             _ => false,
@@ -2759,7 +3156,7 @@ fn eval_graph(
                 _ => false,
             };
             if taken {
-                if let Some(d) = rec(j, g, out, visited, e, online, folder_target) {
+                if let Some(d) = rec(j, g, out, visited, e, online, folder_target, health) {
                     return Some(d);
                 }
             }
@@ -2769,7 +3166,7 @@ fn eval_graph(
 
     for (i, n) in g.nodes.iter().enumerate() {
         if n.kind == "start" {
-            if let Some(d) = rec(i, g, &out, &mut visited, e, online, folder_target) {
+            if let Some(d) = rec(i, g, &out, &mut visited, e, online, folder_target, health) {
                 return Some(d);
             }
         }
@@ -3177,6 +3574,33 @@ async fn library_scan(State(store): State<Store>, Json(req): Json<ScanReq>) -> R
     };
     let mut queued: Vec<String> = Vec::new();
     let mut skipped: Vec<String> = Vec::new();
+    // srcHealth condition support: when ANY applicable graph has the
+    // condition, ffprobe each pending entry's source now (async, non-blocking)
+    // and remember the verdict — the graph walk itself is sync.
+    let needs_health = eff_graph
+        .as_ref()
+        .map(g_has_srchealth)
+        .unwrap_or(false)
+        || libcfg.logics.iter().any(|l| g_has_srchealth(&l.graph))
+        || libcfg.folders.iter().any(|f| g_has_srchealth(&f.graph));
+    let mut health: std::collections::HashMap<String, bool> =
+        std::collections::HashMap::new();
+    if needs_health {
+        for e in entries.iter() {
+            if e.status != "pending" {
+                continue;
+            }
+            let key = e.key();
+            let ok = match resolve_lib_source(&key, &store) {
+                Some(p) => {
+                    let info = probe_full(&p.to_string_lossy()).await;
+                    info.video_codec.is_some() && info.duration.unwrap_or(0.0) > 0.0
+                }
+                None => false,
+            };
+            health.insert(key, ok);
+        }
+    }
     for e in entries.iter_mut() {
         if e.status != "pending" {
             continue;
@@ -3201,71 +3625,110 @@ async fn library_scan(State(store): State<Store>, Json(req): Json<ScanReq>) -> R
                     .any(|n| n.kind == "condition" || n.kind == "action")
             })
             .map(|f| &f.graph);
-        let decision: Option<(TargetCfg, bool, Vec<PostOp>, bool)> = {
+        let decision: Option<GraphDecision> = {
             let g = logic_graph.or(folder_graph).or(eff_graph.as_ref());
             if let Some(g) = g {
                 // Walk the node graph; first action reached wins, its
-                // output port carries the post-encode plan.
-                eval_graph(g, e, &online, &folder_target).or_else(|| {
-                    Some((
-                        folder_target.clone(),
-                        folder_target.video_codec.is_some(),
-                        Vec::new(),
-                        false,
-                    ))
-                })
+                // output port carries the post-encode plan. No action
+                // reached -> the folder's bulk default below.
+                Some(
+                    eval_graph(g, e, &online, &folder_target, &health)
+                        .unwrap_or_else(|| {
+                            if folder_target.video_codec.is_some() {
+                                GraphDecision::Encode {
+                                    target: folder_target.clone(),
+                                    post: Vec::new(),
+                                    hw_only: false,
+                                }
+                            } else {
+                                GraphDecision::Skip
+                            }
+                        }),
+                )
             } else if e.folder.is_some() {
-                let has_vc = folder_target.video_codec.is_some();
-                Some((folder_target, has_vc, Vec::new(), false))
+                if folder_target.video_codec.is_some() {
+                    Some(GraphDecision::Encode {
+                        target: folder_target,
+                        post: Vec::new(),
+                        hw_only: false,
+                    })
+                } else {
+                    Some(GraphDecision::Skip)
+                }
             } else {
                 let ac = load_auto();
                 if ac.enabled {
-                    Some((ac.into(), true, Vec::new(), false))
+                    Some(GraphDecision::Encode {
+                        target: ac.into(),
+                        post: Vec::new(),
+                        hw_only: false,
+                    })
                 } else {
                     None
                 }
             }
         };
-        if let Some((t, do_encode, mut post, hw_only)) = decision {
-            if do_encode {
-                // Legacy target flags (folder-row checkboxes / old graphs)
-                // still mean the same thing when no post nodes are chained.
-                if post.is_empty() {
-                    if t.verify_output {
-                        post.push(PostOp::Verify {
-                            mode: None,
-                            value: None,
-                            on_failure: None,
-                        });
-                    }
-                    if t.replace_original {
-                        post.push(PostOp::Replace);
+        if let Some(dec) = decision {
+            match dec {
+                GraphDecision::Skip => {
+                    e.status = "skipped".into();
+                    skipped.push(e.key());
+                }
+                GraphDecision::FailToFolder => {
+                    // Pre-encode failure path (✗ branch of a condition, e.g.
+                    // srcHealth): quarantine the source in the fail folder.
+                    match move_to_fail_folder(&store, e, "source health check failed") {
+                        Ok(fp) => {
+                            e.status = "failed".into();
+                            e.error = Some(format!("quarantined → {}", fp.display()));
+                        }
+                        Err(m) => {
+                            e.status = "error".into();
+                            e.error = Some(m);
+                        }
                     }
                 }
-                // Never create a second job for a file that already has a
-                // live (queued/dispatched/running) one — requeue+scan races
-                // would otherwise double-encode the same file.
-                if live.contains(&e.key()) {
-                    e.status = "queued".into();
-                    queued.push(e.key());
-                    continue;
-                }
-                match dispatch_lib_job(&store, e, &t, &post, hw_only).await {
-                    Ok(true) => {
+                GraphDecision::Encode {
+                    target: t,
+                    post: mut post,
+                    hw_only,
+                } => {
+                    // Legacy target flags (folder-row checkboxes / old graphs)
+                    // still mean the same thing when no post nodes are chained.
+                    if post.is_empty() {
+                        if t.verify_output {
+                            post.push(PostOp::Verify {
+                                mode: None,
+                                value: None,
+                                on_failure: None,
+                            });
+                        }
+                        if t.replace_original {
+                            post.push(PostOp::Replace);
+                        }
+                    }
+                    // Never create a second job for a file that already has a
+                    // live (queued/dispatched/running) one — requeue+scan races
+                    // would otherwise double-encode the same file.
+                    if live.contains(&e.key()) {
                         e.status = "queued".into();
                         queued.push(e.key());
+                        continue;
                     }
-                    Ok(false) => {
-                        // stays pending — a later scan retries it
-                    }
-                    Err(msg) => {
-                        e.status = "error".into();
-                        e.error = Some(msg);
+                    match dispatch_lib_job(&store, e, &t, &post, hw_only).await {
+                        Ok(true) => {
+                            e.status = "queued".into();
+                            queued.push(e.key());
+                        }
+                        Ok(false) => {
+                            // stays pending — a later scan retries it
+                        }
+                        Err(msg) => {
+                            e.status = "error".into();
+                            e.error = Some(msg);
+                        }
                     }
                 }
-            } else {
-                e.status = "skipped".into();
-                skipped.push(e.key());
             }
         }
     }
@@ -4231,6 +4694,49 @@ async fn node_result(State(store): State<Store>, UrlPath(id): UrlPath<String>, m
                                     .unwrap_or_else(|| "<none>".into());
                                 eprintln!("[node_result] HEALTHCHECK FAIL {out_name}: video={vdbg} out_dur={odur} src_dur={src_dur:?} job={job_id}");
                                 let _ = std::fs::remove_file(&dest);
+                                if on_failure.as_deref() == Some("failFolder") {
+                                    // Quarantine the SOURCE in the fail
+                                    // folder (settings) instead of
+                                    // erroring/requeueing.
+                                    let entry = store.lock().unwrap().library.get(lp).cloned();
+                                    if let Some(en) = entry {
+                                        match move_to_fail_folder(
+                                            &store,
+                                            &en,
+                                            &format!(
+                                                "output verify failed: video={vdbg} duration={odur}s (source {src_dur:?}s)"
+                                            ),
+                                        ) {
+                                            Ok(fp) => {
+                                                {
+                                                    let mut s = store.lock().unwrap();
+                                                    let msg = format!(
+                                                        "출력 검증 실패 — 실패 보관함으로 이동: {}",
+                                                        fp.display()
+                                                    );
+                                                    s.update_library_entry(lp, |e| {
+                                                        e.status = "failed".into();
+                                                        e.error = Some(msg.clone());
+                                                        e.reencoded = None;
+                                                        e.new_size = None;
+                                                    });
+                                                    if let Some(j) = s.jobs.get_mut(&job_id) {
+                                                        j.status = "error".into();
+                                                        j.error = Some(msg.clone());
+                                                        j.output_size = None;
+                                                    }
+                                                }
+                                                persist_catalog(&store);
+                                                return (
+                                                    StatusCode::INTERNAL_SERVER_ERROR,
+                                                    Json(json!({ "error": "health check failed — quarantined to fail folder" })),
+                                                )
+                                                    .into_response();
+                                            }
+                                            Err(m) => eprintln!("[node_result] failFolder move failed: {m} — plain error"),
+                                        }
+                                    }
+                                }
                                 if on_failure.as_deref() == Some("requeue") {
                                     // Back to the queue — the next scan
                                     // dispatches a fresh attempt.
@@ -4529,6 +5035,11 @@ async fn main() {
             get(folder_blocks_get).post(folder_blocks_post),
         )
         .route("/api/library/requeue", post(library_requeue))
+        // server-level settings + the fail (quarantine) folder 보관함
+        .route("/api/settings", get(settings_get).post(settings_post))
+        .route("/api/failures", get(failures_get))
+        .route("/api/failures/restore", post(failure_restore))
+        .route("/api/failures/delete", post(failure_delete))
         .route("/api/upload", post(upload))
         .route("/api/media/analyze", get(media_analyze))
         .route("/api/transcode", post(transcode))

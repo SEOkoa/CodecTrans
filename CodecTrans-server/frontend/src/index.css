@@ -1757,3 +1757,152 @@ button:disabled {
   background: transparent;
   color: inherit;
 }
+
+/* ═══ v0.9 — fail quarantine + library sheets + sort + settings ═══ */
+/* condition-node ✓/✗ labels: sit OUTSIDE the right edge, next to their
+   sockets — no longer under the header's delete button */
+.glab { right: -26px; }
+
+/* library sheets — per-library tabs on the library card */
+.libsheets {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin: 14px 0 2px;
+}
+.libsheet {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  padding: 6px 13px;
+  border-radius: 999px;
+  border: 1px solid var(--border);
+  background: var(--panel);
+  color: var(--text);
+  font-size: 12.5px;
+  font-weight: 600;
+  cursor: pointer;
+}
+.libsheet:hover { border-color: var(--accent); }
+.libsheet.on {
+  background: rgba(79, 156, 255, 0.14);
+  border-color: var(--accent);
+  color: var(--accent);
+}
+.libsheet .cnt {
+  font-size: 10.5px;
+  font-weight: 700;
+  opacity: 0.8;
+  background: rgba(255, 255, 255, 0.08);
+  padding: 0 6px;
+  border-radius: 8px;
+}
+.libsheet.off { opacity: 0.55; }
+.libsheet .offdot { font-weight: 900; }
+
+/* the selected library's config row (inside the library card) */
+.libconf {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 10px;
+  margin: 12px 0 2px;
+  padding: 10px 12px;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: var(--panel2);
+}
+.libconf label {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12px;
+  color: var(--muted);
+}
+.libconf select { font-size: 12.5px; }
+.libconf .logicpick { font-size: 12px; color: var(--muted); }
+
+/* activate / deactivate buttons (library rows + config row) */
+.enablebtn {
+  padding: 5px 12px;
+  border-radius: 8px;
+  border: 1px solid var(--border);
+  background: var(--panel);
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 700;
+  cursor: pointer;
+  white-space: nowrap;
+}
+.enablebtn:hover { border-color: var(--accent); color: var(--text); }
+.enablebtn.on {
+  background: rgba(63, 185, 80, 0.13);
+  border-color: rgba(63, 185, 80, 0.5);
+  color: var(--ok);
+}
+.enablebtn.mini { padding: 3px 9px; font-size: 11px; }
+
+/* sortable table headers (library + fail 보관함) */
+.libth {
+  cursor: pointer;
+  user-select: none;
+}
+.libth:hover { color: var(--text); }
+
+/* settings tab blocks */
+.setblock { margin-top: 18px; }
+.setblock:first-of-type { margin-top: 8px; }
+.setblock h3 { margin: 0 0 4px; font-size: 14px; color: var(--text); }
+.setblock .hint { margin: 4px 0 0; }
+
+/* fail (quarantine) table columns */
+.failhead { min-width: 940px; }
+.c-flibrary {
+  flex: 0 0 120px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.c-fname {
+  flex: 2 1 26%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.c-fsize { flex: 0 0 auto; min-width: 64px; text-align: right; }
+.c-fmoved { flex: 0 0 auto; min-width: 92px; text-align: right; }
+.c-freason {
+  flex: 1 1 150px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.c-forig {
+  flex: 1 1 170px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.c-fact {
+  flex: 0 0 auto;
+  display: flex;
+  gap: 6px;
+  justify-content: flex-end;
+}
+.librow .c-fact { align-items: center; }
+
+/* "failed" status chip (quarantined) + summary chip */
+.status.failed {
+  color: var(--warn);
+  border-color: rgba(210, 153, 34, 0.5);
+  background: rgba(210, 153, 34, 0.1);
+}
+.ls-item.faild { color: var(--warn); }
+
+/* destructive mini button (보관함 삭제) */
+button.mini.bad { color: var(--bad); }
+button.mini.bad:hover {
+  background: rgba(248, 81, 73, 0.15);
+  border-color: rgba(248, 81, 73, 0.5);
+  color: var(--bad);
+}

@@ -199,6 +199,28 @@ export const api = {
       body: JSON.stringify(body),
     }),
   logicDelete: (id) => jfetch(`/api/logic/${id}`, { method: "DELETE" }),
+  // server-level settings (currently: the fail/quarantine folder)
+  settingsGet: () => jfetch("/api/settings"),
+  settingsPost: (body) =>
+    jfetch("/api/settings", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    }),
+  // fail quarantine (보관함): list / restore / delete
+  failuresGet: () => jfetch("/api/failures"),
+  failureRestore: (path) =>
+    jfetch("/api/failures/restore", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ path }),
+    }),
+  failureDelete: (path) =>
+    jfetch("/api/failures/delete", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ path }),
+    }),
 };
 
 export function fmtSize(bytes) {

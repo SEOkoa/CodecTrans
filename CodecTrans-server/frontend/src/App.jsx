@@ -100,6 +100,8 @@ function nodeTitle(n) {
           return "비트레이트 < " + (c.value ?? "∅") + " Mbps";
         case "nameContains":
           return "이름 '" + (c.pattern || "∅") + "' 포함";
+        case "srcHealth":
+          return "원본 헬스체크";
         case "nodeHasHw": {
           const cls =
             c.accelClass === "gpu" ? "GPU " : c.accelClass === "cpu" ? "iGPU " : "";
@@ -110,6 +112,7 @@ function nodeTitle(n) {
       }
     case "action":
       if (a.kind === "skip") return "건너뛰기";
+      if (a.kind === "failToFolder") return "실패 처리";
       if (a.kind === "healthcheck") return "헬스체크";
       if (a.kind === "verify") {
         const m = a.verifyMode || "all";
@@ -277,8 +280,10 @@ export default function App() {
   const [folders, setFolders] = useState([]);
   const [folderMsg, setFolderMsg] = useState("");
   const [newFolder, setNewFolder] = useState("");
-  // filesystem tree browser (folder picker)
+  // filesystem tree browser (folder picker) — "folder" = library folder add,
+  // "faildir" = the settings tab's fail (quarantine) folder
   const [treeOpen, setTreeOpen] = useState(false);
+  const [treeMode, setTreeMode] = useState("folder");
   const [tree, setTree] = useState(null); // {path, parent, dirs, files}
   const [treePath, setTreePath] = useState("/");
   const [treeJump, setTreeJump] = useState("");
@@ -294,6 +299,15 @@ export default function App() {
   const [logicName, setLogicName] = useState("");
   // node worker-settings modal (dashboard gear)
   const [nodeCfg, setNodeCfg] = useState(null);
+  // server settings (settings tab) + fail quarantine (보관함 tab)
+  const [failDirDraft, setFailDirDraft] = useState(null); // null = not loaded yet
+  const [settingsMsg, setSettingsMsg] = useState("");
+  const [failures, setFailures] = useState({ failDir: null, items: [] });
+  const [failMsg, setFailMsg] = useState("");
+  const [failSort, setFailSort] = useState({ key: "movedAt", dir: -1 });
+  // library tab: per-library sheet selection + table sort
+  const [libSel, setLibSel] = useState("all");
+  const [libSort, setLibSort] = useState({ key: "name", dir: 1 });
 
   // jobs
   const [jobs, setJobs] = useState([]);
@@ -322,6 +336,8 @@ export default function App() {
         if (l.root) setLibRoot(l.root);
       })
       .catch(() => {});
+    api.settingsGet().then((s) => setFailDirDraft(s.failDir ?? "")).catch(() => {});
+    api.failuresGet().then(setFailures).catch(() => {});
     api
       .codecs()
       .then((c) => {
@@ -581,6 +597,56 @@ export default function App() {
     }
   }
 
+  // ── fail quarantine (보관함) + settings ────────────────────
+  const flashFail = (m) => {
+    setFailMsg(m);
+    setTimeout(() => setFailMsg(""), 3500);
+  };
+  async function loadFailures() {
+    try {
+      const d = await api.failuresGet();
+      setFailures({ failDir: d.failDir ?? null, items: d.items || [] });
+    } catch (err) {
+      flashFail(err.message);
+    }
+  }
+  async function saveFailDir() {
+    try {
+      const r = await api.settingsPost({ failDir: failDirDraft || null });
+      setFailDirDraft(r.failDir ?? "");
+      setSettingsMsg("세팅 저장됨 ✓");
+      setTimeout(() => setSettingsMsg(""), 2500);
+      loadFailures();
+    } catch (err) {
+      setSettingsMsg(err.message);
+    }
+  }
+  async function restoreFailure(path) {
+    try {
+      await api.failureRestore(path);
+      flashFail("원본 위치로 복원됨 ✓");
+      await loadFailures();
+      await doScan(); // the re-armed entry gets re-queued by the scan
+    } catch (err) {
+      flashFail(err.message);
+    }
+  }
+  async function deleteFailure(path) {
+    if (!window.confirm("보관된 파일을 삭제할까요? (원본 위치로 돌아가지 않습니다.)")) return;
+    try {
+      await api.failureDelete(path);
+      flashFail("삭제됨");
+      await loadFailures();
+    } catch (err) {
+      flashFail(err.message);
+    }
+  }
+  // refresh the 보관함 list whenever the tab is opened
+  useEffect(() => {
+    if (tab === "failures") loadFailures();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [tab]);
+
   // ── folders (add/remove list + per-folder target) ──────────────
   const uid = () =>
     crypto.randomUUID
@@ -600,6 +666,60 @@ export default function App() {
       setError(err.message);
     }
   }
+
+  // ── library tab: per-library sheets + sortable table ──────────
+  const libName = (f) => (f.path || "").split("/").filter(Boolean).pop() || f.path;
+  const libEntries = (f) => library.entries.filter((e) => e.folder === f.id);
+  const selFolder = libSel === "all" ? null : folders.find((f) => f.id === libSel);
+  const visibleEntries = (() => {
+    // a sheet for a removed folder falls back to "all"
+    const base =
+      libSel === "all" || !selFolder
+        ? library.entries
+        : library.entries.filter((e) => e.folder === libSel);
+    const { key, dir } = libSort;
+    const val = (e) => {
+      switch (key) {
+        case "name":
+          return e.name || "";
+        case "folder":
+          return libSel === "all"
+            ? e.folder
+              ? libName(folders.find((f) => f.id === e.folder) || {})
+              : "(임시)"
+            : "";
+        case "codec":
+          return e.videoCodec || "";
+        case "size":
+          return e.size || 0;
+        case "duration":
+          return e.duration || 0;
+        case "status":
+          return e.status || "";
+        default:
+          return e.name || "";
+      }
+    };
+    return [...base].sort((a, b) => {
+      const va = val(a);
+      const vb = val(b);
+      if (typeof va === "number" && typeof vb === "number") return (va - vb) * dir;
+      return String(va).localeCompare(String(vb), "ko") * dir;
+    });
+  })();
+  const toggleLibSort = (key) =>
+    setLibSort((s) => (s.key === key ? { key, dir: -s.dir } : { key, dir: 1 }));
+  const sortArrow = (key) => (libSort.key === key ? (libSort.dir === 1 ? " ↑" : " ↓") : "");
+  const Th = ({ k, className, children }) => (
+    <span
+      className={`libth ${className || ""}`}
+      onClick={() => toggleLibSort(k)}
+      title="클릭: 오름/내림 정렬"
+    >
+      {children}
+      {sortArrow(k)}
+    </span>
+  );
   const flash = (set) => (m) => {
     set(m);
     setTimeout(() => set(""), 2500);
@@ -618,12 +738,14 @@ export default function App() {
   function addFolder() {
     const p = newFolder.trim();
     if (!p || folders.some((f) => f.path === p)) return;
+    // New libraries start INACTIVE — the user must flip the 활성화 button,
+    // so a half-configured folder never starts auto-queueing videos.
     saveFolders([
       ...folders,
       {
         id: uid(),
         path: p,
-        enabled: true,
+        enabled: false,
         target: {
           videoCodec: "h265",
           audioCodec: "aac",
@@ -634,6 +756,7 @@ export default function App() {
       },
     ]);
     setNewFolder("");
+    flashFolder("추가됨 — 비활성 상태. 설정 후 행의 [활성화] 버튼으로 켜세요");
   }
   // ── filesystem tree browser ────────────────────────────────
   async function loadTree(path) {
@@ -646,7 +769,8 @@ export default function App() {
       setTreeErr(err.message || "불러오기 실패");
     }
   }
-  function openTree() {
+  function openTree(mode = "folder") {
+    setTreeMode(mode);
     setTreeOpen(true);
     setTreeJump("");
     loadTree("/");
@@ -665,12 +789,13 @@ export default function App() {
   function addTreeFolder() {
     const p = treePath;
     if (!p || folders.some((f) => f.path === p)) return;
+    // Same as addFolder: new libraries start inactive.
     saveFolders([
       ...folders,
       {
         id: uid(),
         path: p,
-        enabled: true,
+        enabled: false,
         target: {
           videoCodec: "h265",
           audioCodec: "aac",
@@ -681,6 +806,7 @@ export default function App() {
       },
     ]);
     setTreeOpen(false);
+    flashFolder("추가됨 — 비활성 상태. 설정 후 행의 [활성화] 버튼으로 켜세요");
   }
   const treeCrumbs = (p) => {
     const parts = p.split("/").filter(Boolean);
@@ -1059,6 +1185,7 @@ export default function App() {
           {[
             ["dashboard", "대시보드"],
             ["library", "라이브러리"],
+            ["failures", "실패 보관함"],
             ["logic", "로직"],
             ["settings", "세팅"],
             ["test", "테스트"],
@@ -1726,207 +1853,15 @@ export default function App() {
         </>
       )}
 
-      {/* ═══ 라이브러리 — folder list + per-folder target ═══ */}
+      {/* ═══ 라이브러리 — per-library sheets + integrated layout ═══ */}
       {tab === "library" && (
         <>
-          <section className="card auto">
-            <h2>폴더 관리</h2>
-            <div className="hint">
-              감시할 폴더를 리스트에 추가/제거하고, 폴더별 처리 방식을 정하세요.{" "}
-              <b>로직</b>을 고르면 저장해 둔 로직(노드 그래프)이 적용되고,
-              <b> “없음”</b>이면 아래 <b>기본 인코딩 설정을 일괄 적용</b>합니다.
-              스캔 시 새로 발견된 영상을 자동 큐잉하며, 결과는 원본 옆에
-              저장되고 원본은 건드리지 않습니다.
-            </div>
-            <div className="search">
-              <input
-                value={newFolder}
-                onChange={(e) => setNewFolder(e.target.value)}
-                onKeyDown={(e) => e.key === "Enter" && addFolder()}
-                placeholder="폴더 경로 (예: /mnt/nas/Videos)"
-              />
-              <button onClick={addFolder} disabled={!newFolder.trim()}>
-                추가
-              </button>
-              <button onClick={openTree} title="파일시스템 트리로 폴더 찾기">
-                🔍 폴더 찾아보기
-              </button>
-            </div>
-            {folders.length === 0 && (
-              <div className="empty">
-                등록된 폴더가 없습니다. 위 입력창에 폴더 경로를 넣고 추가하세요.
-              </div>
-            )}
-            {folders.map((f) => {
-              const mode = f.target.mode || "pct";
-              return (
-                <div key={f.id} className={"folder" + (f.enabled ? "" : " off")}>
-                  <div className="row">
-                    <label className="chk" title="활성/비활성">
-                      <input
-                        type="checkbox"
-                        checked={!!f.enabled}
-                        onChange={() => patchFolder(f.id, (x) => ({ ...x, enabled: !x.enabled }))}
-                      />
-                    </label>
-                    <code className="fpath" title={f.path}>
-                      {f.path}
-                    </code>
-                    <button
-                      className="rm-del"
-                      title="폴더 제거"
-                      onClick={() => removeFolder(f.id)}
-                    >
-                      ✕
-                    </button>
-                  </div>
-                  <div className={"frow" + (f.logicId ? " logic-on" : "")}>
-                    <label className="logicpick">
-                      로직
-                      <select
-                        value={f.logicId || ""}
-                        onChange={(e) =>
-                          patchFolder(f.id, (x) => ({
-                            ...x,
-                            logicId: e.target.value || null,
-                          }))
-                        }
-                        title="로직을 쓰면 그 그래프가 우선 — 아무 액션에도 안 맞은 파일만 아래 일괄 설정으로 처리"
-                      >
-                        <option value="">없음 — 아래 설정으로 일괄 적용</option>
-                        {logics.map((l) => (
-                          <option key={l.id} value={l.id}>
-                            {l.name}
-                          </option>
-                        ))}
-                      </select>
-                    </label>
-                    {f.logicId ? (
-                      <div className="logic-note" title="코덱·비트레이트·검증·대치까지 전부 로직 그래프의 인코딩/후처리 노드가 결정합니다">
-                        <span className="logic-badge">
-                          {logics.find((l) => l.id === f.logicId)?.name || "로직"}
-                        </span>
-                        로직이 적용 중 — 처리 방식은 <b>로직 탭</b>의 그래프로만 조정됩니다
-                      </div>
-                    ) : (
-                      <>
-                        <label>
-                          비디오
-                          <select
-                            value={f.target.videoCodec || ""}
-                            onChange={(e) => patchTarget(f.id, { videoCodec: e.target.value || null })}
-                          >
-                            <option value="">코덱 없음 (큐잉 안 함)</option>
-                            {(codecs?.videoCodecs || [])
-                              .filter((c) => c.id !== "copy")
-                              .map((c) => (
-                                <option key={c.id} value={c.id}>
-                                  {c.label}
-                                </option>
-                              ))}
-                          </select>
-                        </label>
-                        <label>
-                          오디오
-                          <select
-                            value={f.target.audioCodec || "aac"}
-                            onChange={(e) => patchTarget(f.id, { audioCodec: e.target.value })}
-                          >
-                            {(codecs?.audioCodecs || []).map((c) => (
-                              <option key={c.id} value={c.id}>
-                                {c.label}
-                              </option>
-                            ))}
-                          </select>
-                        </label>
-                        <label>
-                          컨테이너
-                          <select
-                            value={f.target.container || "mp4"}
-                            onChange={(e) => patchTarget(f.id, { container: e.target.value })}
-                          >
-                            {(codecs?.containers || []).map((c) => (
-                              <option key={c.id} value={c.id}>
-                                {c.label}
-                              </option>
-                            ))}
-                          </select>
-                        </label>
-                        <div className="rateval">
-                          <div className="ratemode">
-                            <button
-                              type="button"
-                              className={`rm-opt ${mode === "crf" ? "on" : ""}`}
-                              onClick={() => patchTarget(f.id, { mode: "crf" })}
-                            >
-                              CRF
-                            </button>
-                            <button
-                              type="button"
-                              className={`rm-opt ${mode !== "crf" ? "on" : ""}`}
-                              onClick={() => patchTarget(f.id, { mode: "pct" })}
-                            >
-                              %
-                            </button>
-                          </div>
-                          <input
-                            type="number"
-                            className="num"
-                            min={mode === "crf" ? 0 : 10}
-                            max={mode === "crf" ? 51 : 100}
-                            value={mode === "crf" ? f.target.crf ?? 23 : f.target.bitratePct ?? 70}
-                            onChange={(e) =>
-                              patchTarget(
-                                f.id,
-                                mode === "crf"
-                                  ? { crf: Number(e.target.value) }
-                                  : { bitratePct: Number(e.target.value) }
-                              )
-                            }
-                          />
-                        </div>
-                        <div className="postenc">
-                          <label
-                            className="postenc-opt"
-                            title="인코딩 완료 후 ffprobe 검증 — 영상 스트림 존재 + 재생시간 확인. 실패하면 출력 삭제 · 에러 표시"
-                          >
-                            <input
-                              type="checkbox"
-                              checked={!!f.target.verifyOutput}
-                              onChange={(e) =>
-                                patchTarget(f.id, { verifyOutput: e.target.checked })
-                              }
-                            />
-                            ✓ 출력 검증
-                          </label>
-                          <label
-                            className="postenc-opt"
-                            title="출력이 원본의 경로를 대체 — 원본은 옆에 .orig으로 백업"
-                          >
-                            <input
-                              type="checkbox"
-                              checked={!!f.target.replaceOriginal}
-                              onChange={(e) =>
-                                patchTarget(f.id, { replaceOriginal: e.target.checked })
-                              }
-                            />
-                            ⟲ 원본 대치
-                          </label>
-                        </div>
-                      </>
-                    )}
-                  </div>
-                </div>
-              );
-            })}
-            {folderMsg && <div className="meta ok-text">{folderMsg}</div>}
-          </section>
-
-          <section className="card lib">
+          <section className="card lib2">
             <h2>Library</h2>
             <div className="hint">
-              활성 폴더 전체를 <b>read-only</b>로 스캔합니다 — 파일은 절대
-              건드리지 않습니다. 새로 발견된 영상은 폴더/로직 설정대로 자동 큐잉됩니다.
+              활성 폴더를 <b>read-only</b>로 스캔합니다 — 파일은 절대
+              건드리지 않습니다. 아래 <b>시트</b>에서 라이브러리별로 대상
+              영상을 확인하고, 각 라이브러리의 처리 방식을 바로 조정하세요.
             </div>
             <div className="search">
               <button
@@ -1936,12 +1871,217 @@ export default function App() {
                 {scanning ? "Scanning…" : "전체 다시 스캔"}
               </button>
             </div>
-            {library.entries.length > 0 && (
+            {/* library sheets — per-library tabs (전체 + each registered folder) */}
+            <div className="libsheets">
+              <button
+                className={`libsheet${libSel === "all" ? " on" : ""}`}
+                onClick={() => setLibSel("all")}
+                title="모든 라이브러리"
+              >
+                전체
+                <span className="cnt">{library.entries.length}</span>
+              </button>
+              {folders.map((f) => (
+                <button
+                  key={f.id}
+                  className={`libsheet${libSel === f.id ? " on" : ""}${f.enabled ? "" : " off"}`}
+                  onClick={() => setLibSel(f.id)}
+                  title={`${f.path}${f.enabled ? "" : " — 비활성"}`}
+                >
+                  {libName(f)}
+                  <span className="cnt">{libEntries(f).length}</span>
+                  {!f.enabled && (
+                    <span className="offdot" title="비활성 — 폴더 관리에서 활성화">
+                      ·
+                    </span>
+                  )}
+                </button>
+              ))}
+            </div>
+            {/* the selected library's config row */}
+            {selFolder && (
+              <div className="libconf">
+                <button
+                  className={`enablebtn${selFolder.enabled ? " on" : ""}`}
+                  onClick={() =>
+                    patchFolder(selFolder.id, (x) => ({
+                      ...x,
+                      enabled: !x.enabled,
+                    }))
+                  }
+                >
+                  {selFolder.enabled ? "⏸ 비활성화" : "▶ 활성화"}
+                </button>
+                <label className="logicpick">
+                  로직
+                  <select
+                    value={selFolder.logicId || ""}
+                    onChange={(e) =>
+                      patchFolder(selFolder.id, (x) => ({
+                        ...x,
+                        logicId: e.target.value || null,
+                      }))
+                    }
+                    title="로직을 쓰면 그 그래프가 우선 — 아무 액션에도 안 맞은 파일만 아래 일괄 설정으로 처리"
+                  >
+                    <option value="">없음 — 아래 설정으로 일괄 적용</option>
+                    {logics.map((l) => (
+                      <option key={l.id} value={l.id}>
+                        {l.name}
+                      </option>
+                    ))}
+                  </select>
+                </label>
+                {selFolder.logicId ? (
+                  <div
+                    className="logic-note"
+                    title="코덱·비트레이트·검증·대치까지 전부 로직 그래프의 인코딩/후처리 노드가 결정합니다"
+                  >
+                    <span className="logic-badge">
+                      {logics.find((l) => l.id === selFolder.logicId)?.name || "로직"}
+                    </span>
+                    로직이 적용 중 — 처리 방식은 <b>로직 탭</b>의 그래프로만 조정됩니다
+                  </div>
+                ) : (
+                  <>
+                    <label>
+                      비디오
+                      <select
+                        value={selFolder.target.videoCodec || ""}
+                        onChange={(e) =>
+                          patchTarget(selFolder.id, {
+                            videoCodec: e.target.value || null,
+                          })
+                        }
+                      >
+                        <option value="">코덱 없음 (큐잉 안 함)</option>
+                        {(codecs?.videoCodecs || [])
+                          .filter((c) => c.id !== "copy")
+                          .map((c) => (
+                            <option key={c.id} value={c.id}>
+                              {c.label}
+                            </option>
+                          ))}
+                      </select>
+                    </label>
+                    <label>
+                      오디오
+                      <select
+                        value={selFolder.target.audioCodec || "aac"}
+                        onChange={(e) =>
+                          patchTarget(selFolder.id, {
+                            audioCodec: e.target.value,
+                          })
+                        }
+                      >
+                        {(codecs?.audioCodecs || []).map((c) => (
+                          <option key={c.id} value={c.id}>
+                            {c.label}
+                          </option>
+                        ))}
+                      </select>
+                    </label>
+                    <label>
+                      컨테이너
+                      <select
+                        value={selFolder.target.container || "mp4"}
+                        onChange={(e) =>
+                          patchTarget(selFolder.id, {
+                            container: e.target.value,
+                          })
+                        }
+                      >
+                        {(codecs?.containers || []).map((c) => (
+                          <option key={c.id} value={c.id}>
+                            {c.label}
+                          </option>
+                        ))}
+                      </select>
+                    </label>
+                    <div className="rateval">
+                      <div className="ratemode">
+                        <button
+                          type="button"
+                          className={`rm-opt ${
+                            (selFolder.target.mode || "pct") === "crf" ? "on" : ""
+                          }`}
+                          onClick={() => patchTarget(selFolder.id, { mode: "crf" })}
+                        >
+                          CRF
+                        </button>
+                        <button
+                          type="button"
+                          className={`rm-opt ${
+                            (selFolder.target.mode || "pct") !== "crf" ? "on" : ""
+                          }`}
+                          onClick={() => patchTarget(selFolder.id, { mode: "pct" })}
+                        >
+                          %
+                        </button>
+                      </div>
+                      <input
+                        type="number"
+                        className="num"
+                        min={(selFolder.target.mode || "pct") === "crf" ? 0 : 10}
+                        max={(selFolder.target.mode || "pct") === "crf" ? 51 : 100}
+                        value={
+                          (selFolder.target.mode || "pct") === "crf"
+                            ? selFolder.target.crf ?? 23
+                            : selFolder.target.bitratePct ?? 70
+                        }
+                        onChange={(e) =>
+                          patchTarget(
+                            selFolder.id,
+                            (selFolder.target.mode || "pct") === "crf"
+                              ? { crf: Number(e.target.value) }
+                              : { bitratePct: Number(e.target.value) }
+                          )
+                        }
+                      />
+                    </div>
+                    <div className="postenc">
+                      <label
+                        className="postenc-opt"
+                        title="인코딩 완료 후 ffprobe 검증 — 영상 스트림 존재 + 재생시간 확인. 실패하면 출력 삭제 · 에러 표시"
+                      >
+                        <input
+                          type="checkbox"
+                          checked={!!selFolder.target.verifyOutput}
+                          onChange={(e) =>
+                            patchTarget(selFolder.id, {
+                              verifyOutput: e.target.checked,
+                            })
+                          }
+                        />
+                        ✓ 출력 검증
+                      </label>
+                      <label
+                        className="postenc-opt"
+                        title="출력이 원본의 경로를 대체 — 원본은 옆에 .orig으로 백업"
+                      >
+                        <input
+                          type="checkbox"
+                          checked={!!selFolder.target.replaceOriginal}
+                          onChange={(e) =>
+                            patchTarget(selFolder.id, {
+                              replaceOriginal: e.target.checked,
+                            })
+                          }
+                        />
+                        ⟲ 원본 대치
+                      </label>
+                    </div>
+                  </>
+                )}
+              </div>
+            )}
+            {visibleEntries.length > 0 && (
               <div className="libsummary">
                 {(() => {
-                  const es = library.entries;
+                  const es = visibleEntries;
                   const done = es.filter((e) => e.status === "done");
                   const err = es.filter((e) => e.status === "error");
+                  const faild = es.filter((e) => e.status === "failed");
                   const act = es.filter((e) => libJob(e));
                   const saved = done.reduce(
                     (a, e) => a + Math.max(0, (e.size || 0) - (e.newSize || 0)),
@@ -1950,16 +2090,35 @@ export default function App() {
                   const shrunk = done.filter((e) => (e.newSize || 0) < (e.size || 0));
                   return (
                     <>
-                      <span className="ls-item"><b>{es.length}</b> 파일</span>
-                      <span className="ls-item ok"><b>{done.length}</b> 완료</span>
+                      <span className="ls-item">
+                        <b>{es.length}</b> 파일
+                      </span>
+                      <span className="ls-item ok">
+                        <b>{done.length}</b> 완료
+                      </span>
                       {act.length > 0 && (
-                        <span className="ls-item run"><b>{act.length}</b> 진행 중</span>
+                        <span className="ls-item run">
+                          <b>{act.length}</b> 진행 중
+                        </span>
                       )}
                       {err.length > 0 && (
-                        <span className="ls-item bad"><b>{err.length}</b> 오류</span>
+                        <span className="ls-item bad">
+                          <b>{err.length}</b> 오류
+                        </span>
+                      )}
+                      {faild.length > 0 && (
+                        <span
+                          className="ls-item faild"
+                          title="실패 보관함으로 이동된 파일 — 실패 보관함 탭에서 복원/삭제"
+                        >
+                          <b>{faild.length}</b> 보관함
+                        </span>
                       )}
                       {saved > 0 && (
-                        <span className="ls-item save" title={`${shrunk.length}개 파일 원본 대비 용량 감소분`}>
+                        <span
+                          className="ls-item save"
+                          title={`${shrunk.length}개 파일 원본 대비 용량 감소분`}
+                        >
                           💾 <b>{fmtSize(saved)}</b> 절약
                         </span>
                       )}
@@ -1968,18 +2127,30 @@ export default function App() {
                 })()}
               </div>
             )}
-            {library.entries.length > 0 ? (
+            {visibleEntries.length > 0 ? (
               <div className="libtable">
                 <div className="libhead row">
-                  <span className="c-name">File</span>
-                  <span className="c-folder">Folder</span>
-                  <span className="c-codec">Codec</span>
+                  <Th k="name" className="c-name">
+                    File
+                  </Th>
+                  <Th k="folder" className="c-folder">
+                    Folder
+                  </Th>
+                  <Th k="codec" className="c-codec">
+                    Codec
+                  </Th>
                   <span className="c-spec">Specs</span>
-                  <span className="c-size">Size</span>
-                  <span className="c-dur">Duration</span>
-                  <span className="c-status">Status</span>
+                  <Th k="size" className="c-size">
+                    Size
+                  </Th>
+                  <Th k="duration" className="c-dur">
+                    Duration
+                  </Th>
+                  <Th k="status" className="c-status">
+                    Status
+                  </Th>
                 </div>
-                {library.entries.map((e) => (
+                {visibleEntries.map((e) => (
                   <div
                     key={(e.folder ? e.folder + "/" : "") + e.path}
                     className="librow row"
@@ -2028,11 +2199,17 @@ export default function App() {
                                 ? "done"
                                 : e.status === "error"
                                 ? "error"
+                                : e.status === "failed"
+                                ? "failed"
                                 : e.status === "queued"
                                 ? "running"
                                 : ""
                             }`}
-                            title={e.status === "error" && e.error ? e.error : undefined}
+                            title={
+                              e.status === "error" || e.status === "failed"
+                                ? e.error
+                                : undefined
+                            }
                           >
                             {e.status}
                           </span>
@@ -2058,9 +2235,70 @@ export default function App() {
               </div>
             ) : (
               <div className="empty">
-                활성 폴더에 영상이 없거나 아직 스캔하지 않았습니다.
+                {folders.some((f) => f.enabled)
+                  ? "선택한 시트에 영상이 없거나 아직 스캔하지 않았습니다."
+                  : "활성화된 폴더가 없습니다 — 아래 폴더 관리에서 추가하고 [활성화]하세요."}
               </div>
             )}
+          </section>
+
+          <section className="card auto">
+            <h2>폴더 관리</h2>
+            <div className="hint">
+              감시할 폴더(라이브러리)를 추가/제거합니다. 새 폴더는 <b>비활성
+              상태로 추가</b>됩니다 — 로직/인코딩 설정(위 시트에서)을 마치고
+              <b> [활성화]</b>를 눌러야 큐잉이 시작됩니다.
+            </div>
+            <div className="search">
+              <input
+                value={newFolder}
+                onChange={(e) => setNewFolder(e.target.value)}
+                onKeyDown={(e) => e.key === "Enter" && addFolder()}
+                placeholder="폴더 경로 (예: /mnt/nas/Videos)"
+              />
+              <button onClick={addFolder} disabled={!newFolder.trim()}>
+                추가
+              </button>
+              <button onClick={openTree} title="파일시스템 트리로 폴더 찾기">
+                🔍 폴더 찾아보기
+              </button>
+            </div>
+            {folders.length === 0 && (
+              <div className="empty">
+                등록된 폴더가 없습니다. 위 입력창에 폴더 경로를 넣고 추가하세요.
+              </div>
+            )}
+            {folders.map((f) => (
+              <div key={f.id} className={"folder" + (f.enabled ? "" : " off")}>
+                <div className="row">
+                  <button
+                    className={`enablebtn mini${f.enabled ? " on" : ""}`}
+                    onClick={() =>
+                      patchFolder(f.id, (x) => ({ ...x, enabled: !x.enabled }))
+                    }
+                    title={f.enabled ? "비활성화 — 큐잉 중지" : "활성화 — 스캔 시 자동 큐잉"}
+                  >
+                    {f.enabled ? "⏸ 비활성화" : "▶ 활성화"}
+                  </button>
+                  <code className="fpath" title={f.path}>
+                    {f.path}
+                  </code>
+                  {f.logicId && (
+                    <span className="logic-badge" title="로직 적용 중">
+                      {logics.find((l) => l.id === f.logicId)?.name || "로직"}
+                    </span>
+                  )}
+                  <button
+                    className="rm-del"
+                    title="폴더 제거"
+                    onClick={() => removeFolder(f.id)}
+                  >
+                    ✕
+                  </button>
+                </div>
+              </div>
+            ))}
+            {folderMsg && <div className="meta ok-text">{folderMsg}</div>}
           </section>
         </>
       )}
@@ -2151,6 +2389,10 @@ export default function App() {
                   이름에 포함
                   <span>예: 4K, raw, .mkv</span>
                 </Pal>
+                <Pal kind="cond" preset={{ kind: "srcHealth" }}>
+                  원본 헬스체크
+                  <span>ffprobe — 재생 가능한지 확인, ✓ 통과 / ✗ 실패 갈림</span>
+                </Pal>
                 <div className="gpal-sec">🖥 노드(서버) 조건</div>
                 <Pal kind="cond" preset={{ kind: "nodeHasHw" }}>
                   HW 가속 지원
@@ -2160,6 +2402,10 @@ export default function App() {
                 <Pal kind="act" preset={{ kind: "encode" }}>
                   인코딩 시작
                   <span>코덱 · CRF 또는 원본 %</span>
+                </Pal>
+                <Pal kind="act" preset={{ kind: "failToFolder" }}>
+                  실패 처리
+                  <span>원본을 실패 보관 폴더로 이동 (세팅 탭 지정)</span>
                 </Pal>
                 <Pal kind="act" preset={{ kind: "healthcheck" }}>
                   헬스체크
@@ -2301,8 +2547,15 @@ export default function App() {
                                 <option value="bitrateGt">원본 비트레이트 &gt;</option>
                                 <option value="bitrateLt">원본 비트레이트 &lt;</option>
                                 <option value="nameContains">이름에 포함</option>
+                                <option value="srcHealth">원본 헬스체크 (ffprobe)</option>
                                 <option value="nodeHasHw">노드가 HW 가속 지원</option>
                               </select>
+                              {n.condition?.kind === "srcHealth" && (
+                                <div className="gsub" title="트랜스코딩 전에 원본 파일을 ffprobe로 검사 — 영상 스트림 존재 + 재생시간 확인">
+                                  ✓ 통과(재생 가능) / ✗ 실패(파손·인코딩 불가)
+                                  <br />✗에 <b>실패 처리</b> 노드를 연결하면 실패 보관 폴더로 이동
+                                </div>
+                              )}
                               {n.condition?.kind === "srcCodec" && (
                                 <select
                                   value={n.condition?.codec || ""}
@@ -2406,6 +2659,7 @@ export default function App() {
                                 <option value="encode">인코딩 시작</option>
                                 <option value="healthcheck">헬스체크 (노드 온라인 시만)</option>
                                 <option value="skip">건너뛰기</option>
+                                <option value="failToFolder">🗄 실패 처리 (보관 폴더로 이동)</option>
                                 <option value="verify">⬇ 출력 검증</option>
                                 <option value="replace">⬇ 원본 대치</option>
                                 <option value="saveHere">⬇ 원본 위치에 저장</option>
@@ -2425,6 +2679,14 @@ export default function App() {
                                   />
                                   ⚡ HW 전용 (비지원 노드에 안 보냄)
                                 </label>
+                              )}
+                              {n.action?.kind === "failToFolder" && (
+                                <div className="phint">
+                                  조건 노드의 <b>✗(실패)</b> 갈래에 연결하세요 —
+                                  이 파일은 인코딩하지 않고 <b>실패 보관 폴더</b>(세팅
+                                  탭에서 지정)로 이동됩니다.{" "}
+                                  <code>보관폴더/라이브러리명/…</code>
+                                </div>
                               )}
                               {n.action?.kind === "verify" && (
                                 <>
@@ -2462,7 +2724,7 @@ export default function App() {
                                     </label>
                                   )}
                                   <label
-                                    title="검증 실패 시: 에러로 표시(기본) 또는 큐로 되돌려 다음 스캔에 재시도"
+                                    title="검증 실패 시: 에러로 표시(기본) · 큐로 되돌려 재시도 · 실패 보관 폴더로 원본 이동"
                                   >
                                     실패 시
                                     <select
@@ -2476,6 +2738,7 @@ export default function App() {
                                     >
                                       <option value="error">에러 표시</option>
                                       <option value="requeue">큐로 되돌리기 (재시도)</option>
+                                      <option value="failFolder">🗄 실패 보관 폴더로 이동</option>
                                     </select>
                                   </label>
                                 </>
@@ -2767,26 +3030,196 @@ export default function App() {
         </>
       )}
 
-      {/* ═══ 세팅 — skeleton for now ═══ */}
+      {/* ═══ 실패 보관함 — quarantined files (failed health checks) ═══ */}
+      {tab === "failures" && (
+        <section className="card">
+          <h2>실패 보관함</h2>
+          <div className="hint">
+            <b>원본 헬스체크</b> 또는 <b>출력 검증</b>을 통과하지 못해{" "}
+            <b>실패 처리</b>된 영상이 보관 폴더로 이동됩니다. 구조:{" "}
+            <code>
+              {failures.failDir ? failures.failDir : "세팅에서 지정"}
+              /라이브러리폴더명/…
+            </code>
+            {!failures.failDir && (
+              <>
+                {" "}
+                — 아직 <b>세팅 탭</b>에서 보관 폴더를 지정하지 않았습니다.
+              </>
+            )}
+          </div>
+          <div className="search">
+            <button onClick={loadFailures}>↻ 새로고침</button>
+            {failMsg && <span className="meta ok-text">{failMsg}</span>}
+          </div>
+          {failures.items.length > 0 ? (
+            <div className="libtable">
+              <div className="libhead row failhead">
+                {[
+                  ["library", "Library"],
+                  ["name", "File"],
+                  ["size", "Size"],
+                  ["movedAt", "Fail date"],
+                  ["reason", "Reason"],
+                  ["originalPath", "Original path"],
+                  ["act", ""],
+                ].map(
+                  ([k, label]) =>
+                    k === "act" ? (
+                      <span key={k} className="c-fact" />
+                    ) : (
+                      <span
+                        key={k}
+                        className={`libth c-f${k}`}
+                        onClick={() =>
+                          setFailSort((s) =>
+                            s.key === k ? { key: k, dir: -s.dir } : { key: k, dir: 1 }
+                          )
+                        }
+                        title="클릭: 오름/내림 정렬"
+                      >
+                        {label}
+                        {failSort.key === k ? (failSort.dir === 1 ? " ↑" : " ↓") : ""}
+                      </span>
+                    )
+                )}
+              </div>
+              {(() => {
+                const items = [...failures.items].sort((a, b) => {
+                  const get = (x) => {
+                    switch (failSort.key) {
+                      case "library":
+                        return x.library || "";
+                      case "name":
+                        return x.name || "";
+                      case "size":
+                        return x.size || 0;
+                      case "movedAt":
+                        return x.movedAt ?? x.mtime ?? 0;
+                      case "reason":
+                        return x.reason || "";
+                      case "originalPath":
+                        return x.originalPath || "";
+                      default:
+                        return 0;
+                    }
+                  };
+                  const va = get(a);
+                  const vb = get(b);
+                  if (typeof va === "number" && typeof vb === "number")
+                    return (va - vb) * failSort.dir;
+                  return String(va).localeCompare(String(vb), "ko") * failSort.dir;
+                });
+                return items.map((it) => (
+                  <div key={it.path} className="librow row">
+                    <span className="c-flibrary jmeta" title={it.library}>
+                      {it.library}
+                    </span>
+                    <span className="c-fname jname" title={it.path}>
+                      {it.name}
+                    </span>
+                    <span className="c-fsize jmeta">{fmtSize(it.size)}</span>
+                    <span className="c-fmoved jmeta" title={String(it.movedAt)}>
+                      {it.movedAt
+                        ? new Date(it.movedAt).toLocaleString("ko-KR", {
+                            month: "2-digit",
+                            day: "2-digit",
+                            hour: "2-digit",
+                            minute: "2-digit",
+                          })
+                        : "—"}
+                    </span>
+                    <span className="c-freason jmeta" title={it.reason || ""}>
+                      {it.reason || "—"}
+                    </span>
+                    <span className="c-forig jmeta" title={it.originalPath || ""}>
+                      {it.originalPath ? shortPath(it.originalPath) : "—"}
+                    </span>
+                    <span className="c-fact">
+                      <button
+                        className="mini"
+                        title="원본 위치로 복원 (스캔 시 다시 큐잉)"
+                        onClick={() => restoreFailure(it.path)}
+                      >
+                        ⤺ 복원
+                      </button>
+                      <button
+                        className="mini bad"
+                        title="삭제 (원본으로 돌아가지 않음)"
+                        onClick={() => deleteFailure(it.path)}
+                      >
+                        ✕ 삭제
+                      </button>
+                    </span>
+                  </div>
+                ));
+              })()}
+            </div>
+          ) : (
+            <div className="empty">
+              {failures.failDir
+                ? "보관된 실패 파일이 없습니다 — 원본이 그대로 있습니다."
+                : "보관 폴더가 지정되지 않았습니다. 세팅 탭에서 지정하세요."}
+            </div>
+          )}
+        </section>
+      )}
+
+      {/* ═══ 세팅 — server settings + fail (quarantine) folder ═══ */}
       {tab === "settings" && (
         <section className="card settings">
           <h2>세팅</h2>
-          <div className="hint">
-            더 많은 설정은 추가 예정입니다. 지금은 서버 정보만 보여드려요.
-          </div>
-          <div className="statgrid">
-            <div className="stat">
-              <div className="stat-top">
-                <span className="stat-label">서비스</span>
-                <span className="stat-val">{health?.service || "—"}</span>
-              </div>
+          <div className="setblock">
+            <h3>실패 처리</h3>
+            <div className="hint">
+              <b>원본 헬스체크</b>(로직의 ✗ 갈래) 또는 <b>출력 검증 실패</b>
+              (실패 시 → 실패 보관 폴더로 이동)에 걸린 영상을 모아둘 폴더를
+              지정하세요. 이동 구조:{" "}
+              <code>{"<보관폴더>/라이브러리폴더명/원본 상대경로"}</code> — 원본
+              위치·이유는 파일 옆 <code>.ctfail.json</code>에 기록되고,{" "}
+              <b>실패 보관함</b> 탭에서 확인/복원/삭제할 수 있습니다.
             </div>
-            <div className="stat">
-              <div className="stat-top">
-                <span className="stat-label">FFmpeg</span>
-                <span className="stat-val">
-                  {health?.ffmpeg ? health.ffmpeg.split(" ").slice(0, 3).join(" ") : "—"}
-                </span>
+            <div className="search">
+              <input
+                value={failDirDraft ?? ""}
+                onChange={(e) => setFailDirDraft(e.target.value)}
+                onKeyDown={(e) => e.key === "Enter" && saveFailDir()}
+                placeholder="실패 보관 폴더 경로 (예: /mnt/nas/Failed)"
+              />
+              <button onClick={() => openTree("faildir")} title="파일시스템 트리로 폴더 찾기">
+                🔍 폴더 찾아보기
+              </button>
+              <button onClick={saveFailDir}>저장</button>
+              {failures.failDir && (
+                <button
+                  onClick={() => {
+                    setFailDirDraft("");
+                    api.settingsPost({ failDir: null }).then(() => loadFailures());
+                  }}
+                  title="보관 폴더 해제"
+                >
+                  해제
+                </button>
+              )}
+            </div>
+            {settingsMsg && <div className="meta ok-text">{settingsMsg}</div>}
+          </div>
+          <div className="setblock">
+            <h3>서버 정보</h3>
+            <div className="statgrid">
+              <div className="stat">
+                <div className="stat-top">
+                  <span className="stat-label">서비스</span>
+                  <span className="stat-val">{health?.service || "—"}</span>
+                </div>
+              </div>
+              <div className="stat">
+                <div className="stat-top">
+                  <span className="stat-label">FFmpeg</span>
+                  <span className="stat-val">
+                    {health?.ffmpeg ? health.ffmpeg.split(" ").slice(0, 3).join(" ") : "—"}
+                  </span>
+                </div>
               </div>
             </div>
           </div>
@@ -2862,12 +3295,26 @@ export default function App() {
               <span className="tm-pick" title={treePath}>
                 {treePath}
               </span>
-              <button
-                onClick={addTreeFolder}
-                disabled={!treePath || folders.some((f) => f.path === treePath)}
-              >
-                + 이 폴더 추가
-              </button>
+              {treeMode === "faildir" ? (
+                <button
+                  onClick={() => {
+                    setFailDirDraft(treePath);
+                    setTreeOpen(false);
+                    setSettingsMsg("");
+                  }}
+                  disabled={!treePath}
+                  title="실패 보관 폴더로 선택 (세팅 탭의 저장 버튼으로 확정)"
+                >
+                  🗄 이 폴더를 실패 보관 폴더로 선택
+                </button>
+              ) : (
+                <button
+                  onClick={addTreeFolder}
+                  disabled={!treePath || folders.some((f) => f.path === treePath)}
+                >
+                  + 이 폴더 추가
+                </button>
+              )}
             </div>
           </div>
         </div>
