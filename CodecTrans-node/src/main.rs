@@ -1093,6 +1093,28 @@ async fn probe_duration(path: &str) -> f64 {
     out
 }
 
+/// True when ffmpeg's stderr points at a HW-DECODE device-init failure
+/// (not an encode-side or content error) — worth retrying with CPU decode.
+fn hw_decode_failure(err: &Option<String>) -> bool {
+    let Some(e) = err else {
+        return false;
+    };
+    let l = e.to_lowercase();
+    [
+        "failed to initialize hw device",
+        "hwaccel method",
+        "failed to open codec on device",
+        "cuinit failed",
+        "cuinit return",
+        "cuvid",
+        "failed to load pix_fmt",
+        "no hwaccel",
+        "cannot use hwaccel",
+    ]
+    .iter()
+    .any(|p| l.contains(p))
+}
+
 /// av1_nvenc on Blackwell (driver 595.x) only accepts 4:2:0 input. If the
 /// source is 4:4:4/4:2:2/RGB, ffmpeg negotiates YUV444P and the encoder is
 /// rejected with "YUV444P not supported" -> "No capable devices found".
@@ -1312,121 +1334,206 @@ async fn run_job(client: reqwest::Client, state: NState, server: String, node_id
         let caps = state.lock().unwrap().caps.clone();
         pin_device(&job, &eff, &caps)
     };
-    let mut args: Vec<String> = vec![
-        "-hide_banner".into(),
-        "-nostdin".into(),
-        "-i".into(),
-        in_path.to_string_lossy().to_string(),
-    ];
+    // The encoder's render-node device (if pinned) — reused for the
+    // hwaccel device flags below.
+    let pin_dev: Option<String> = pin_args
+        .windows(2)
+        .find(|w| w[0] == "-vaapi_device" || w[0] == "-qsv_device")
+        .map(|w| w[1].clone());
     // av1_nvenc guard: force NV12 for 4:4:4/4:2:2/RGB sources (see fn docs).
     let guard = nvenc_av1_fmt_guard(&eff, &in_path.to_string_lossy()).await;
-    args.extend(guard);
-    // VA-API encoders need an explicit hwupload: ffmpeg's auto_scale can't
-    // convert sw frames to the VA-API hw format on this build (ENOSYS) — and
-    // hwupload in turn needs a device reference, so pin -vaapi_device too.
-    if eff.ends_with("_vaapi") {
-        args.push("-vf".into());
-        args.push("format=nv12,hwupload".into());
-        if pin_args.is_empty() {
-            if let Some(dev) = pick_vaapi_device() {
-                args.push("-vaapi_device".into());
-                args.push(dev);
+    // Decode path: when the encoder is HW-accelerated, decode on the SAME
+    // GPU too — the pixels never touch the CPU (nvenc: zero-copy CUDA
+    // frames, videotoolbox/qsv/vaapi: hw frames straight into the encoder).
+    let hw_decode: bool = eff.ends_with("_nvenc")
+        || eff.ends_with("_vaapi")
+        || eff.ends_with("_qsv")
+        || eff.ends_with("_vt")
+        || eff.contains("videotoolbox");
+    let mut build_args = |hw: bool| -> Vec<String> {
+        let mut args: Vec<String> = vec!["-hide_banner".into(), "-nostdin".into()];
+        if hw {
+            if eff.ends_with("_nvenc") {
+                args.extend([
+                    "-hwaccel".into(),
+                    "cuda".into(),
+                    "-hwaccel_output_format".into(),
+                    "cuda".into(),
+                ]);
+            } else if eff.ends_with("_vaapi") {
+                args.extend(["-hwaccel".into(), "vaapi".into()]);
+                if let Some(d) = pin_dev.clone().or_else(pick_vaapi_device) {
+                    args.extend(["-hwaccel_device".into(), d]);
+                }
+                args.extend(["-hwaccel_output_format".into(), "vaapi".into()]);
+            } else if eff.ends_with("_qsv") {
+                args.extend(["-hwaccel".into(), "qsv".into()]);
+                if let Some(d) = &pin_dev {
+                    args.extend(["-hwaccel_qsv_device".into(), d.clone()]);
+                }
+                args.extend(["-hwaccel_output_format".into(), "qsv".into()]);
+            } else if eff.ends_with("_vt") || eff.contains("videotoolbox") {
+                args.extend(["-hwaccel".into(), "videotoolbox".into()]);
             }
         }
-    }
-    args.extend(pin_args);
-    args.push("-c:v".into());
-    args.push(eff.clone());
-    if let Some(kbps) = job.video_bitrate {
-        // Capped VBR ("% of source" mode): -b:v sets the target and
-        // -maxrate/-bufsize hard-cap the output, so a misconfigured
-        // percentage can't bloat the file past its target.
-        args.push("-b:v".into());
-        args.push(format!("{kbps}k"));
-        args.push("-maxrate".into());
-        args.push(format!("{}k", (kbps as u64) * 120 / 100)); // 1.2x target
-        args.push("-bufsize".into());
-        args.push(format!("{}k", (kbps as u64) * 2)); // 2x target
-    } else {
-        let crf_eligible = ["libx264", "libx265", "libvpx-vp9", "libvpx", "libsvtav1", "libaom-av1"].contains(&eff.as_str());
-        if crf_eligible {
-            if let Some(crf) = job.crf {
-                args.push("-crf".into());
-                args.push(crf.to_string());
+        args.extend(["-i".into(), in_path.to_string_lossy().to_string()]);
+        args.extend(guard.iter().cloned());
+        if eff.ends_with("_vaapi") && !hw {
+            // CPU-decode fallback: ffmpeg's auto_scale can't convert sw
+            // frames to the VA-API hw format on this build (ENOSYS) — and
+            // hwupload in turn needs a device reference, so pin
+            // -vaapi_device too.
+            args.push("-vf".into());
+            args.push("format=nv12,hwupload".into());
+            if pin_args.is_empty() {
+                if let Some(dev) = pick_vaapi_device() {
+                    args.push("-vaapi_device".into());
+                    args.push(dev);
+                }
             }
         }
-    }
-    // Per-encoder preset — each family accepts different names. libsvtav1
-    // takes ints (0..=13), NVENC takes p1..p7, x264/x265/vpx take
-    // "veryfast". Others (vaapi/amf/...) don't share a common preset, so
-    // we leave them at their default.
-    let preset: Option<&str> = if eff == "libsvtav1" {
-        Some("4")
-    } else if eff.ends_with("_nvenc") {
-        Some("p5")
-    } else if eff == "libx264" || eff == "libx265" || eff == "libvpx" || eff == "libvpx-vp9" {
-        Some("veryfast")
-    } else {
-        None
+        args.extend(pin_args.iter().cloned());
+        args.push("-c:v".into());
+        args.push(eff.clone());
+        if let Some(kbps) = job.video_bitrate {
+            // Capped VBR ("% of source" mode): -b:v sets the target and
+            // -maxrate/-bufsize hard-cap the output, so a misconfigured
+            // percentage can't bloat the file past its target.
+            args.push("-b:v".into());
+            args.push(format!("{kbps}k"));
+            args.push("-maxrate".into());
+            args.push(format!("{}k", (kbps as u64) * 120 / 100)); // 1.2x target
+            args.push("-bufsize".into());
+            args.push(format!("{}k", (kbps as u64) * 2)); // 2x target
+        } else {
+            let crf_eligible = ["libx264", "libx265", "libvpx-vp9", "libvpx", "libsvtav1", "libaom-av1"].contains(&eff.as_str());
+            if crf_eligible {
+                if let Some(crf) = job.crf {
+                    args.push("-crf".into());
+                    args.push(crf.to_string());
+                }
+            }
+        }
+        // Per-encoder preset — each family accepts different names. libsvtav1
+        // takes ints (0..=13), NVENC takes p1..p7, x264/x265/vpx take
+        // "veryfast". Others (vaapi/amf/...) don't share a common preset, so
+        // we leave them at their default.
+        let preset: Option<&str> = if eff == "libsvtav1" {
+            Some("4")
+        } else if eff.ends_with("_nvenc") {
+            Some("p5")
+        } else if eff == "libx264" || eff == "libx265" || eff == "libvpx" || eff == "libvpx-vp9" {
+            Some("veryfast")
+        } else {
+            None
+        };
+        if let Some(p) = preset {
+            args.push("-preset".into());
+            args.push(p.into());
+        }
+        args.push("-c:a".into());
+        // The built-in `opus` encoder is flagged experimental in this ffmpeg
+        // build (fails without -strict -2); libopus is the stable one.
+        let acodec = if job.audio_codec == "opus" { "libopus" } else { job.audio_codec.as_str() };
+        args.push(acodec.to_string());
+        if job.audio_codec == "aac" {
+            args.push("-b:a".into());
+            args.push("128k".into());
+        }
+        if job.container == "webm" {
+            args.push("-f".into());
+            args.push("webm".into());
+        }
+        args.push("-y".into());
+        args.push(out_path.to_string_lossy().to_string());
+        args
     };
-    if let Some(p) = preset {
-        args.push("-preset".into());
-        args.push(p.into());
-    }
-    args.push("-c:a".into());
-    // The built-in `opus` encoder is flagged experimental in this ffmpeg
-    // build (fails without -strict -2); libopus is the stable one.
-    let acodec = if job.audio_codec == "opus" { "libopus" } else { job.audio_codec.as_str() };
-    args.push(acodec.to_string());
-    if job.audio_codec == "aac" {
-        args.push("-b:a".into());
-        args.push("128k".into());
-    }
-    if job.container == "webm" {
-        args.push("-f".into());
-        args.push("webm".into());
-    }
-    args.push("-y".into());
-    args.push(out_path.to_string_lossy().to_string());
+    let hw_args = build_args(true);
+    let sw_args = build_args(false);
 
     let total = probe_duration(&in_path.to_string_lossy()).await;
 
-    let mut child = match Command::new("ffmpeg").args(&args).envs(pin_env.into_iter()).stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::piped()).spawn() {
-        Ok(c) => c,
-        Err(e) => {
-            let msg = format!("spawn ffmpeg failed: {e}");
-            let _ = client.post(format!("{}/api/nodes/{}/report", server, node_id))
-                .json(&json!({"jobId": job.id, "status": "error", "error": msg})).send().await;
-            let mut st = state.lock().unwrap();
-            update_job(&mut st, &job.id, |j| { j.status = "error".into(); j.error = Some(msg); j.finished_at = Some(now_ms()); });
-            return;
-        }
-    };
-
-    // 3. read stderr, update progress.
-    // ffmpeg writes progress with '\r' (same-line overwrite), not '\n'.
-    // Line-based reading lumps every update into one line at the end ->
-    // progress stuck at 0. Read in chunks, split on both '\r' and '\n'.
+    // 3. run — attempt 0: the HW pipeline (when applicable). If it dies on
+    // a hwaccel/decode DEVICE-init failure (a quirky input the GPU decoder
+    // rejects), attempt 1 retries with CPU decode — same HW encoder, so the
+    // output is identical.
     use tokio::io::AsyncReadExt;
+    let mut ok = false;
     let mut last_err: Option<String> = None;
-    if let Some(mut s) = child.stderr.take() {
-        let mut buf = [0u8; 8192];
-        let mut pending = String::new();
-        let mut last_report = 0.0f64;
-        loop {
-            let n = match s.read(&mut buf).await {
-                Ok(0) => break,
-                Ok(n) => n,
-                Err(_) => break,
-            };
-            pending.push_str(&String::from_utf8_lossy(&buf[..n]));
-            while let Some(pos) = pending.find(|c| c == '\r' || c == '\n') {
-                let seg = pending[..pos].to_string();
-                pending = pending[pos + 1..].to_string();
-                if seg.is_empty() {
-                    continue;
+    for attempt in 0..2u32 {
+        let use_hw = hw_decode && attempt == 0;
+        let args = if use_hw { hw_args.clone() } else { sw_args.clone() };
+        if attempt == 1 {
+            eprintln!(
+                "[node] {} — HW decode path failed ({}), retrying with CPU decode",
+                job.id,
+                last_err.clone().unwrap_or_default()
+            );
+            let mut st = state.lock().unwrap();
+            update_job(&mut st, &job.id, |j| j.progress = 0.0);
+        }
+        let mut child = match Command::new("ffmpeg").args(&args).envs(pin_env.clone().into_iter()).stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::piped()).spawn() {
+            Ok(c) => c,
+            Err(e) => {
+                let msg = format!("spawn ffmpeg failed: {e}");
+                let _ = client.post(format!("{}/api/nodes/{}/report", server, node_id))
+                    .json(&json!({"jobId": job.id, "status": "error", "error": msg})).send().await;
+                let mut st = state.lock().unwrap();
+                update_job(&mut st, &job.id, |j| { j.status = "error".into(); j.error = Some(msg); j.finished_at = Some(now_ms()); });
+                return;
+            }
+        };
+        // read stderr, update progress.
+        // ffmpeg writes progress with '\r' (same-line overwrite), not '\n'.
+        // Line-based reading lumps every update into one line at the end ->
+        // progress stuck at 0. Read in chunks, split on both '\r' and '\n'.
+        if let Some(mut s) = child.stderr.take() {
+            let mut buf = [0u8; 8192];
+            let mut pending = String::new();
+            let mut last_report = 0.0f64;
+            loop {
+                let n = match s.read(&mut buf).await {
+                    Ok(0) => break,
+                    Ok(n) => n,
+                    Err(_) => break,
+                };
+                pending.push_str(&String::from_utf8_lossy(&buf[..n]));
+                while let Some(pos) = pending.find(|c| c == '\r' || c == '\n') {
+                    let seg = pending[..pos].to_string();
+                    pending = pending[pos + 1..].to_string();
+                    if seg.is_empty() {
+                        continue;
+                    }
+                    if let Some(t) = parse_time(&seg) {
+                        let prog = if total > 0.0 {
+                            (t / total).clamp(0.0, 0.999)
+                        } else {
+                            0.0
+                        };
+                        {
+                            let mut st = state.lock().unwrap();
+                            update_job(&mut st, &job.id, |j| j.progress = prog);
+                        } // lock dropped before any await
+                        if (prog - last_report) >= 0.05 {
+                            last_report = prog;
+                            let _ = client
+                                .post(format!("{}/api/nodes/{}/report", server, node_id))
+                                .json(&json!({"jobId": job.id, "status": "running", "progress": prog}))
+                                .send()
+                                .await;
+                        }
+                    }
+                    if seg.contains("Error")
+                        || seg.contains("Invalid")
+                        || seg.contains("does not contain any stream")
+                    {
+                        last_err = Some(seg.trim().to_string());
+                    }
                 }
-                if let Some(t) = parse_time(&seg) {
+            }
+            // flush trailing segment
+            if !pending.is_empty() {
+                if let Some(t) = parse_time(&pending) {
                     let prog = if total > 0.0 {
                         (t / total).clamp(0.0, 0.999)
                     } else {
@@ -1435,46 +1542,24 @@ async fn run_job(client: reqwest::Client, state: NState, server: String, node_id
                     {
                         let mut st = state.lock().unwrap();
                         update_job(&mut st, &job.id, |j| j.progress = prog);
-                    } // lock dropped before any await
-                    if (prog - last_report) >= 0.05 {
-                        last_report = prog;
-                        let _ = client
-                            .post(format!("{}/api/nodes/{}/report", server, node_id))
-                            .json(&json!({"jobId": job.id, "status": "running", "progress": prog}))
-                            .send()
-                            .await;
                     }
                 }
-                if seg.contains("Error")
-                    || seg.contains("Invalid")
-                    || seg.contains("does not contain any stream")
+                if pending.contains("Error")
+                    || pending.contains("Invalid")
+                    || pending.contains("does not contain any stream")
                 {
-                    last_err = Some(seg.trim().to_string());
+                    last_err = Some(pending.trim().to_string());
                 }
             }
         }
-        // flush trailing segment
-        if !pending.is_empty() {
-            if let Some(t) = parse_time(&pending) {
-                let prog = if total > 0.0 {
-                    (t / total).clamp(0.0, 0.999)
-                } else {
-                    0.0
-                };
-                {
-                    let mut st = state.lock().unwrap();
-                    update_job(&mut st, &job.id, |j| j.progress = prog);
-                }
-            }
-            if pending.contains("Error")
-                || pending.contains("Invalid")
-                || pending.contains("does not contain any stream")
-            {
-                last_err = Some(pending.trim().to_string());
-            }
+        ok = child.wait().await.map(|s| s.success()).unwrap_or(false);
+        if ok {
+            break;
+        }
+        if !(use_hw && hw_decode_failure(&last_err)) {
+            break;
         }
     }
-    let ok = child.wait().await.map(|s| s.success()).unwrap_or(false);
 
     // Wait for the output file's size to stabilize before reading it:
     // some hosts report a lagging on-disk size right after ffmpeg closes

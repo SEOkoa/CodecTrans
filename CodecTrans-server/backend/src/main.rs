@@ -1557,6 +1557,17 @@ pub struct Condition {
     /// on an iGPU path (qsv/vaapi)".
     #[serde(default)]
     pub accel_class: Option<String>,
+    /// "srcHealth": check depth — "front" (default: decode the first
+    /// `health_value`% of the duration) | "random" (front window PLUS one
+    /// random-position window, each `health_value`% of the duration) |
+    /// "all" (decode the entire file). Every file is checked; the mode
+    /// controls how deep into each file.
+    #[serde(default)]
+    pub health_mode: Option<String>,
+    /// "srcHealth": window size, % of duration, for "front"/"random"
+    /// (default 10, clamped 1..=100).
+    #[serde(default)]
+    pub health_value: Option<u32>,
 }
 
 /// Block action — what to do with matching files.
@@ -1769,6 +1780,112 @@ fn verify_selected(key: &str, mode: Option<&str>, value: Option<u32>) -> bool {
         }
         _ => true, // "all" / unset
     }
+}
+
+/// Every enabled `srcHealth` condition's (mode, pct) across the given
+/// graphs. Mode defaults to "front", pct to 10 (clamped 1..=100). An empty
+/// result means no graph health-checks sources.
+fn src_health_depths(graphs: &[&WorkflowGraph]) -> Vec<(String, u32)> {
+    let mut out = Vec::new();
+    for g in graphs {
+        for n in g.nodes.iter().filter(|n| n.kind == "condition" && n.enabled) {
+            if n.condition.kind == "srcHealth" {
+                let m = n
+                    .condition
+                    .health_mode
+                    .clone()
+                    .unwrap_or_else(|| "front".into());
+                out.push((m, n.condition.health_value.unwrap_or(10).clamp(1, 100)));
+            }
+        }
+    }
+    out
+}
+
+/// Decode-based source integrity check for ONE file (per-file, every file
+/// is checked — `depths` only controls how deep). Builds the decode
+/// windows: "all" short-circuits to a full-file decode (it subsumes any
+/// window), "front" decodes the first pct%, "random" decodes the front
+/// pct% PLUS one random-position pct% window (the front is always part of
+/// the random check). Healthy = every window decodes without ffmpeg errors.
+async fn decode_health_check(path: &str, duration: f64, depths: &[(String, u32)]) -> bool {
+    if duration <= 0.0 {
+        return false;
+    }
+    let mut windows: Vec<(f64, f64)> = Vec::new(); // (seek, len)
+    for (m, pct) in depths {
+        let win = duration * ((*pct as f64) / 100.0);
+        match m.as_str() {
+            "all" => {
+                windows = vec![(0.0, duration)];
+                break;
+            }
+            "random" => {
+                windows.push((0.0, win));
+                if duration > 2.0 * win {
+                    // Random window inside the remainder — re-seeded per
+                    // scan, so different spots get spot-checked over time.
+                    let span = (duration - 2.0 * win) as u64;
+                    let now = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_nanos() as u64)
+                        .unwrap_or(0);
+                    let start = (fnv1a(path) ^ now) % span;
+                    windows.push((start as f64 + win, win));
+                } else if duration > win {
+                    // Too short for front + separate window — one tail
+                    // window covers the rest of the file.
+                    windows.push((duration - win, win));
+                }
+            }
+            _ => windows.push((0.0, win)), // "front"
+        }
+    }
+    if windows.is_empty() {
+        return true;
+    }
+    // Merge overlapping windows (several nodes may request the same span).
+    windows.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+    let mut merged: Vec<(f64, f64)> = Vec::new();
+    for (s, l) in windows {
+        if let Some(last) = merged.last_mut() {
+            if s <= last.0 + last.1 {
+                last.1 = (last.0 + last.1).max(s + l) - last.0;
+                continue;
+            }
+        }
+        merged.push((s, l));
+    }
+    for (seek, len) in merged {
+        // Full-file decodes get a long leash; window decodes are short.
+        let timeout_s = if len >= duration - 0.5 { 3600 } else { 600 };
+        if !decode_window_ok(path, seek, len, timeout_s).await {
+            return false;
+        }
+    }
+    true
+}
+
+/// Decode the [seek, seek+len] window to null. Healthy = clean exit AND no
+/// error output — `-v error` makes ffmpeg print only real errors.
+async fn decode_window_ok(path: &str, seek: f64, len: f64, timeout_s: u64) -> bool {
+    let mut cmd = tokio::process::Command::new("ffmpeg");
+    cmd.arg("-v").arg("error").arg("-nostdin").arg("-threads").arg("4");
+    if seek > 0.0 {
+        cmd.arg("-ss").arg(format!("{seek:.3}"));
+    }
+    cmd.arg("-i").arg(path);
+    cmd.arg("-t").arg(format!("{len:.3}"));
+    cmd.args(["-f", "null", "-"]);
+    cmd.stdout(std::process::Stdio::piped());
+    cmd.stderr(std::process::Stdio::piped());
+    let fut = cmd.output();
+    let Ok(Ok(o)) = tokio::time::timeout(std::time::Duration::from_secs(timeout_s), fut).await
+    else {
+        return false; // spawn failure or timeout -> fail
+    };
+    let err = String::from_utf8_lossy(&o.stderr);
+    o.status.success() && err.trim().is_empty()
 }
 
 /// Legacy `blocks` → linear graph: start → c1 →a1; c1(false) → c2 →a2; …
@@ -2997,15 +3114,6 @@ enum GraphDecision {
     FailToFolder,
 }
 
-/// True when the graph has an enabled `srcHealth` condition — the scan must
-/// then ffprobe the pending entries' sources (awaited) and hand the result
-/// map to `cond_matches`.
-fn g_has_srchealth(g: &WorkflowGraph) -> bool {
-    g.nodes
-        .iter()
-        .any(|n| n.kind == "condition" && n.enabled && n.condition.kind == "srcHealth")
-}
-
 /// Evaluate the node graph for one file: from every `start` node follow the
 /// edges — a condition's ✓ port is taken when the condition matches (a
 /// disabled condition acts as an open gate), ✗ when it doesn't — and the
@@ -3575,30 +3683,59 @@ async fn library_scan(State(store): State<Store>, Json(req): Json<ScanReq>) -> R
     let mut queued: Vec<String> = Vec::new();
     let mut skipped: Vec<String> = Vec::new();
     // srcHealth condition support: when ANY applicable graph has the
-    // condition, ffprobe each pending entry's source now (async, non-blocking)
-    // and remember the verdict — the graph walk itself is sync.
-    let needs_health = eff_graph
-        .as_ref()
-        .map(g_has_srchealth)
-        .unwrap_or(false)
-        || libcfg.logics.iter().any(|l| g_has_srchealth(&l.graph))
-        || libcfg.folders.iter().any(|f| g_has_srchealth(&f.graph));
+    // condition, run the decode-based integrity check on EVERY pending
+    // entry's source (per-file; each file is checked at the depth its
+    // graph asks for). The scan already ffprobed every file during the
+    // walk, so the entry's own probe result is reused — the decode windows
+    // are the slow part and run with bounded parallelism (2 at a time).
+    let health_depths: Vec<(String, u32)> = {
+        let mut graphs: Vec<&WorkflowGraph> = Vec::new();
+        if let Some(g) = eff_graph.as_ref() {
+            graphs.push(g);
+        }
+        for l in &libcfg.logics {
+            graphs.push(&l.graph);
+        }
+        for f in &libcfg.folders {
+            graphs.push(&f.graph);
+        }
+        src_health_depths(&graphs)
+    };
     let mut health: std::collections::HashMap<String, bool> =
         std::collections::HashMap::new();
-    if needs_health {
-        for e in entries.iter() {
-            if e.status != "pending" {
-                continue;
+    if !health_depths.is_empty() {
+        let pending: Vec<(String, PathBuf, Option<f64>, bool)> = entries
+            .iter()
+            .filter(|e| e.status == "pending")
+            .filter_map(|e| {
+                resolve_lib_source(&e.key(), &store)
+                    .map(|p| (e.key(), p, e.duration, e.video_codec.is_some()))
+            })
+            .collect();
+        let sem = std::sync::Arc::new(tokio::sync::Semaphore::new(2));
+        let mut handles = Vec::with_capacity(pending.len());
+        for (key, p, dur, has_video) in pending {
+            let sem = sem.clone();
+            let depths = health_depths.clone();
+            handles.push(tokio::spawn(async move {
+                let _g = sem.acquire_owned().await.expect("sem");
+                let ok = if !has_video || dur.unwrap_or(0.0) <= 0.0 {
+                    false
+                } else {
+                    decode_health_check(
+                        &p.to_string_lossy(),
+                        dur.unwrap_or(0.0),
+                        &depths,
+                    )
+                    .await
+                };
+                (key, ok)
+            }));
+        }
+        for h in handles {
+            if let Ok((key, ok)) = h.await {
+                health.insert(key, ok);
             }
-            let key = e.key();
-            let ok = match resolve_lib_source(&key, &store) {
-                Some(p) => {
-                    let info = probe_full(&p.to_string_lossy()).await;
-                    info.video_codec.is_some() && info.duration.unwrap_or(0.0) > 0.0
-                }
-                None => false,
-            };
-            health.insert(key, ok);
         }
     }
     for e in entries.iter_mut() {
@@ -3690,7 +3827,7 @@ async fn library_scan(State(store): State<Store>, Json(req): Json<ScanReq>) -> R
                 }
                 GraphDecision::Encode {
                     target: t,
-                    post: mut post,
+                    mut post,
                     hw_only,
                 } => {
                     // Legacy target flags (folder-row checkboxes / old graphs)

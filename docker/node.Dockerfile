@@ -75,14 +75,31 @@ RUN set -x; \
         fi; \
         rm -rf /tmp/ex-$v /tmp/*.deb; \
     done; \
+    # ── 545 (system fallback for the noble runtime base — noble's repos \
+    #    don't ship the 545 series; the .so files go straight to the \
+    #    runtime's default linker path) ── \
+    mkdir -p /opt/nvidia-545; \
+    cd /tmp; \
+    for p in libnvidia-compute-545 libnvidia-encode-545 nvidia-utils-545; do \
+        apt-get download $p >/dev/null 2>&1 || true; \
+    done; \
+    for d in *.deb; do dpkg -x "$d" /tmp/ex-545 >/dev/null 2>&1 || true; done; \
+    for f in libcuda.so* libnvidia-encode.so* libnvidia-ml.so* libnvidia-cfg.so*; do \
+        cp -a /tmp/ex-545/usr/lib/x86_64-linux-gnu/$f /opt/nvidia-545/ 2>/dev/null || true; \
+    done; \
+    echo "545 fallback extracted:"; ls -la /opt/nvidia-545/ 2>/dev/null | head -20; \
+    rm -rf /tmp/ex-545 /tmp/*.deb; \
     rm -rf /var/lib/apt/lists/*
 
-# Runtime: Ubuntu 22.04 + ffmpeg 4.4 (h264/hevc NVENC — everything the
-# RTX 30-series can do; AV1 NVENC doesn't exist on Ampere anyway) +
-# the 545 driver userland as the SYSTEM fallback (works with host drivers
-# >= 545). The /opt/nvidia-userland series (575/535/525) cover NEWER and
-# OLDER host drivers — the node picks the matching one at startup (see
-# above) and fetches anything missing from the repos at runtime.
+# Runtime: Ubuntu 24.04 + ffmpeg 6.1 (h264/hevc/AV1 NVENC — av1_nvenc needs
+# ffmpeg >= 5.1, so the 22.04/ffmpeg-4.4 base could never do it; 6.1 also
+# gives proper -hwaccel cuda cuvid->nvenc zero-copy pipelines) + the 545
+# driver userland as the SYSTEM fallback (works with host drivers >= 545;
+# noble's repos don't ship the 545 series, so the .so files are extracted
+# from the jammy packages in the nvidia-userland stage below). The
+# /opt/nvidia-userland series (575/535/525) cover NEWER and OLDER host
+# drivers — the node picks the matching one at startup (see above) and
+# fetches anything missing from the repos at runtime.
 #
 #   - GPU-self-contained: plain /dev/nvidia* device passthrough (QNAP's
 #     privileged+devices pattern) is enough — no nvidia docker runtime
@@ -91,12 +108,16 @@ RUN set -x; \
 #
 # The node does NOT need access to the media itself — it streams sources
 # from the server and uploads results.
-FROM ubuntu:22.04
+FROM ubuntu:24.04
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
         ffmpeg ca-certificates curl \
-        libnvidia-encode-545 libnvidia-compute-545 nvidia-utils-545 \
     && rm -rf /var/lib/apt/lists/*
+# 545-series userland as the default-path fallback (see comment above).
+COPY --from=nvidia-userland /opt/nvidia-545 /usr/lib/nvidia-545
+RUN for f in /usr/lib/nvidia-545/lib*.so*; do \
+        ln -sf "/usr/lib/nvidia-545/$(basename "$f")" "/usr/lib/x86_64-linux-gnu/$(basename "$f")"; \
+    done
 COPY --from=nvidia-userland /opt/nvidia-userland /opt/nvidia-userland
 WORKDIR /opt/ct
 COPY --from=build /src/target/release/CodecTransNode /opt/ct/CodecTransNode

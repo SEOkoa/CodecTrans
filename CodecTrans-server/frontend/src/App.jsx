@@ -100,8 +100,13 @@ function nodeTitle(n) {
           return "비트레이트 < " + (c.value ?? "∅") + " Mbps";
         case "nameContains":
           return "이름 '" + (c.pattern || "∅") + "' 포함";
-        case "srcHealth":
-          return "원본 헬스체크";
+        case "srcHealth": {
+          const m = c.healthMode || "front";
+          if (m === "all") return "헬스체크 · 전체";
+          if (m === "random")
+            return `헬스체크 · 무작위 ${c.healthValue ?? 10}% (앞+랜덤)`;
+          return `헬스체크 · 앞부분 ${c.healthValue ?? 10}%`;
+        }
         case "nodeHasHw": {
           const cls =
             c.accelClass === "gpu" ? "GPU " : c.accelClass === "cpu" ? "iGPU " : "";
@@ -993,6 +998,8 @@ export default function App() {
         condition:
           preset.kind === "nodeHasHw"
             ? { kind: "nodeHasHw", hwFamily: "av1" }
+            : preset.kind === "srcHealth"
+            ? { kind: "srcHealth", healthMode: "front", healthValue: 10 }
             : { kind: preset.kind || "always" },
       };
     else if (kind === "act")
@@ -1540,11 +1547,34 @@ export default function App() {
                   <span className={`status ${j.status}`}>{STATUS_LABEL[j.status] || j.status}</span>
                   {j.accelerated && <span className="accel" title={`HW: ${j.effectiveVideoCodec}`}>⚡</span>}
                   <span className="jname">{j.outputFile || j.inputFile}</span>
+                  {j.libPath && (
+                    <span
+                      className="chip c-av1"
+                      title={`라이브러리 자동화: ${j.libPath}`}
+                    >
+                      📚 자동화
+                    </span>
+                  )}
                   <span className="jmeta">
                     {j.executedBy} · {j.effectiveVideoCodec} → {j.container}
                     {j.outputSize != null ? ` · ${fmtSize(j.outputSize)}` : ""}
                   </span>
                 </div>
+                {(j.status === "running" || j.status === "dispatched") && (
+                  <div className="row" style={{ marginTop: 4, gap: 6 }}>
+                    <div className="bar" style={{ flex: 1, height: 6 }}>
+                      <div
+                        className="fill"
+                        style={{
+                          width: `${Math.round((j.progress || 0) * 100)}%`,
+                        }}
+                      />
+                    </div>
+                    <span className="prog-pct">
+                      {Math.round((j.progress || 0) * 100)}%
+                    </span>
+                  </div>
+                )}
                 {j.status === "done" && (
                   <a className="dl" href={api.downloadUrl(j.outputFile)} download>
                     ⬇ download
@@ -1749,6 +1779,46 @@ export default function App() {
                   ⚙
                 </button>
               </div>
+              {(() => {
+                const live = jobs.filter(
+                  (j) =>
+                    j.nodeId === n.id &&
+                    (j.status === "running" || j.status === "dispatched")
+                );
+                if (live.length === 0) return null;
+                return (
+                  <div className="nodejobs">
+                    {live.map((j) => {
+                      const pct = Math.round((j.progress || 0) * 100);
+                      return (
+                        <div key={j.id} className="nodejob">
+                          <div className="row" style={{ gap: 6 }}>
+                            <span
+                              className="jmeta"
+                              title={j.libPath || j.inputFile}
+                            >
+                              {j.libPath ? "📚 " : ""}
+                              {(j.inputFile || "").split("/").pop() ||
+                                j.id.slice(0, 8)}
+                            </span>
+                            <span className="jmeta">
+                              {j.effectiveVideoCodec || j.videoCodec} →{" "}
+                              {j.container}
+                            </span>
+                            <span className="prog-pct">{pct}%</span>
+                          </div>
+                          <div className="bar" style={{ height: 5 }}>
+                            <div
+                              className="fill"
+                              style={{ width: pct + "%" }}
+                            />
+                          </div>
+                        </div>
+                      );
+                    })}
+                  </div>
+                );
+              })()}
               <AccelPanel accels={n.accels} flat={n.hwEncoders} />
               {sp.length > 0 && <div className="nodestats">{sp.join("  ·  ")}</div>}
             </div>
@@ -1777,6 +1847,63 @@ export default function App() {
           </>
         )}
       </section>
+
+      {/* running + queued jobs — manual test AND library automation,
+          each with its own live progress */}
+      {(() => {
+        const liveJobs = jobs.filter((j) =>
+          ["queued", "dispatched", "running"].includes(j.status)
+        );
+        if (liveJobs.length === 0) return null;
+        return (
+          <section className="card nodes">
+            <h2>Jobs — 진행/대기 ({liveJobs.length})</h2>
+            <div className="hint">
+              지금 도는 작업 전부 — 테스트 탭 수동 잡과 라이브러리 자동화
+              잡이 함께 보이고, 각 잡마다 진행도가 추적됩니다.
+            </div>
+            {liveJobs.map((j) => {
+              const pct = Math.round((j.progress || 0) * 100);
+              const live =
+                j.status === "running" || j.status === "dispatched";
+              return (
+                <div key={j.id} className="nodejob" style={{ marginBottom: 8 }}>
+                  <div
+                    className="row"
+                    style={{ gap: 6, alignItems: "center" }}
+                  >
+                    <span className={`status ${j.status}`}>
+                      {STATUS_LABEL[j.status] || j.status}
+                    </span>
+                    <span
+                      className="jname"
+                      title={j.libPath || j.inputFile}
+                    >
+                      {j.libPath ? "📚 " : ""}
+                      {(j.inputFile || j.outputFile || "")
+                        .split("/")
+                        .pop() || j.id.slice(0, 8)}
+                    </span>
+                    <span className="jmeta">
+                      {j.executedBy || "—"} · {j.effectiveVideoCodec || j.videoCodec} →{" "}
+                      {j.container}
+                    </span>
+                    {live && <span className="prog-pct">{pct}%</span>}
+                  </div>
+                  {live && (
+                    <div className="bar" style={{ height: 5 }}>
+                      <div
+                        className="fill"
+                        style={{ width: pct + "%" }}
+                      />
+                    </div>
+                  )}
+                </div>
+              );
+            })}
+          </section>
+        );
+      })()}
 
       {/* node worker-settings modal (gear) */}
       {nodeCfg && (
@@ -2390,8 +2517,8 @@ export default function App() {
                   <span>예: 4K, raw, .mkv</span>
                 </Pal>
                 <Pal kind="cond" preset={{ kind: "srcHealth" }}>
-                  원본 헬스체크
-                  <span>ffprobe — 재생 가능한지 확인, ✓ 통과 / ✗ 실패 갈림</span>
+                  헬스체크
+                  <span>프레임 디코드 — 전체 / 앞부분 / 무작위(앞+랜덤), ✓ 통과 / ✗ 실패</span>
                 </Pal>
                 <div className="gpal-sec">🖥 노드(서버) 조건</div>
                 <Pal kind="cond" preset={{ kind: "nodeHasHw" }}>
@@ -2407,10 +2534,6 @@ export default function App() {
                   실패 처리
                   <span>원본을 실패 보관 폴더로 이동 (세팅 탭 지정)</span>
                 </Pal>
-                <Pal kind="act" preset={{ kind: "healthcheck" }}>
-                  헬스체크
-                  <span>노드 온라인 시만</span>
-                </Pal>
                 <Pal kind="act" preset={{ kind: "skip" }}>
                   건너뛰기
                   <span>인코딩하지 않음</span>
@@ -2418,7 +2541,7 @@ export default function App() {
                 <div className="gpal-sec">⬇ 인코딩 이후 (인코딩 출력 포트에 연결)</div>
                 <Pal kind="act" preset={{ kind: "verify" }}>
                   출력 검증
-                  <span>ffprobe 헬스체크 — 전체 / N% / N에 1 샘플</span>
+                  <span>출력 파일 ffprobe — 전체 / N% / N에 1 샘플</span>
                 </Pal>
                 <Pal kind="act" preset={{ kind: "replace" }}>
                   원본 대치
@@ -2547,14 +2670,54 @@ export default function App() {
                                 <option value="bitrateGt">원본 비트레이트 &gt;</option>
                                 <option value="bitrateLt">원본 비트레이트 &lt;</option>
                                 <option value="nameContains">이름에 포함</option>
-                                <option value="srcHealth">원본 헬스체크 (ffprobe)</option>
+                                <option value="srcHealth">헬스체크 (프레임 디코드)</option>
                                 <option value="nodeHasHw">노드가 HW 가속 지원</option>
                               </select>
                               {n.condition?.kind === "srcHealth" && (
-                                <div className="gsub" title="트랜스코딩 전에 원본 파일을 ffprobe로 검사 — 영상 스트림 존재 + 재생시간 확인">
-                                  ✓ 통과(재생 가능) / ✗ 실패(파손·인코딩 불가)
-                                  <br />✗에 <b>실패 처리</b> 노드를 연결하면 실패 보관 폴더로 이동
-                                </div>
+                                <>
+                                  <label>
+                                    검사 깊이
+                                    <select
+                                      value={n.condition?.healthMode || "front"}
+                                      onChange={(e) =>
+                                        patchCond(n.id, {
+                                          healthMode: e.target.value,
+                                        })
+                                      }
+                                    >
+                                      <option value="front">앞부분 (N% 프레임)</option>
+                                      <option value="random">
+                                        무작위 (앞부분 + 랜덤위치, 각 N%)
+                                      </option>
+                                      <option value="all">전체 (파일 전체 디코드)</option>
+                                    </select>
+                                  </label>
+                                  {(n.condition?.healthMode || "front") !== "all" && (
+                                    <label>
+                                      N
+                                      <input
+                                        type="number"
+                                        className="num"
+                                        min={1}
+                                        max={100}
+                                        value={n.condition?.healthValue ?? 10}
+                                        onChange={(e) =>
+                                          patchCond(n.id, {
+                                            healthValue: Number(e.target.value),
+                                          })
+                                        }
+                                      />
+                                      %
+                                    </label>
+                                  )}
+                                  <div
+                                    className="gsub"
+                                    title="각 파일을 ffmpeg 디코드로 검사 — 지정한 범위 어디든 디코딩 오류가 있으면 실패. 모든 파일 검사 (샘플링 없음)"
+                                  >
+                                    ✓ 통과 / ✗ 실패 — ✗에 <b>실패 처리</b> 노드를
+                                    연결하면 실패 보관 폴더로 이동
+                                  </div>
+                                </>
                               )}
                               {n.condition?.kind === "srcCodec" && (
                                 <select
@@ -2657,7 +2820,6 @@ export default function App() {
                                 onChange={(e) => patchAct(n.id, { kind: e.target.value })}
                               >
                                 <option value="encode">인코딩 시작</option>
-                                <option value="healthcheck">헬스체크 (노드 온라인 시만)</option>
                                 <option value="skip">건너뛰기</option>
                                 <option value="failToFolder">🗄 실패 처리 (보관 폴더로 이동)</option>
                                 <option value="verify">⬇ 출력 검증</option>
@@ -3035,7 +3197,7 @@ export default function App() {
         <section className="card">
           <h2>실패 보관함</h2>
           <div className="hint">
-            <b>원본 헬스체크</b> 또는 <b>출력 검증</b>을 통과하지 못해{" "}
+            <b>헬스체크</b> 또는 <b>출력 검증</b>을 통과하지 못해{" "}
             <b>실패 처리</b>된 영상이 보관 폴더로 이동됩니다. 구조:{" "}
             <code>
               {failures.failDir ? failures.failDir : "세팅에서 지정"}
@@ -3172,7 +3334,7 @@ export default function App() {
           <div className="setblock">
             <h3>실패 처리</h3>
             <div className="hint">
-              <b>원본 헬스체크</b>(로직의 ✗ 갈래) 또는 <b>출력 검증 실패</b>
+              <b>헬스체크</b>(로직의 ✗ 갈래) 또는 <b>출력 검증 실패</b>
               (실패 시 → 실패 보관 폴더로 이동)에 걸린 영상을 모아둘 폴더를
               지정하세요. 이동 구조:{" "}
               <code>{"<보관폴더>/라이브러리폴더명/원본 상대경로"}</code> — 원본

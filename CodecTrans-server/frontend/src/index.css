@@ -1906,3 +1906,27 @@ button.mini.bad:hover {
   border-color: rgba(248, 81, 73, 0.5);
   color: var(--bad);
 }
+
+/* ── dashboard: per-node live jobs + running-jobs card ── */
+.nodejobs {
+  margin: 6px 0 2px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.nodejob .bar {
+  margin-top: 4px;
+}
+.nodejob .row {
+  margin: 0;
+}
+.nodejob .jmeta {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  max-width: 340px;
+}
+.nodejob .prog-pct {
+  min-width: 34px;
+  text-align: right;
+}
