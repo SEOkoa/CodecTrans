@@ -569,6 +569,8 @@ code {
 .libtable .libhead > *,
 .libtable .librow > * {
   min-width: 0; /* let grid tracks own the sizing — no cell may blow out */
+  margin-left: 0; /* the flex-era .jmeta auto-margin right-shifted cells
+                     inside their tracks, breaking vertical alignment */
 }
 .c-name {
   flex: 2 1 40%;
