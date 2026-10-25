@@ -626,7 +626,7 @@ export default function App() {
     poll();
     scanTimer.current = setInterval(poll, 800);
     try {
-      const l = await api.libraryScan(folderId || undefined);
+      const l = await api.libraryScan(undefined, undefined, folderId);
       setLibrary({ root: "", entries: l.entries || [] });
       flashBlock(
         l.queued?.length
