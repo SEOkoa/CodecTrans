@@ -538,6 +538,38 @@ code {
 .librow:nth-child(odd) {
   background: var(--panel2);
 }
+/* Shared column grid — header and every row use the SAME track sizes, so
+   cells line up vertically across all rows (the old per-row flex sizing
+   let long content shift the column boundaries). */
+.libtable .libhead,
+.libtable .librow {
+  display: grid;
+  grid-template-columns:
+    minmax(0, 2.2fr)   /* name */
+    minmax(0, 1fr)     /* folder */
+    minmax(0, 1.5fr)   /* codec */
+    minmax(0, 1.3fr)   /* specs */
+    minmax(96px, 1.1fr)/* size */
+    minmax(64px, 0.7fr)/* duration */
+    minmax(130px, 1.2fr); /* status */
+  gap: 0 10px;
+}
+/* Failure-quarantine table (same libhead/librow classes, different cells) */
+.libtable:has(.failhead) .libhead,
+.libtable:has(.failhead) .librow {
+  grid-template-columns:
+    minmax(0, 1fr)     /* library */
+    minmax(0, 2fr)     /* name */
+    minmax(70px, 0.8fr)/* size */
+    minmax(92px, 0.9fr)/* fail date */
+    minmax(0, 1.4fr)   /* reason */
+    minmax(0, 1.6fr)   /* original path */
+    minmax(60px, 0.6fr); /* action */
+}
+.libtable .libhead > *,
+.libtable .librow > * {
+  min-width: 0; /* let grid tracks own the sizing — no cell may blow out */
+}
 .c-name {
   flex: 2 1 40%;
   overflow: hidden;

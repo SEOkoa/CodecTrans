@@ -317,6 +317,7 @@ export default function App() {
   const [nodeCfg, setNodeCfg] = useState(null);
   // server settings (settings tab) + fail quarantine (보관함 tab)
   const [failDirDraft, setFailDirDraft] = useState(null); // null = not loaded yet
+  const [autoScanDraft, setAutoScanDraft] = useState(null); // null = not loaded yet
   const [settingsMsg, setSettingsMsg] = useState("");
   const [failures, setFailures] = useState({ failDir: null, items: [] });
   const [failMsg, setFailMsg] = useState("");
@@ -352,7 +353,13 @@ export default function App() {
         if (l.root) setLibRoot(l.root);
       })
       .catch(() => {});
-    api.settingsGet().then((s) => setFailDirDraft(s.failDir ?? "")).catch(() => {});
+    api
+      .settingsGet()
+      .then((s) => {
+        setFailDirDraft(s.failDir ?? "");
+        setAutoScanDraft(s.autoScanMinutes ?? 0);
+      })
+      .catch(() => {});
     api.failuresGet().then(setFailures).catch(() => {});
     api
       .codecs()
@@ -386,7 +393,12 @@ export default function App() {
             );
           setFolders((cur) => (sig(f) === sig(cur) ? cur : f));
           setLibSel((cur) =>
-            cur === "all" || f.some((y) => y.id === cur) ? cur : "all",
+            cur === "all" ||
+            cur === "skipped" ||
+            cur === "notvideo" ||
+            f.some((y) => y.id === cur)
+              ? cur
+              : "all",
           );
         })
         .catch(() => {});
@@ -803,7 +815,13 @@ export default function App() {
       const l = await api.library();
       setLibrary(l);
       if (l.root) setLibRoot(l.root);
-      if (!next.some((f) => f.id === libSel)) setLibSel("all");
+      if (
+        libSel !== "all" &&
+        libSel !== "skipped" &&
+        libSel !== "notvideo" &&
+        !next.some((f) => f.id === libSel)
+      )
+        setLibSel("all");
       flashFolder("폴더 저장됨 ✓");
     } catch (err) {
       flashFolder(err.message);
@@ -2219,12 +2237,17 @@ export default function App() {
               <div className="libconf">
                 <button
                   className={`enablebtn${selFolder.enabled ? " on" : ""}`}
-                  onClick={() =>
+                  onClick={() => {
+                    const turningOn = !selFolder.enabled;
+                    // Enabling a folder starts its scan immediately — new
+                    // files are found and auto-queued without a manual scan.
                     patchFolder(selFolder.id, (x) => ({
                       ...x,
                       enabled: !x.enabled,
-                    }))
-                  }
+                    })).then(() => {
+                      if (turningOn) doScan(selFolder.id);
+                    });
+                  }}
                 >
                   {selFolder.enabled ? "⏸ 비활성화" : "▶ 활성화"}
                 </button>
@@ -3722,6 +3745,39 @@ export default function App() {
               )}
             </div>
             {settingsMsg && <div className="meta ok-text">{settingsMsg}</div>}
+          </div>
+          <div className="setblock">
+            <h3>자동 감지</h3>
+            <div className="hint">
+              등록된 폴더에 <b>새 파일이 추가</b>되면 주기적으로 재스캔해
+              자동으로 큐에 넣습니다. 스캔/인코딩이 진행 중이면 그 틱은
+              건너뛰고 다음 주기에 반영됩니다. 폴더를 <b>활성화</b>하면
+              즉시 그 폴더만 스캔도 시작됩니다.
+            </div>
+            <div className="search">
+              <select
+                value={autoScanDraft ?? 0}
+                onChange={(e) => setAutoScanDraft(Number(e.target.value))}
+              >
+                <option value={0}>꺼짐 (수동 스캔만)</option>
+                <option value={1}>1분마다</option>
+                <option value={5}>5분마다</option>
+                <option value={10}>10분마다</option>
+                <option value={30}>30분마다</option>
+              </select>
+              <button
+                onClick={() =>
+                  api
+                    .settingsPost({ autoScanMinutes: autoScanDraft ?? 0 })
+                    .then((r) => {
+                      setAutoScanDraft(r.autoScanMinutes ?? 0);
+                      flashBlock("자동 감지 주기 저장됨 ✓");
+                    })
+                }
+              >
+                저장
+              </button>
+            </div>
           </div>
           <div className="setblock">
             <h3>서버 정보</h3>

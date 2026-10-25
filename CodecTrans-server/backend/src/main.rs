@@ -793,7 +793,7 @@ async fn probe_full(path: &str) -> MediaInfo {
         .args([
             "-v", "error",
             "-show_entries",
-            "stream=codec_type,codec_name,profile,width,height,pix_fmt,avg_frame_rate,sample_rate,channels,bit_rate",
+            "stream=codec_type,codec_name,profile,width,height,pix_fmt,avg_frame_rate,sample_rate,channels,bit_rate,duration",
             "-show_entries", "format=duration,size,bit_rate,format_name",
             "-of", "json",
             path,
@@ -807,6 +807,7 @@ async fn probe_full(path: &str) -> MediaInfo {
 
     let u32f = |st: &Value, k: &str| st.get(k).and_then(|x| x.as_u64()).map(|n| n as u32);
     let f64f = |st: &Value, k: &str| st.get(k).and_then(|x| x.as_f64());
+    let mut video_stream_dur: Option<f64> = None;
     if let Some(streams) = v.get("streams").and_then(|s| s.as_array()) {
         for st in streams {
             let ct = st.get("codec_type").and_then(|x| x.as_str()).unwrap_or("");
@@ -815,6 +816,9 @@ async fn probe_full(path: &str) -> MediaInfo {
             match ct {
                 "video" if info.video_codec.is_none() => {
                     info.video_codec = cn;
+                    if video_stream_dur.is_none() {
+                        video_stream_dur = f64f(st, "duration");
+                    }
                     info.video_profile = st.get("profile").and_then(|x| x.as_str()).map(|s| s.to_string());
                     info.width = u32f(st, "width");
                     info.height = u32f(st, "height");
@@ -847,6 +851,16 @@ async fn probe_full(path: &str) -> MediaInfo {
         info.size = f.get("size").and_then(|x| x.as_str()).and_then(|s| s.parse::<u64>().ok());
         info.bit_rate = f.get("bit_rate").and_then(|x| x.as_str()).and_then(|s| s.parse::<u64>().ok());
         info.container = f.get("format_name").and_then(|x| x.as_str()).map(|s| s.to_string());
+    }
+    // Format-level duration is often missing/zero for MPEG-PS (.mpg/.mpeg
+    // VCD-style) and raw elementary streams — fall back to the video
+    // stream's own duration so real videos aren't mis-gated as non-video.
+    if info.duration.map_or(true, |d| d < 1.0) {
+        if let Some(sd) = video_stream_dur {
+            if sd >= 1.0 {
+                info.duration = Some(sd);
+            }
+        }
     }
     info
 }
@@ -907,7 +921,7 @@ fn is_video_ext(ext: Option<&str>) -> bool {
     match ext {
         Some(e) => [
             "mp4", "mkv", "avi", "mov", "ts", "webm", "m4v", "mpg", "mpeg", "wmv", "flv",
-            "3gp", "mts", "m2ts", "ogv", "divx",
+            "3gp", "mts", "m2ts", "ogv", "divx", "m2v", "psv", "evo", "vob",
         ]
         .contains(&e.to_ascii_lowercase().as_str()),
         None => false,
@@ -926,6 +940,13 @@ fn walk_videos(cur: &std::path::Path, root: &std::path::Path, out: &mut Vec<Path
         }
         let p = e.path();
         if p.is_dir() {
+            // Skip hidden dirs and NAS metadata/thumbnail caches (QNAP
+            // .@__thumb is full of mjpeg "thumbnails" that would flood the
+            // library as non-video garbage; @eaDir is QNAP metadata).
+            let name = e.file_name().to_string_lossy().into_owned();
+            if name.starts_with('.') || name == "@eaDir" || name.starts_with('!') {
+                continue;
+            }
             walk_videos(&p, root, out, limit);
         } else if p.is_file() && is_video_ext(p.extension().and_then(|x| x.to_str())) {
             if let Ok(rel) = p.strip_prefix(root) {
@@ -1656,6 +1677,11 @@ pub struct LibraryConfig {
     /// so the dashboard's 보관함 tab can list/restore/delete them.
     #[serde(default)]
     pub fail_dir: Option<String>,
+    /// Auto-rescan every N minutes to pick up NEW files dropped into the
+    /// registered folders (0 = off). Skipped while a scan or a library job
+    /// is in flight.
+    #[serde(default)]
+    pub auto_scan_minutes: u32,
 }
 
 /// One quarantined file under `fail_dir` (dashboard 보관함 tab).
@@ -2021,17 +2047,43 @@ fn catalog_path() -> PathBuf {
 }
 
 fn load_catalog() -> Vec<LibraryEntry> {
-    let p = catalog_path();
-    if let Ok(s) = std::fs::read_to_string(&p) {
+    let mut raw: Vec<LibraryEntry> = if let Ok(s) = std::fs::read_to_string(catalog_path()) {
         if let Ok(v) = serde_json::from_str::<Vec<LibraryEntry>>(&s) {
-            return v;
+            v
+        } else {
+            eprintln!("[CodecTrans] catalog.json is corrupt — trying catalog.json.bak");
+            Vec::new()
         }
-        eprintln!("[CodecTrans] catalog.json is corrupt — trying catalog.json.bak");
+    } else {
+        Vec::new()
+    };
+    if raw.is_empty() {
+        raw = std::fs::read_to_string(catalog_path().with_extension("json.bak"))
+            .ok()
+            .and_then(|s| serde_json::from_str::<Vec<LibraryEntry>>(&s).ok())
+            .unwrap_or_default();
     }
-    std::fs::read_to_string(p.with_extension("json.bak"))
-        .ok()
-        .and_then(|s| serde_json::from_str::<Vec<LibraryEntry>>(&s).ok())
-        .unwrap_or_default()
+    // Drop junk entries whose relative path lives in a hidden/NAS-metadata
+    // directory (QNAP .@__thumb is full of mjpeg thumbnails that once
+    // flooded the library). The walk skips these dirs now; this purges the
+    // stale entries already on disk.
+    let junk = raw
+        .iter()
+        .filter(|e| {
+            e.path
+                .rsplit('/')
+                .any(|seg| seg.starts_with('.') || seg == "@eaDir" || seg.starts_with('!'))
+        })
+        .count();
+    if junk > 0 {
+        eprintln!("[CodecTrans] purging {} junk (hidden-dir) catalog entries", junk);
+        raw.retain(|e| {
+            !e.path
+                .rsplit('/')
+                .any(|seg| seg.starts_with('.') || seg == "@eaDir" || seg.starts_with('!'))
+        });
+    }
+    raw
 }
 
 /// Persist the in-memory catalog to disk and grow the re-encoded-name
@@ -2421,24 +2473,35 @@ fn move_to_fail_folder(store: &Store, e: &LibraryEntry, reason: &str) -> Result<
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct SettingsBody {
-    fail_dir: Option<String>,
+    /// Three-state: missing = leave as-is, null = clear, string = set.
+    fail_dir: Option<Option<String>>,
+    /// Auto-rescan interval in minutes (0 = off).
+    auto_scan_minutes: Option<u32>,
 }
 
-/// GET /api/settings — server-level settings (currently: the fail folder).
+/// GET /api/settings — server-level settings (fail folder, auto-rescan).
 async fn settings_get(State(_store): State<Store>) -> impl IntoResponse {
-    Json(json!({ "failDir": load_lib_cfg().fail_dir }))
+    let c = load_lib_cfg();
+    Json(json!({
+        "failDir": c.fail_dir,
+        "autoScanMinutes": c.auto_scan_minutes,
+    }))
 }
 
 /// POST /api/settings — currently: the fail (quarantine) folder.
 async fn settings_post(State(_store): State<Store>, Json(b): Json<SettingsBody>) -> Response {
     let _g = LIB_CFG_LOCK.lock().unwrap_or_else(|p| p.into_inner());
     let mut c = load_lib_cfg();
-    c.fail_dir = b
-        .fail_dir
-        .map(|p| p.trim().to_string())
-        .filter(|p| !p.is_empty());
+    match b.fail_dir {
+        Some(None) => c.fail_dir = None,
+        Some(Some(p)) => c.fail_dir = Some(p.trim().to_string()).filter(|p| !p.is_empty()),
+        None => {} // field absent — leave the fail dir untouched
+    }
+    if let Some(m) = b.auto_scan_minutes {
+        c.auto_scan_minutes = m.min(1440);
+    }
     match save_lib_cfg(&c) {
-        Ok(_) => Json(json!({ "ok": true, "failDir": c.fail_dir })).into_response(),
+        Ok(_) => Json(json!({ "ok": true, "failDir": c.fail_dir, "autoScanMinutes": c.auto_scan_minutes })).into_response(),
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(json!({ "error": e.to_string() })),
@@ -4001,12 +4064,24 @@ async fn library_scan(State(store): State<Store>, Json(req): Json<ScanReq>) -> R
         }
         // Non-video gate — camera thumbnails (single-frame mjpeg in a .mp4
         // shell, jpeg_pipe container, no duration) and other non-video files
-        // are catalogued but NEVER queued for processing.
+        // are catalogued but NEVER queued for processing. MPEG family
+        // containers (mpeg-PS .mpg/.mpeg, .vob, .psv/.evo, raw .m2v)
+        // frequently carry no duration metadata at all — a real video stream
+        // there is still encodable, so the duration check is exempted.
+        let mpeg_family = e
+            .container
+            .as_deref()
+            .is_some_and(|c| matches!(c.to_ascii_lowercase().as_str(), "mpeg" | "mpegvideo" | "vcd" | "svcd" | "dvd video"))
+            || e
+                .name
+                .rsplit_once('.')
+                .map(|(_, x)| x.to_ascii_lowercase())
+                .is_some_and(|x| matches!(x.as_str(), "mpg" | "mpeg" | "vob" | "psv" | "evo" | "m2v"));
         let not_video = if e.video_codec.is_none() {
             Some("no video stream".to_string())
         } else if e.video_codec.as_deref() == Some("mjpeg") {
             Some("still image (mjpeg)".to_string())
-        } else if e.duration.map_or(true, |d| d < 1.0) {
+        } else if !mpeg_family && e.duration.map_or(true, |d| d < 1.0) {
             Some("no real duration (<1s)".to_string())
         } else {
             None
@@ -5693,20 +5768,99 @@ async fn spawn_mdns(store: &Store, port: u16) {
     //    (node died during claim/download before ever reporting "running")
     //    goes back to the queue so another node (or the same one, later)
     //    can pick it up instead of the file being stranded forever.
+    //    Orphaned ENTRIES (a server restart wiped the in-memory job queue,
+    //    but the persistent catalog still says "queued"/"running") are
+    //    reset to "pending" so the next scan re-arms them.
     {
         let store = store.clone();
         tokio::spawn(async move {
             loop {
                 tokio::time::sleep(std::time::Duration::from_secs(30)).await;
                 let now = now_ms();
-                let mut s = store.lock().unwrap();
-                for j in s.jobs.values_mut() {
-                    if j.status == "dispatched" && now - j.created_at > 600_000 {
-                        j.status = "queued".to_string();
-                        j.node_id = None;
-                        eprintln!("[CodecTrans] job {} stuck dispatched 10m — requeued", j.id);
+                {
+                    let mut s = store.lock().unwrap();
+                    for j in s.jobs.values_mut() {
+                        if j.status == "dispatched" && now - j.created_at > 600_000 {
+                            j.status = "queued".to_string();
+                            j.node_id = None;
+                            eprintln!("[CodecTrans] job {} stuck dispatched 10m — requeued", j.id);
+                        }
+                    }
+                    let live: std::collections::HashSet<String> = s
+                        .jobs
+                        .values()
+                        .filter(|j| matches!(j.status.as_str(), "queued" | "dispatched" | "running"))
+                        .map(|j| j.input_file.clone())
+                        .collect();
+                    let orphans: Vec<String> = s
+                        .library
+                        .values()
+                        .filter(|e| {
+                            (e.status == "queued" || e.status == "running")
+                                && !live.contains(&e.key())
+                        })
+                        .map(|e| e.key())
+                        .collect();
+                    for k in &orphans {
+                        if let Some(e) = s.library.get_mut(k) {
+                            e.status = "pending".to_string();
+                        }
+                    }
+                    if !orphans.is_empty() {
+                        eprintln!(
+                            "[CodecTrans] reset {} orphaned queued/running entries to pending",
+                            orphans.len()
+                        );
+                    }
+                    drop(s);
+                    if !orphans.is_empty() {
+                        persist_catalog(&store);
                     }
                 }
+            }
+        });
+    }
+
+    // 5. Auto-rescan: every auto_scan_minutes (library config, 0 = off) the
+    //    registered folders are rescanned so NEW files are found and
+    //    auto-queued without a manual scan. Re-reads the setting each tick
+    //    (a settings change applies on the next tick). Skipped while a scan
+    //    is active or a library job is queued/running/dispatched.
+    {
+        let store = store.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_secs(90)).await; // let the server settle
+            loop {
+                let minutes = load_lib_cfg().auto_scan_minutes;
+                let wait = if minutes == 0 { 300 } else { minutes.clamp(1, 1440) };
+                tokio::time::sleep(std::time::Duration::from_secs((wait * 60) as u64)).await;
+                if minutes == 0 {
+                    continue;
+                }
+                let scanning = SCAN_STATE.lock().unwrap().active;
+                let busy = {
+                    let s = store.lock().unwrap();
+                    s.list()
+                        .iter()
+                        .any(|j| j.lib_path.is_some() && !["done", "error", "cancelled"].contains(&j.status.as_str()))
+                };
+                if scanning || busy {
+                    continue;
+                }
+                let resp = library_scan(
+                    State(store.clone()),
+                    Json(ScanReq { root: None, folder_id: None, limit: Some(5000) }),
+                )
+                .await;
+                let queued = {
+                    let st = SCAN_STATE.lock().unwrap();
+                    (st.finished_queued, st.scanned)
+                };
+                let _ = resp;
+                eprintln!(
+                    "[CodecTrans] auto-scan finished — {} scanned, {} queued",
+                    queued.1, queued.0
+                );
             }
         });
     }
