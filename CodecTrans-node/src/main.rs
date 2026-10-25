@@ -1242,6 +1242,21 @@ async fn fail_job(
     }
 }
 
+/// Job scratch is one-shot. Remove the downloaded input and the encoded
+/// output the moment the job finishes — whatever the outcome (done,
+/// error, cancel). `in_path` is the node's own download copy ONLY when the
+/// input was downloaded (`!skip_download`); with the local fast path it
+/// is the user's actual source file on the shared filesystem and must
+/// never be touched. Leaving these behind made finished jobs accumulate
+/// GBs on remote nodes (a Mac node held 39G of stale inputs + 30G of
+/// already-uploaded outputs).
+fn remove_job_scratch(in_path: &std::path::Path, out_path: &std::path::Path, downloaded_input: bool) {
+    if downloaded_input {
+        let _ = std::fs::remove_file(in_path);
+    }
+    let _ = std::fs::remove_file(out_path);
+}
+
 async fn run_job(client: reqwest::Client, state: NState, server: String, node_id: String, job: RemoteJob) {
     // Local fast path (input): the job carries the source's absolute path on
     // the SERVER's host. When that path exists on THIS node's filesystem
@@ -1684,6 +1699,8 @@ async fn run_job(client: reqwest::Client, state: NState, server: String, node_id
                     j.progress = 1.0;
                     j.finished_at = Some(now_ms());
                 });
+                drop(st);
+                remove_job_scratch(&in_path, &out_path, !skip_download);
                 return;
             }
             let form = reqwest::multipart::Form::new()
@@ -1728,6 +1745,11 @@ async fn run_job(client: reqwest::Client, state: NState, server: String, node_id
         let mut st = state.lock().unwrap();
         update_job(&mut st, &job.id, |j| { j.status = "error".into(); j.error = Some(msg); j.finished_at = Some(now_ms()); });
     }
+
+    // The job is over — the scratch files are worthless now (the result
+    // is uploaded/staged, or the job failed). Remove them so finished
+    // work never piles up on the node's disk.
+    remove_job_scratch(&in_path, &out_path, !skip_download);
 }
 
 // ============================================================
@@ -2173,6 +2195,26 @@ async fn main() {
     let name = node_name();
     let caps = detect_ffmpeg();
     let port = local_port();
+
+    // Startup wipe of stale job scratch: anything left in in//out/ from a
+    // previous run belongs to a job that never finished (node crash /
+    // server restart mid-job) — the server re-queues those entries, so the
+    // files are pure orphans. Safety net so GBs of leftovers never pile up
+    // on the node's disk (remove_job_scratch handles the normal paths).
+    {
+        for d in [in_dir(), out_dir()] {
+            if let Ok(rd) = std::fs::read_dir(&d) {
+                for e in rd.flatten() {
+                    let p = e.path();
+                    let _ = if p.is_dir() {
+                        std::fs::remove_dir_all(&p)
+                    } else {
+                        std::fs::remove_file(&p)
+                    };
+                }
+            }
+        }
+    }
 
     // mDNS: advertise this node on the LAN so a server can find it.
     let daemon = match ServiceDaemon::new() {

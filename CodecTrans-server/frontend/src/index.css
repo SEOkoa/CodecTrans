@@ -170,6 +170,61 @@ header h1 {
   .grid {
     grid-template-columns: 1fr;
   }
+
+  /* ── mobile layout: wrap instead of overflow ───────────── */
+  .wrap {
+    padding: 16px 12px 48px;
+  }
+  /* Header: logo + pill share row 1, tabs get their own wrapped row */
+  header {
+    flex-wrap: wrap;
+    gap: 8px;
+  }
+  header h1 {
+    font-size: 20px;
+    margin-right: auto;
+  }
+  .tabs {
+    flex-basis: 100%;
+    flex-wrap: wrap;
+    margin-left: 0;
+  }
+  /* Node card row: chips + gear wrap to a clean second line */
+  .node .row {
+    flex-wrap: wrap;
+    row-gap: 6px;
+  }
+  .node .jmeta {
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+  /* Node job rows: filename ellipsizes, codec + % wrap below */
+  .nodejob .row {
+    flex-wrap: wrap;
+    row-gap: 2px;
+  }
+  .nodejob .jmeta:first-child {
+    flex: 1 1 100%;
+  }
+  /* Search row: button drops below the input when tight */
+  .search {
+    flex-wrap: wrap;
+  }
+  .search input {
+    flex: 1 1 200px;
+  }
+  /* Long tokens must never punch through a row */
+  .jname,
+  .sub,
+  .est {
+    overflow-wrap: anywhere;
+  }
+  /* Safety net: leftover horizontal overflow is clipped — the data tables
+     have their own internal scroll (.libtable overflow-x:auto). */
+  body {
+    overflow-x: hidden;
+  }
 }
 
 .card {

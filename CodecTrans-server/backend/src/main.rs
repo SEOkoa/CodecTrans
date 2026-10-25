@@ -1873,6 +1873,132 @@ fn src_health_depths(graphs: &[&WorkflowGraph]) -> Vec<(String, u32)> {
     out
 }
 
+// ============================================================
+//  CUDA — server-side GPU decode for the scan's health check
+// ============================================================
+
+/// Bundled NVIDIA userland libdir matching the host driver (set at
+/// startup). When set, the scan's health decodes run on the GPU
+/// (-hwaccel cuda) — the 4K source decode hits the NVDEC engine instead
+/// of burning CPU cores, so the scan can run 4 health decodes in
+/// parallel at ~0 CPU cost.
+static CUDA_LIBDIR: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+
+fn cuda_libdir() -> Option<String> {
+    CUDA_LIBDIR.lock().unwrap().clone()
+}
+
+/// Read the host NVIDIA kernel driver version. /sys/module/nvidia/version
+/// is just the version string; /proc/driver/nvidia/version is the NVRM
+/// banner. Neither is namespaced — both report the HOST from a container.
+fn host_nvidia_driver_version() -> Option<String> {
+    for p in ["/sys/module/nvidia/version", "/proc/driver/nvidia/version"] {
+        if let Ok(s) = std::fs::read_to_string(p) {
+            if let Some(line) = s.lines().next() {
+                let t = line.trim().to_string();
+                if !t.is_empty() {
+                    return Some(t);
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Major series number (e.g. 575) out of a version string like "575.64.03"
+/// or an NVRM banner line.
+fn nv_major(line: &str) -> Option<u32> {
+    for t in line.split_whitespace() {
+        if let Some(m) = t.split('.').next() {
+            if let Ok(n) = m.parse::<u32>() {
+                if n >= 300 && n <= 999 {
+                    return Some(n);
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Probe + select the bundled NVIDIA userland series that matches the host
+/// kernel driver (same pattern as the node image: a NAS passes /dev/nvidia*
+/// but does NOT inject the host driver userland into containers, and a
+/// version-skewed userland fails cuInit with SYSTEM_DRIVER_MISMATCH).
+/// Best effort — any failure leaves the health check as a CPU decode.
+fn init_cuda() {
+    let root = std::path::PathBuf::from("/opt/nvidia-userland");
+    if !root.exists() {
+        return; // no bundled series (bare host / non-NVIDIA box)
+    }
+    let host = host_nvidia_driver_version();
+    let host_major = host.as_deref().and_then(nv_major);
+    if let Some(h) = &host {
+        eprintln!("[CodecTrans] host NVIDIA kernel driver: {h}");
+    }
+    let mut series: Vec<u32> = host_major.into_iter().collect();
+    let mut others: Vec<u32> = Vec::new();
+    if let Ok(rd) = std::fs::read_dir(&root) {
+        for e in rd.filter_map(|e| e.ok()) {
+            if let Some(v) = e.file_name().to_str().and_then(|s| s.parse::<u32>().ok()) {
+                if !series.contains(&v) {
+                    others.push(v);
+                }
+            }
+        }
+    }
+    others.sort_by(|a, b| b.cmp(a));
+    series.append(&mut others);
+    for v in series {
+        let lib = root.join(v.to_string()).join("lib");
+        if !lib.is_dir() {
+            continue;
+        }
+        // A 2-frame NVENC one-shot exercises the whole cuda userland
+        // (cuInit against the host kernel driver) — if it encodes, the
+        // cuvid decode path works with the same series.
+        let probe = std::path::PathBuf::from("/tmp/ct_cuda_probe.mp4");
+        let _ = std::fs::remove_file(&probe);
+        let out = std::process::Command::new("ffmpeg")
+            .args([
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-y",
+                "-f",
+                "lavfi",
+                "-i",
+                "testsrc=duration=0.1:size=320x240:rate=10",
+                "-vf",
+                "format=nv12",
+                "-frames:v",
+                "2",
+                "-c:v",
+                "h264_nvenc",
+            ])
+            .arg(probe.to_string_lossy().to_string())
+            .env("LD_LIBRARY_PATH", lib.to_string_lossy().to_string())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .output();
+        let ok = out
+            .as_ref()
+            .map(|o| o.status.success())
+            .unwrap_or(false)
+            && std::fs::metadata(&probe).map(|m| m.len() > 0).unwrap_or(false);
+        let _ = std::fs::remove_file(&probe);
+        if ok {
+            eprintln!(
+                "[CodecTrans] CUDA userland series {v} OK — scan health decode runs on the GPU ({})",
+                lib.display()
+            );
+            *CUDA_LIBDIR.lock().unwrap() = Some(lib.to_string_lossy().to_string());
+            return;
+        }
+        eprintln!("[CodecTrans] CUDA userland series {v}: probe failed (driver mismatch?)");
+    }
+    eprintln!("[CodecTrans] no bundled NVIDIA userland matched the host driver — scan health decode stays on CPU.");
+}
+
 /// Decode-based source integrity check for ONE file (per-file, every file
 /// is checked — `depths` only controls how deep). Builds the decode
 /// windows: "all" short-circuits to a full-file decode (it subsumes any
@@ -1971,12 +2097,23 @@ async fn decode_health_check(path: &str, duration: Option<f64>, depths: &[(Strin
 /// checks, 4K/10-bit material) the realtime budget blows — retry once at
 /// 3x before declaring the source broken.
 async fn decode_window_ok(path: &str, seek: f64, len: f64, timeout_s: u64) -> bool {
+    // GPU decode when the container carries a bundled NVIDIA userland that
+    // matches the host driver (set by init_cuda at startup): the 4K source
+    // decode then hits the NVDEC engine instead of the CPU — that is what
+    // lets the scan run several health decodes in parallel for ~0 CPU cost.
+    let cuda = cuda_libdir();
     let build = || {
         let mut c = tokio::process::Command::new("ffmpeg");
-        // -threads 2 (not 4): the scan runs up to 4 health decodes in
-        // parallel — 4 x 2 threads fills an 8-core box exactly instead of
-        // 4 x 4 oversubscribing it into thrash.
-        c.arg("-v").arg("error").arg("-nostdin").arg("-threads").arg("2");
+        c.arg("-v").arg("error").arg("-nostdin");
+        if let Some(lib) = &cuda {
+            c.arg("-hwaccel").arg("cuda");
+            c.env("LD_LIBRARY_PATH", lib.clone());
+        } else {
+            // -threads 2 (not 4): the scan runs up to 4 health decodes in
+            // parallel — 4 x 2 threads fills an 8-core box exactly instead of
+            // 4 x 4 oversubscribing it into thrash.
+            c.arg("-threads").arg("2");
+        }
         if seek > 0.0 {
             c.arg("-ss").arg(format!("{seek:.3}"));
         }
@@ -3188,6 +3325,31 @@ async fn resolve_choice_dispatch(
     Some((node.id, node_name, effective, accelerated, gpu_device, eff))
 }
 
+/// Cap on how many jobs may sit in the queue (queued + dispatched +
+/// running) at once. The scan and the re-dispatch sweep only top the queue
+/// up to this many — with a big library one scan would otherwise dump
+/// hundreds of files onto the nodes at once; the cap keeps the queue a
+/// steady ~10 deep, draining and refilling as nodes finish work.
+/// (Env override: CT_MAX_QUEUED.)
+fn max_queued() -> usize {
+    std::env::var("CT_MAX_QUEUED")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(10)
+        .max(1)
+}
+
+/// Jobs currently occupying the queue (not finished, not cancelled).
+fn active_job_count(store: &Store) -> usize {
+    store
+        .lock()
+        .unwrap()
+        .list()
+        .iter()
+        .filter(|j| matches!(j.status.as_str(), "queued" | "dispatched" | "running"))
+        .count()
+}
+
 /// Queue one library entry for re-encoding on a node with the given target
 /// (folder default or a logic block's). The node pulls the source via
 /// node_fetch_file; the finished file is moved back next to the source
@@ -4337,6 +4499,10 @@ async fn library_scan(State(store): State<Store>, Json(req): Json<ScanReq>) -> R
     // node online) just leaves the entry pending: the next scan or a
     // job-completion sweep retries it.
     for i in &redispatch {
+        // Queue cap — the job-completion sweep refills as slots free up.
+        if active_job_count(&store) >= max_queued() {
+            break;
+        }
         let e = entries[*i].clone();
         let Some(d) = e
             .decision
@@ -4360,7 +4526,26 @@ async fn library_scan(State(store): State<Store>, Json(req): Json<ScanReq>) -> R
     let eff_graph = std::sync::Arc::new(eff_graph);
     let health_depths = std::sync::Arc::new(health_depths);
     let live = std::sync::Arc::new(live);
-    let health_sem = std::sync::Arc::new(tokio::sync::Semaphore::new(2));
+    // Health decode workers. CT_HEALTH_WORKERS overrides per deployment
+    // (0 = OFF: no decode runs, the srcHealth gate evaluates as healthy);
+    // otherwise the auto default — with the GPU decode the decodes cost ~0
+    // CPU so run 4 in parallel; without a GPU stay at 2 (2 x 2 threads ≈
+    // 4 of 8 cores) so the CPU path can't oversubscribe the box.
+    let health_conc: usize = match std::env::var("CT_HEALTH_WORKERS").ok() {
+        Some(s) => match s.parse() {
+            Ok(n) => n,
+            Err(_) => 2,
+        },
+        None => {
+            let d = if cuda_libdir().is_some() { 4 } else { 2 };
+            eprintln!("[CodecTrans] health workers: {d} (auto — set CT_HEALTH_WORKERS to override, 0 = off)");
+            d
+        }
+    };
+    if health_conc == 0 {
+        eprintln!("[CodecTrans] health workers: 0 — srcHealth decode disabled (gate evaluates as healthy)");
+    }
+    let health_sem = std::sync::Arc::new(tokio::sync::Semaphore::new(health_conc.max(1)));
     let libcfg = std::sync::Arc::new(libcfg);
     let store_t = store.clone();
     let mut handles: Vec<tokio::task::JoinHandle<(String, Option<String>)>> = Vec::new();
@@ -4451,6 +4636,11 @@ async fn library_scan(State(store): State<Store>, Json(req): Json<ScanReq>) -> R
             let h_false = std::collections::HashMap::from([(key.clone(), false)]);
             let decision = if health_depths.is_empty() {
                 evaluate(&h_true)
+            } else if health_conc == 0 {
+                // Workers disabled (CT_HEALTH_WORKERS=0): the decode never
+                // runs, so the gate can only ever pass — evaluate as
+                // healthy. (Corrupt files are no longer quarantined.)
+                evaluate(&h_true)
             } else {
                 let d_true = evaluate(&h_true);
                 let d_false = evaluate(&h_false);
@@ -4518,6 +4708,11 @@ async fn library_scan(State(store): State<Store>, Json(req): Json<ScanReq>) -> R
                     // a live (queued/dispatched/running) one.
                     if live.contains(&key) {
                         Some("queued".into())
+                    } else if active_job_count(&store_t) >= max_queued() {
+                        // Queue is full — leave it pending (the saved
+                        // decision is persisted below); the job-completion
+                        // sweep re-dispatches it as slots free up.
+                        None
                     } else {
                         match dispatch_lib_job(&store_t, &e, &t, &post, hw_only).await {
                             Ok(true) => Some("queued".into()),
@@ -5262,6 +5457,10 @@ async fn sweep_redispatch(store: &Store, limit: usize) {
             .collect()
     };
     for e in candidates {
+        // Queue cap — stop topping up once the queue is full.
+        if active_job_count(store) >= max_queued() {
+            break;
+        }
         let Some(d) = e
             .decision
             .as_ref()
@@ -6063,6 +6262,11 @@ async fn main() {
         "[CodecTrans] library catalog: {} entries",
         store.lock().unwrap().list_library().len()
     );
+
+    // GPU availability for the scan's health decode: probe the bundled
+    // NVIDIA userland (container images carry it; a bare host without a
+    // matching driver falls back to the CPU decode path silently).
+    init_cuda();
 
     // mDNS: advertise this server on the LAN + browse for nodes.
     spawn_mdns(&store, port).await;
