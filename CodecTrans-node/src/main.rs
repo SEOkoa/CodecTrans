@@ -1782,7 +1782,7 @@ fn macos_ram_mb() -> Option<(u64, u64)> {
         if !o.status.success() {
             return None;
         }
-        String::from_utf8_lossy(&o.stdout).trim().to_string()
+        String::from_utf8_lossy(&o.stdout).trim().to_string().into()
     };
     let total_bytes: u64 = run("sysctl", "-n hw.memsize")?.parse().ok()?;
     let page_bytes: u64 = run("sysctl", "-n hw.pagesize")?.parse().ok()?;
