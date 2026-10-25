@@ -1141,54 +1141,30 @@ fn parse_time(s: &str) -> Option<f64> {
 /// Byte stream over a file on disk — feeds reqwest's multipart `Part::stream`
 /// so a multi-GB finished output is uploaded from disk, never read whole
 /// into RAM.
-struct FileBytes {
-    file: Option<tokio::fs::File>,
-    buf: Vec<u8>,
-}
-
-impl FileBytes {
-    fn new(path: &std::path::Path) -> Self {
-        let file = std::fs::File::open(path)
-            .ok()
-            .map(tokio::fs::File::from_std);
-        Self { file, buf: vec![0u8; 1 << 20] }
-    }
-}
-
-impl futures_util::Stream for FileBytes {
-    type Item = Result<bytes::Bytes, std::io::Error>;
-
-    fn poll_next(mut self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> std::task::Poll<Option<Self::Item>> {
-        use tokio::io::AsyncRead;
-        let this = self.get_mut();
-        match this.file.as_mut() {
-            None => std::task::Poll::Ready(None),
-            Some(f) => {
-                this.buf.clear();
-                // ReadBuf borrows this.buf — capture the read result and the
-                // filled length inside one scope so the borrow ends before
-                // we touch the buffer again.
-                let (res, n) = {
-                    let mut rb = tokio::io::ReadBuf::new(&mut this.buf);
-                    let r = std::pin::Pin::new(f).poll_read(cx, &mut rb);
-                    (r, rb.filled().len())
-                };
-                match res {
-                    std::task::Poll::Ready(Ok(_)) => {
-                        if n == 0 {
-                            this.file = None;
-                            std::task::Poll::Ready(None)
-                        } else {
-                            this.buf.truncate(n);
-                            std::task::Poll::Ready(Some(Ok(this.buf.clone().into())))
-                        }
-                    }
-                    std::task::Poll::Ready(Err(e)) => std::task::Poll::Ready(Some(Err(e))),
-                    std::task::Poll::Pending => std::task::Poll::Pending,
-                }
+///
+/// Do NOT hand-roll `Stream::poll_next` here with `tokio::io::ReadBuf` over a
+/// reusable `Vec`: `ReadBuf::new(&mut buf)` sizes its capacity from
+/// `buf.len()`, so a `buf.clear()` before the read silently yields a
+/// 0-capacity buffer and the stream EOFs after 0 bytes — which is exactly
+/// what shipped: the server received an empty file part and answered HTTP 500
+/// "uploaded file is empty (torn upload)". `stream::unfold` +
+/// `AsyncReadExt::read` allocates a fresh buffer per poll and cannot hit that
+/// class of bug.
+fn file_bytes(path: &std::path::Path) -> impl futures_util::Stream<Item = Result<bytes::Bytes, std::io::Error>> {
+    let initial: Option<tokio::fs::File> =
+        std::fs::File::open(path).ok().map(tokio::fs::File::from_std);
+    futures_util::stream::unfold(initial, |maybe_file| async move {
+        let mut f = maybe_file?;
+        let mut buf = vec![0u8; 1 << 20];
+        match AsyncReadExt::read(&mut f, &mut buf).await {
+            Ok(0) => None,
+            Ok(n) => {
+                buf.truncate(n);
+                Some((Ok(bytes::Bytes::from(buf)), Some(f)))
             }
+            Err(e) => Some((Err(e), None)),
         }
-    }
+    })
 }
 
 // ============================================================
@@ -1529,7 +1505,7 @@ async fn run_job(client: reqwest::Client, state: NState, server: String, node_id
             let form = reqwest::multipart::Form::new()
                 .part("jobId", reqwest::multipart::Part::text(job.id.clone()))
                 .part("outputFile", reqwest::multipart::Part::text(job.output_file.clone()))
-                .part("file", reqwest::multipart::Part::stream(reqwest::Body::wrap_stream(FileBytes::new(&out_path))).file_name(job.output_file.clone()));
+                .part("file", reqwest::multipart::Part::stream(reqwest::Body::wrap_stream(file_bytes(&out_path))).file_name(job.output_file.clone()));
             let up = xfer.post(format!("{}/api/nodes/{}/result", server, node_id)).multipart(form).send().await;
             match up {
                 Ok(r) if r.status().is_success() => {
