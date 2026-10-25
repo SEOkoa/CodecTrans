@@ -3212,9 +3212,13 @@ async fn dispatch_lib_job(
                 let online = list_nodes_redis(c, "online", None, None).await;
                 let counts = active_jobs_by_node(store, None);
                 let idx = if hw_only {
-                    // HW-only: pick a FREE node that has the family in
+                    // HW-only: prefer a FREE node with the family in
                     // hardware. Nothing capable online at all -> error;
-                    // capable but busy -> pending.
+                    // capable but busy -> still queue on the LEAST-LOADED
+                    // capable node: the node enforces its own max_jobs, so
+                    // the job waits its turn instead of the entry bouncing
+                    // back to pending for the next scan (which would
+                    // trickle a big AV1 queue at "2 files per scan").
                     let any_capable = online
                         .iter()
                         .any(|n| usable_hw_encoders(n).iter().any(|h| codec_family(h) == family));
@@ -3226,10 +3230,25 @@ async fn dispatch_lib_job(
                             if names.is_empty() { "none".to_string() } else { names.join(", ") }
                         ));
                     }
-                    online.iter().position(|n| {
-                        counts.get(&n.id).copied().unwrap_or(0) < n.max_jobs
-                            && usable_hw_encoders(n).iter().any(|h| codec_family(h) == family)
-                    })
+                    let load = |n: &Node| counts.get(&n.id).copied().unwrap_or(0);
+                    online
+                        .iter()
+                        .position(|n| {
+                            load(n) < n.max_jobs
+                                && usable_hw_encoders(n).iter().any(|h| codec_family(h) == family)
+                        })
+                        .or_else(|| {
+                            online
+                                .iter()
+                                .enumerate()
+                                .filter(|(_, n)| {
+                                    usable_hw_encoders(n)
+                                        .iter()
+                                        .any(|h| codec_family(h) == family)
+                                })
+                                .min_by_key(|(_, n)| load(n))
+                                .map(|(i, _)| i)
+                        })
                 } else {
                     pick_node_idx(&online, &counts, &family)
                 };
