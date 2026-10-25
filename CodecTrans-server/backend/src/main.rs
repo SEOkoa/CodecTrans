@@ -1930,17 +1930,41 @@ async fn decode_window_ok(path: &str, seek: f64, len: f64, timeout_s: u64) -> bo
     let r = tokio::time::timeout(std::time::Duration::from_secs(timeout_s), build().output()).await;
     if let Ok(Ok(o)) = r {
         let err = String::from_utf8_lossy(&o.stderr);
+        if !(o.status.success() && err.trim().is_empty()) {
+            eprintln!(
+                "[CodecTrans] health decode FAILED window({seek:.3}+{len:.3}) of {path}: exit={:?} stderr={}",
+                o.status.code(),
+                err.lines().take(3).collect::<Vec<_>>().join(" | ")
+            );
+        }
         return o.status.success() && err.trim().is_empty();
     }
+    eprintln!(
+        "[CodecTrans] health decode TIMEOUT({timeout_s}s) window({seek:.3}+{len:.3}) of {path} — retrying at {}s",
+        timeout_s.saturating_mul(3).max(60)
+    );
     // Timeout (or a transient spawn hiccup) — retry once, 3x the budget.
     let retry_s = timeout_s.saturating_mul(3).max(60);
     let r = tokio::time::timeout(std::time::Duration::from_secs(retry_s), build().output()).await;
     match r {
         Ok(Ok(o)) => {
             let err = String::from_utf8_lossy(&o.stderr);
-            o.status.success() && err.trim().is_empty()
+            let ok = o.status.success() && err.trim().is_empty();
+            if !ok {
+                eprintln!(
+                    "[CodecTrans] health decode RETRY FAILED window({seek:.3}+{len:.3}) of {path}: exit={:?} stderr={}",
+                    o.status.code(),
+                    err.lines().take(3).collect::<Vec<_>>().join(" | ")
+                );
+            }
+            ok
         }
-        _ => false,
+        _ => {
+            eprintln!(
+                "[CodecTrans] health decode RETRY TIMEOUT({retry_s}s) window({seek:.3}+{len:.3}) of {path} — source marked broken",
+            );
+            false
+        }
     }
 }
 
