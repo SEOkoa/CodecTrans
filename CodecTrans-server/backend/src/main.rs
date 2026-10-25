@@ -1462,7 +1462,7 @@ fn save_auto(c: &AutoConfig) -> std::io::Result<()> {
 /// The server walks the list in order and uses the FIRST choice the selected
 /// node can actually run (HW), so a folder can say "av1 on the GPU, else
 /// hevc" or "hevc on the nvenc box, h264 on the Mac" without per-node graphs.
-#[derive(Clone, Serialize, Deserialize, Default)]
+#[derive(Clone, PartialEq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct TargetChoice {
     /// Logical video codec (h264/h265/av1/...).
@@ -1489,7 +1489,7 @@ pub struct TargetChoice {
 }
 
 /// Encoding target for a folder or a logic block.
-#[derive(Clone, Serialize, Deserialize, Default)]
+#[derive(Clone, PartialEq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct TargetCfg {
     /// Logical video codec (h264/h265/av1/...); rewritten per-node to the
@@ -1769,7 +1769,7 @@ pub struct WorkflowGraph {
 /// A post-encode operation — chained on the encode action's OUTPUT port.
 /// The server executes the whole plan (in chain order) when the finished
 /// file arrives in `node_result`. The node never sees it.
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", tag = "op")]
 pub enum PostOp {
     /// ffprobe the output: video stream present, positive duration, at
@@ -3402,6 +3402,7 @@ fn cond_matches(
 }
 
 /// The verdict for one file after walking its logic graph.
+#[derive(Clone, PartialEq)]
 enum GraphDecision {
     /// Encode with this target; `post` is the post-encode chain
     /// (verify → replace → …).
@@ -4267,39 +4268,28 @@ async fn library_scan(State(store): State<Store>, Json(req): Json<ScanReq>) -> R
                 .find(|f| e.folder.as_deref() == Some(f.id.as_str()));
             let folder_target: TargetCfg =
                 folder.map(|f| f.target.clone()).unwrap_or_default();
-            // srcHealth decode for THIS file's source — the slow part,
-            // bounded to 4 parallel decodes across the whole scan. An
-            // unknown duration is not corruption: decode_health_check
-            // falls back to a short front window.
-            let health = if health_depths.is_empty() {
-                true
-            } else {
-                match resolve_lib_source(&key, &store_t) {
-                    Some(p) => {
-                        let _g = health_sem.acquire_owned().await.expect("health sem");
-                        decode_health_check(&p.to_string_lossy(), e.duration, &health_depths).await
-                    }
-                    None => false,
-                }
-            };
-            let hmap = std::collections::HashMap::from([(key.clone(), health)]);
-            // Graph precedence: 1) the folder's chosen NAMED logic
-            // (library-tab assignment), 2) legacy per-folder inline graph,
-            // 3) global library graph. None of them -> the folder's bulk
-            // default below.
-            let logic_graph: Option<&WorkflowGraph> = folder
-                .and_then(|f| f.logic_id.as_deref())
-                .and_then(|lid| libcfg.logics.iter().find(|l| l.id == lid))
-                .map(|l| &l.graph);
-            let folder_graph: Option<&WorkflowGraph> = folder
-                .filter(|f| {
-                    f.graph
-                        .nodes
-                        .iter()
-                        .any(|n| n.kind == "condition" || n.kind == "action")
-                })
-                .map(|f| &f.graph);
-            let decision: Option<GraphDecision> = {
+            // Graph decision — with a LAZY health check. If the graph
+            // reaches the SAME decision with srcHealth true AND false, the
+            // decode is pure waste for this file (it is skipped by cheaper
+            // conditions first) — only files whose outcome actually depends
+            // on the health gate pay for the decode.
+            let evaluate = |h: &std::collections::HashMap<String, bool>| -> Option<GraphDecision> {
+                // Graph precedence: 1) the folder's chosen NAMED logic
+                // (library-tab assignment), 2) legacy per-folder inline
+                // graph, 3) global library graph. None of them -> the
+                // folder's bulk default below.
+                let logic_graph: Option<&WorkflowGraph> = folder
+                    .and_then(|f| f.logic_id.as_deref())
+                    .and_then(|lid| libcfg.logics.iter().find(|l| l.id == lid))
+                    .map(|l| &l.graph);
+                let folder_graph: Option<&WorkflowGraph> = folder
+                    .filter(|f| {
+                        f.graph
+                            .nodes
+                            .iter()
+                            .any(|n| n.kind == "condition" || n.kind == "action")
+                    })
+                    .map(|f| &f.graph);
                 let g = logic_graph
                     .or(folder_graph)
                     .or_else(|| eff_graph.as_ref().as_ref());
@@ -4308,7 +4298,7 @@ async fn library_scan(State(store): State<Store>, Json(req): Json<ScanReq>) -> R
                     // output port carries the post-encode plan. No action
                     // reached -> the folder's bulk default below.
                     Some(
-                        eval_graph(g, &e, &online[..], &folder_target, &hmap)
+                        eval_graph(g, &e, &online[..], &folder_target, h)
                             .unwrap_or_else(|| {
                                 if folder_target.video_codec.is_some() {
                                     GraphDecision::Encode {
@@ -4324,7 +4314,7 @@ async fn library_scan(State(store): State<Store>, Json(req): Json<ScanReq>) -> R
                 } else if e.folder.is_some() {
                     if folder_target.video_codec.is_some() {
                         Some(GraphDecision::Encode {
-                            target: folder_target,
+                            target: folder_target.clone(),
                             post: Vec::new(),
                             hw_only: false,
                         })
@@ -4342,6 +4332,32 @@ async fn library_scan(State(store): State<Store>, Json(req): Json<ScanReq>) -> R
                     } else {
                         None
                     }
+                }
+            };
+            let h_true = std::collections::HashMap::from([(key.clone(), true)]);
+            let h_false = std::collections::HashMap::from([(key.clone(), false)]);
+            let decision = if health_depths.is_empty() {
+                evaluate(&h_true)
+            } else {
+                let d_true = evaluate(&h_true);
+                let d_false = evaluate(&h_false);
+                if d_true == d_false {
+                    // The health gate changes nothing for this file — skip
+                    // the decode entirely.
+                    d_true
+                } else {
+                    // Health MATTERS — run the srcHealth decode (bounded to
+                    // 4 parallel decodes across the scan). An unknown
+                    // duration is not corruption: decode_health_check falls
+                    // back to a short front window.
+                    let h = match resolve_lib_source(&key, &store_t) {
+                        Some(p) => {
+                            let _g = health_sem.acquire_owned().await.expect("health sem");
+                            decode_health_check(&p.to_string_lossy(), e.duration, &health_depths).await
+                        }
+                        None => false,
+                    };
+                    evaluate(if h { &h_true } else { &h_false })
                 }
             };
             let outcome: Option<String> = match decision {
