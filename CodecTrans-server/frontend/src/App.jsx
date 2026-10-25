@@ -2460,22 +2460,62 @@ export default function App() {
                     key={(e.folder ? e.folder + "/" : "") + e.path}
                     className="librow row"
                   >
-                    <span className="c-name jname" title={e.path}>
-                      {e.name}
+                    <span className="c-name" title={e.path}>
+                      <span className="jname">{e.name}</span>
+                      {e.status === "done" && e.reencoded && (
+                        <span className="jout">→ {e.reencoded}</span>
+                      )}
                     </span>
                     <span className="c-folder jmeta" title={folderPath(e.folder)}>
                       {e.folder ? shortPath(folderPath(e.folder)) : "(임시)"}
                     </span>
-                    <span className="c-codec">
+                    <span
+                      className="c-codec"
+                      title={
+                        `${e.videoCodec || "?"}${e.audioCodec ? ` / ${e.audioCodec}` : ""}` +
+                        (e.status === "done" && e.newCodec
+                          ? `  →  출력: ${e.newCodec}`
+                          : "")
+                      }
+                    >
                       {e.videoCodec || "?"}
-                      {e.audioCodec ? ` / ${e.audioCodec}` : ""}
+                      {e.audioCodec ? (
+                        <span className="dim"> / {e.audioCodec}</span>
+                      ) : (
+                        ""
+                      )}
+                      {e.status === "done" && e.newCodec && (
+                        <span className="enc-new">
+                          {" → "}
+                          <b>{e.newCodec}</b>
+                        </span>
+                      )}
                     </span>
                     <span className="c-spec jmeta">
                       {e.width ? `${e.width}×${e.height}` : "—"}
                       {e.fps ? ` · ${fmtFps(e.fps)}fps` : ""}
                       {e.videoBitRate ? ` · ${fmtRate(e.videoBitRate)}` : ""}
                     </span>
-                    <span className="c-size jmeta">{fmtSize(e.size)}</span>
+                    <span className="c-size jmeta">
+                      {e.status === "done" && e.newSize != null && e.size > 0 ? (
+                        <span title="원본 → 결과">
+                          <span className="dim">{fmtSize(e.size)}</span>
+                          {" → "}
+                          {fmtSize(e.newSize)}
+                          <span
+                            className={
+                              "szdelta " + (e.newSize <= e.size ? "down" : "up")
+                            }
+                          >
+                            {e.newSize <= e.size
+                              ? `−${Math.max(1, Math.round((1 - e.newSize / e.size) * 100))}%`
+                              : `+${Math.round((e.newSize / e.size - 1) * 100)}%`}
+                          </span>
+                        </span>
+                      ) : (
+                        fmtSize(e.size)
+                      )}
+                    </span>
                     <span className="c-dur jmeta">
                       {e.duration ? fmtDur(e.duration) : "—"}
                     </span>
@@ -2515,10 +2555,16 @@ export default function App() {
                                 : ""
                             }`}
                             title={
-                              e.status === "error" ||
-                              e.status === "failed" ||
-                              e.status === "skipped" ||
-                              e.status === "notvideo"
+                              e.status === "done"
+                                ? `원본: ${fmtSize(e.size)} ${[e.videoCodec, e.audioCodec]
+                                    .filter(Boolean)
+                                    .join("/")} → 결과: ${
+                                    e.newSize != null ? fmtSize(e.newSize) : "?"
+                                  } ${e.newCodec || ""} (${e.reencoded || "?"})`
+                                : e.status === "error" ||
+                                  e.status === "failed" ||
+                                  e.status === "skipped" ||
+                                  e.status === "notvideo"
                                 ? e.error
                                 : undefined
                             }

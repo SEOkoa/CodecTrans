@@ -279,8 +279,11 @@ pub struct LibraryEntry {
     pub video_bit_rate: Option<u64>, // bits/s
     pub pix_fmt: Option<String>,
     pub status: String,        // pending | queued | done | skipped | error
-    pub reencoded: Option<String>, // target codec actually applied (e.g. "hevc")
+    pub reencoded: Option<String>, // output filename (staged next to the source)
     pub new_size: Option<u64>,
+    /// Effective video codec of the finished output (e.g. "hevc_nvenc").
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub new_codec: Option<String>,
     pub error: Option<String>,
 }
 
@@ -2265,6 +2268,7 @@ async fn library_requeue(State(store): State<Store>, Json(req): Json<RequeueReq>
             e.error = None;
             e.reencoded = None;
             e.new_size = None;
+            e.new_codec = None;
         })
         .is_some()
     };
@@ -3749,6 +3753,7 @@ async fn library_scan(State(store): State<Store>, Json(req): Json<ScanReq>) -> R
             status: "pending".into(),
             reencoded: None,
             new_size: None,
+            new_codec: None,
             error: None,
         });
         SCAN_STATE.lock().unwrap().scanned += 1;
@@ -3801,6 +3806,7 @@ async fn library_scan(State(store): State<Store>, Json(req): Json<ScanReq>) -> R
                 e.status = o.status.clone();
                 e.reencoded = o.reencoded.clone();
                 e.new_size = o.new_size;
+                e.new_codec = o.new_codec.clone();
                 e.error = o.error.clone();
             }
         }
@@ -4959,6 +4965,7 @@ async fn node_result(State(store): State<Store>, UrlPath(id): UrlPath<String>, m
                             e.error = Some(msg.clone());
                             e.reencoded = None;
                             e.new_size = None;
+                            e.new_codec = None;
                         });
                         if let Some(j) = s.jobs.get_mut(job_id) {
                             j.status = "error".into();
@@ -5062,6 +5069,7 @@ async fn node_result(State(store): State<Store>, UrlPath(id): UrlPath<String>, m
                                                         e.error = Some(msg.clone());
                                                         e.reencoded = None;
                                                         e.new_size = None;
+                                                        e.new_codec = None;
                                                     });
                                                     if let Some(j) = s.jobs.get_mut(&job_id) {
                                                         j.status = "error".into();
@@ -5093,6 +5101,7 @@ async fn node_result(State(store): State<Store>, UrlPath(id): UrlPath<String>, m
                                             e.error = Some(msg.clone());
                                             e.reencoded = None;
                                             e.new_size = None;
+                                            e.new_codec = None;
                                         });
                                         if let Some(j) = s.jobs.get_mut(&job_id) {
                                             j.status = "error".into();
@@ -5152,11 +5161,16 @@ async fn node_result(State(store): State<Store>, UrlPath(id): UrlPath<String>, m
                             replaced = true;
                             {
                                 let mut s = store.lock().unwrap();
+                                let eff = s
+                                    .jobs
+                                    .get(&job_id)
+                                    .map(|j| j.effective_video_codec.clone());
                                 s.update_library_entry(lp, |e| {
                                     e.status = "done".into();
                                     // The finished file now lives at the SOURCE path.
                                     e.reencoded = Some(src_name.clone());
                                     e.new_size = Some(size);
+                                    e.new_codec = eff;
                                     e.error = None;
                                 });
                             }
@@ -5188,10 +5202,15 @@ async fn node_result(State(store): State<Store>, UrlPath(id): UrlPath<String>, m
                 if !replaced {
                     {
                         let mut s = store.lock().unwrap();
+                        let eff = s
+                            .jobs
+                            .get(&job_id)
+                            .map(|j| j.effective_video_codec.clone());
                         s.update_library_entry(lp, |e| {
                             e.status = "done".into();
                             e.reencoded = Some(out_name.clone());
                             e.new_size = Some(size);
+                            e.new_codec = eff;
                             e.error = None;
                         });
                     }
