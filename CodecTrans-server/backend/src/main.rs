@@ -1812,15 +1812,21 @@ async fn decode_health_check(path: &str, duration: f64, depths: &[(String, u32)]
     if duration <= 0.0 {
         return false;
     }
+    // Absolute cap for spot-check windows: the point is to exercise the
+    // decode pipeline, not to watch the movie. Without it a 10% window on
+    // a 3-hour file means 18 minutes of CPU decoding per file and the scan
+    // crawls. "all" mode (explicit full-file verification) stays uncapped.
+    const MAX_WINDOW_S: f64 = 15.0;
     let mut windows: Vec<(f64, f64)> = Vec::new(); // (seek, len)
     for (m, pct) in depths {
-        let win = duration * ((*pct as f64) / 100.0);
+        let pct_win = duration * ((*pct as f64) / 100.0);
         match m.as_str() {
             "all" => {
                 windows = vec![(0.0, duration)];
                 break;
             }
             "random" => {
+                let win = pct_win.min(MAX_WINDOW_S);
                 windows.push((0.0, win));
                 if duration > 2.0 * win {
                     // Random window inside the remainder — re-seeded per
@@ -1838,7 +1844,7 @@ async fn decode_health_check(path: &str, duration: f64, depths: &[(String, u32)]
                     windows.push((duration - win, win));
                 }
             }
-            _ => windows.push((0.0, win)), // "front"
+            _ => windows.push((0.0, pct_win.min(MAX_WINDOW_S))), // "front"
         }
     }
     if windows.is_empty() {
@@ -1857,8 +1863,15 @@ async fn decode_health_check(path: &str, duration: f64, depths: &[(String, u32)]
         merged.push((s, l));
     }
     for (seek, len) in merged {
-        // Full-file decodes get a long leash; window decodes are short.
-        let timeout_s = if len >= duration - 0.5 { 3600 } else { 600 };
+        // Timeouts scale with the decode length: ~8x realtime (slow-CPU
+        // software decode), clamped. Window decodes max out at 15 min; a
+        // full-file "all" decode at 1 hour.
+        let scaled = (len * 8.0) as u64;
+        let timeout_s = if len >= duration - 0.5 {
+            scaled.clamp(30, 3600)
+        } else {
+            scaled.clamp(30, 900)
+        };
         if !decode_window_ok(path, seek, len, timeout_s).await {
             return false;
         }
@@ -3821,6 +3834,21 @@ async fn library_scan(State(store): State<Store>, Json(req): Json<ScanReq>) -> R
         let pending: Vec<(String, PathBuf, Option<f64>, bool)> = entries
             .iter()
             .filter(|e| e.status == "pending")
+            .filter(|e| {
+                // Disabled folders are index-only — their files never reach
+                // the graph evaluation, so the expensive decode check would
+                // be pure waste. (Unknown folder ids fall through to
+                // checked: they may be ad-hoc / to-be-restored.)
+                e.folder
+                    .as_deref()
+                    .map_or(true, |fid| {
+                        libcfg
+                            .folders
+                            .iter()
+                            .find(|f| f.id == fid)
+                            .map_or(true, |f| f.enabled)
+                    })
+            })
             .filter_map(|e| {
                 resolve_lib_source(&e.key(), &store)
                     .map(|p| (e.key(), p, e.duration, e.video_codec.is_some()))

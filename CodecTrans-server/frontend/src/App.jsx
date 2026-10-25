@@ -109,10 +109,10 @@ function nodeTitle(n) {
           return "이름 '" + (c.pattern || "∅") + "' 포함";
         case "srcHealth": {
           const m = c.healthMode || "front";
-          if (m === "all") return "헬스체크 · 전체";
+          if (m === "all") return "헬스체크 · 전체 (긴 영상은 오래 걸림)";
           if (m === "random")
-            return `헬스체크 · 무작위 ${c.healthValue ?? 10}% (앞+랜덤)`;
-          return `헬스체크 · 앞부분 ${c.healthValue ?? 10}%`;
+            return `헬스체크 · 무작위 ${c.healthValue ?? 10}% (앞+랜덤, 최대 15초)`;
+          return `헬스체크 · 앞부분 ${c.healthValue ?? 10}% (최대 15초)`;
         }
         case "nodeHasHw": {
           const cls =
