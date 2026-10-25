@@ -302,6 +302,10 @@ export default function App() {
   const [activeLogic, setActiveLogic] = useState("");
   const activeLogicRef = useRef("");
   const [logicName, setLogicName] = useState("");
+  // Unsaved canvas edits (explicit 💾 저장 button — no auto-save, so a
+  // careless drag can't clobber a saved logic).
+  const [logicDirty, setLogicDirty] = useState(false);
+  const logicDirtyRef = useRef(false);
   // node worker-settings modal (dashboard gear)
   const [nodeCfg, setNodeCfg] = useState(null);
   // server settings (settings tab) + fail quarantine (보관함 tab)
@@ -843,8 +847,20 @@ export default function App() {
   useEffect(() => {
     graphRef.current = graph;
   }, [graph]);
+  // Warn before leaving the page with unsaved logic edits.
+  useEffect(() => {
+    const h = (e) => {
+      if (logicDirtyRef.current) {
+        e.preventDefault();
+        e.returnValue = "";
+      }
+    };
+    window.addEventListener("beforeunload", h);
+    return () => window.removeEventListener("beforeunload", h);
+  }, []);
   // Save the canvas as a NAMED logic (create when the id is still empty).
-  // Every edit auto-saves — same behavior as before the rename.
+  // Edits are STAGED ONLY — nothing hits the server until the 💾 저장
+  // button is pressed (accidental drags/changes stay local).
   // Name/graph are read from REFS: selectLogic mutates the refs synchronously
   // while setLogicName/setGraph are still async — a stale render closure must
   // never clobber a just-loaded logic with the blank-canvas defaults.
@@ -852,8 +868,17 @@ export default function App() {
   const commitGraph = (g) => {
     setGraph(g);
     graphRef.current = g;
+    logicDirtyRef.current = true;
+    setLogicDirty(true);
+  };
+  const saveLogic = () => {
     const id = activeLogicRef.current;
-    const name = logicNameRef.current || logicName || "새 로직";
+    const name = (logicNameRef.current || logicName || "새 로직").trim();
+    if (!name) {
+      flashBlock("로직 이름을 먼저 입력하세요");
+      return;
+    }
+    const g = graphRef.current;
     api
       .logicsPost(id ? { id, name, graph: g } : { name, graph: g })
       .then((r) => {
@@ -862,6 +887,9 @@ export default function App() {
           setActiveLogic(r.logic.id);
         }
         if (r.logics) setLogics(r.logics);
+        logicDirtyRef.current = false;
+        setLogicDirty(false);
+        flashBlock(id ? "로직 저장됨" : "새 로직으로 저장됨");
       })
       .catch((err) => flashBlock(err.message));
   };
@@ -873,9 +901,18 @@ export default function App() {
           edges: g.edges,
         };
   // Switch the canvas to a saved named logic ("" = new blank one).
+  // Unsaved edits are discarded on switch — guarded by a confirm.
   const selectLogic = (id, list = logics) => {
+    if (logicDirtyRef.current && id !== activeLogicRef.current) {
+      const ok = window.confirm(
+        "저장되지 않은 변경이 있습니다.\n다른 로직으로 전환하면 이 변경은 사라집니다. 계속할까요?"
+      );
+      if (!ok) return;
+    }
     activeLogicRef.current = id;
     setActiveLogic(id);
+    logicDirtyRef.current = false;
+    setLogicDirty(false);
     const l = list.find((x) => x.id === id);
     let g;
     if (l) {
@@ -895,7 +932,8 @@ export default function App() {
   const patchLogicName = (name) => {
     logicNameRef.current = name;
     setLogicName(name);
-    commitGraph(graphRef.current);
+    logicDirtyRef.current = true;
+    setLogicDirty(true);
   };
   const deleteLogic = () => {
     const id = activeLogicRef.current;
@@ -2464,11 +2502,23 @@ export default function App() {
                 value={logicName}
                 placeholder="로직 이름"
                 onChange={(e) => patchLogicName(e.target.value)}
-                title="로직 이름 — 수정하면 즉시 저장"
+                title="로직 이름 — 저장 버튼으로 함께 적용됩니다"
               />
               <button onClick={() => selectLogic("")} disabled={!activeLogic} title="빈 캔버스로 새 로직 만들기">
                 새 로직
               </button>
+              <button
+                className={"savebtn" + (logicDirty ? " save-dirty" : "")}
+                onClick={saveLogic}
+                title="현재 캔버스(노드·와이어·이름)를 이 로직으로 저장 — 저장 전에는 서버에 반영되지 않습니다"
+              >
+                💾 저장{logicDirty ? " *" : ""}
+              </button>
+              {logicDirty && (
+                <span className="meta dim" style={{ color: "#e6b455" }}>
+                  변경사항 미저장
+                </span>
+              )}
               <button
                 className="rm-del"
                 onClick={deleteLogic}

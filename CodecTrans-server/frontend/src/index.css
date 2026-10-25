@@ -1101,6 +1101,25 @@ button:disabled {
   margin: 10px 0 8px;
   flex-wrap: wrap;
 }
+/* explicit logic-save button (no auto-save) */
+.savebtn {
+  font-weight: 700;
+  color: #eaf2ff;
+  background: linear-gradient(180deg, #2b6cb0, #245a94);
+  border: 1px solid #3b82c4;
+  border-radius: 8px;
+  padding: 6px 14px;
+  cursor: pointer;
+  white-space: nowrap;
+}
+.savebtn:hover {
+  filter: brightness(1.12);
+}
+.savebtn.save-dirty {
+  background: linear-gradient(180deg, #b7791f, #97621a);
+  border-color: #e6b455;
+  box-shadow: 0 0 0 2px rgba(230, 180, 85, 0.25);
+}
 .gcanvas {
   position: relative;
   height: 620px;
