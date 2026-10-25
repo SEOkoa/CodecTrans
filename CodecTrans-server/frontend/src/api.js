@@ -143,12 +143,18 @@ export const api = {
 
   // storage library (server scans a directory of videos, read-only)
   library: () => jfetch("/api/library"),
-  libraryScan: (root, limit) =>
+  libraryScan: (root, limit, folderId) =>
     jfetch("/api/library/scan", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ root: root || undefined, limit }),
+      body: JSON.stringify({
+        root: root || undefined,
+        limit,
+        folderId: folderId || undefined,
+      }),
     }),
+  // live (or last-run) library scan progress
+  scanProgress: () => jfetch("/api/library/scan/progress"),
   // library automation settings (persisted server-side; ad-hoc roots)
   autoGet: () => jfetch("/api/library/auto"),
   autoPost: (cfg) =>

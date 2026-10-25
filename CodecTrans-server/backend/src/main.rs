@@ -1535,8 +1535,8 @@ fn default_one() -> u32 {
 #[derive(Clone, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct Condition {
-    /// "always" | "srcCodec" | "sizeGt" | "sizeLt" | "bitrateGt" |
-    /// "bitrateLt" | "nodeHasHw" | "nameContains"
+    /// "always" | "srcCodec" | "sizeGt" | "sizeLt" | "heightGte" |
+    /// "bitrateGt" | "bitrateLt" | "nodeHasHw" | "nameContains"
     #[serde(default)]
     pub kind: String,
     /// srcCodec: source codec name to match (h264, hevc, av1, ...)
@@ -1949,6 +1949,52 @@ fn load_lib_cfg() -> LibraryConfig {
 /// so without this a concurrent scan's `persist_catalog` can commit a stale
 /// snapshot and silently delete logics/folders added in the meantime.
 static LIB_CFG_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Live progress of the running (or last finished) library scan — polled by
+/// the UI so a long scan shows "123/1500" instead of a silent spinner.
+#[derive(Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ScanState {
+    /// A scan is running right now.
+    active: bool,
+    /// Files probed so far (this run).
+    scanned: usize,
+    /// Total files to probe (known after the directory walk).
+    total: usize,
+    /// Unix ms when the current/last run started.
+    started_at: i64,
+    /// Human scope: "all enabled folders" | "folder: /path" | ad-hoc root.
+    scope: String,
+    /// Result of the last finished run (kept for the UI after it ends).
+    finished_queued: usize,
+    finished_skipped: usize,
+}
+
+static SCAN_STATE: std::sync::Mutex<ScanState> = std::sync::Mutex::new(ScanState {
+    active: false,
+    scanned: 0,
+    total: 0,
+    started_at: 0,
+    scope: String::new(),
+    finished_queued: 0,
+    finished_skipped: 0,
+});
+
+fn scan_scope_label(roots: &[(Option<String>, PathBuf)], libcfg: &LibraryConfig) -> String {
+    if roots.iter().any(|(f, _)| f.is_none()) {
+        return roots[0].1.display().to_string();
+    }
+    if roots.len() == 1 {
+        let fid = roots[0].0.clone().unwrap_or_default();
+        return libcfg
+            .folders
+            .iter()
+            .find(|f| f.id == fid)
+            .map(|f| format!("folder: {}", f.path))
+            .unwrap_or_else(|| "folder".into());
+    }
+    format!("{} enabled folders", roots.len())
+}
 
 fn save_lib_cfg(c: &LibraryConfig) -> std::io::Result<()> {
     std::fs::write(lib_cfg_path(), serde_json::to_string_pretty(c)?)
@@ -3083,6 +3129,10 @@ fn cond_matches(
         "srcCodec" => e.video_codec.as_deref() == c.codec.as_deref(),
         "sizeGt" => size_mb > c.value.unwrap_or(f64::INFINITY),
         "sizeLt" => size_mb < c.value.unwrap_or(f64::INFINITY),
+        // Height (세로) >= value: 720 (HD), 1080 (FHD), 1440 (QHD), 2160 (4K).
+        "heightGte" => {
+            e.height.map_or(false, |h| (h as f64) >= c.value.unwrap_or(f64::INFINITY))
+        }
         "bitrateGt" => br_mbps.unwrap_or(f64::NEG_INFINITY) > c.value.unwrap_or(f64::INFINITY),
         "bitrateLt" => br_mbps.unwrap_or(f64::INFINITY) < c.value.unwrap_or(f64::INFINITY),
         "nodeHasHw" => online.iter().any(|n| {
@@ -3395,7 +3445,10 @@ struct ScanReq {
     /// Storage root to scan. Optional — falls back to the previously set root,
     /// then the CT_STORAGE env var.
     root: Option<String>,
-    /// Max files to scan (default 500). Keeps large libraries responsive.
+    /// Scan a single registered folder by id (per-folder scan button).
+    /// Wins over "all enabled folders"; an explicit `root` wins over both.
+    folder_id: Option<String>,
+    /// Max files to scan (default 5000, hard cap 20000).
     limit: Option<usize>,
 }
 
@@ -3500,7 +3553,7 @@ fn sub_str_of(p: &std::path::Path) -> String {
 /// automation (logic blocks first, then the folder's default target).
 async fn library_scan(State(store): State<Store>, Json(req): Json<ScanReq>) -> Response {
     // Resolve roots: an explicit {root} wins (ad-hoc, no folder id);
-    // otherwise all enabled registered folders.
+    // then {folderId} (per-folder scan); otherwise all enabled folders.
     let libcfg = load_lib_cfg();
     let roots: Vec<(Option<String>, PathBuf)> =
         if let Some(r) = req.root.filter(|r| !r.trim().is_empty()) {
@@ -3514,6 +3567,25 @@ async fn library_scan(State(store): State<Store>, Json(req): Json<ScanReq>) -> R
                     .into_response();
             }
             vec![(None, p)]
+        } else if let Some(fid) = req.folder_id.filter(|s| !s.trim().is_empty()) {
+            let fid = fid.trim().to_string();
+            match libcfg
+                .folders
+                .iter()
+                .find(|f| f.id == fid)
+            {
+                Some(f) => vec![(Some(f.id.clone()), PathBuf::from(f.path.clone()))]
+                    .into_iter()
+                    .filter(|(_, p)| p.is_dir())
+                    .collect(),
+                None => {
+                    return (
+                        StatusCode::BAD_REQUEST,
+                        Json(json!({ "error": format!("registered folder not found: {fid}") })),
+                    )
+                        .into_response();
+                }
+            }
         } else {
             libcfg
                 .folders
@@ -3527,12 +3599,12 @@ async fn library_scan(State(store): State<Store>, Json(req): Json<ScanReq>) -> R
         return (
             StatusCode::BAD_REQUEST,
             Json(json!({
-                "error": "no folders registered — add a folder first (or pass {\"root\":\"/path/to/videos\"})"
+                "error": "no folders to scan — add a folder first (or pass {\"root\":\"/path/to/videos\"} / {\"folderId\":\"…\"})"
             })),
         )
             .into_response();
     }
-    let limit = req.limit.unwrap_or(500).max(1).min(5000);
+    let limit = req.limit.unwrap_or(5000).max(1).min(20000);
 
     // Re-encode outputs land NEXT TO their source inside the folder — a
     // naive rescan would discover them as new videos and re-encode them in
@@ -3550,21 +3622,22 @@ async fn library_scan(State(store): State<Store>, Json(req): Json<ScanReq>) -> R
         n
     };
 
-    // Walk each root (blocking, but cheap) and ffprobe each video.
-    let mut entries: Vec<LibraryEntry> = Vec::new();
-    for (fid, rootp) in &roots {
-        let rels = std::thread::scope(|sc| {
-            sc.spawn(|| {
-                let mut v: Vec<PathBuf> = Vec::new();
-                walk_videos(rootp, rootp, &mut v, limit);
-                v
-            })
-            .join()
-            .unwrap_or_default()
-        });
-        let rels: Vec<PathBuf> = rels
-            .into_iter()
-            .filter(|rel| {
+    // Walk ALL roots first (blocking, but cheap) so the total is known up
+    // front, then probe each video reporting progress to SCAN_STATE
+    // (polled by the UI via GET /api/library/scan/progress).
+    let plan: Vec<(Option<String>, PathBuf, PathBuf)> = {
+        let mut v: Vec<(Option<String>, PathBuf, PathBuf)> = Vec::new();
+        for (fid, rootp) in &roots {
+            let rels = std::thread::scope(|sc| {
+                sc.spawn(|| {
+                    let mut w: Vec<PathBuf> = Vec::new();
+                    walk_videos(rootp, rootp, &mut w, limit);
+                    w
+                })
+                .join()
+                .unwrap_or_default()
+            });
+            for rel in rels {
                 let fname = rel.file_name().and_then(|x| x.to_str()).unwrap_or("");
                 if out_names.contains(fname) {
                     // A replace-original source KEEPS its own name (the
@@ -3574,40 +3647,54 @@ async fn library_scan(State(store): State<Store>, Json(req): Json<ScanReq>) -> R
                         Some(f) => format!("{f}/{}", rel.to_string_lossy()),
                         None => rel.to_string_lossy().to_string(),
                     };
-                    return store.lock().unwrap().library.contains_key(&key);
+                    if !store.lock().unwrap().library.contains_key(&key) {
+                        continue;
+                    }
                 }
-                true
-            })
-            .collect();
-        for rel in &rels {
-            let full = rootp.join(rel);
-            let pstr = full.to_string_lossy().to_string();
-            let size = std::fs::metadata(&full).map(|m| m.len()).unwrap_or(0);
-            let ext = full.extension().and_then(|x| x.to_str()).unwrap_or("").to_string();
-            let info = probe_full(&pstr).await;
-            entries.push(LibraryEntry {
-                path: rel.to_string_lossy().to_string(),
-                name: full.file_name().and_then(|x| x.to_str()).unwrap_or("").to_string(),
-                size,
-                duration: info.duration,
-                video_codec: info.video_codec,
-                audio_codec: info.audio_codec,
-                container: info
-                    .container
-                    .clone()
-                    .or_else(|| if ext.is_empty() { None } else { Some(ext) }),
-                width: info.width,
-                height: info.height,
-                fps: info.fps,
-                video_bit_rate: info.video_bit_rate,
-                pix_fmt: info.pix_fmt,
-                folder: fid.clone(),
-                status: "pending".into(),
-                reencoded: None,
-                new_size: None,
-                error: None,
-            });
+                v.push((fid.clone(), rootp.clone(), rel));
+            }
         }
+        v
+    };
+    *SCAN_STATE.lock().unwrap() = ScanState {
+        active: true,
+        scanned: 0,
+        total: plan.len(),
+        started_at: now_ms(),
+        scope: scan_scope_label(&roots, &libcfg),
+        finished_queued: 0,
+        finished_skipped: 0,
+    };
+    let mut entries: Vec<LibraryEntry> = Vec::new();
+    for (fid, rootp, rel) in &plan {
+        let full = rootp.join(rel);
+        let pstr = full.to_string_lossy().to_string();
+        let size = std::fs::metadata(&full).map(|m| m.len()).unwrap_or(0);
+        let ext = full.extension().and_then(|x| x.to_str()).unwrap_or("").to_string();
+        let info = probe_full(&pstr).await;
+        entries.push(LibraryEntry {
+            path: rel.to_string_lossy().to_string(),
+            name: full.file_name().and_then(|x| x.to_str()).unwrap_or("").to_string(),
+            size,
+            duration: info.duration,
+            video_codec: info.video_codec,
+            audio_codec: info.audio_codec,
+            container: info
+                .container
+                .clone()
+                .or_else(|| if ext.is_empty() { None } else { Some(ext) }),
+            width: info.width,
+            height: info.height,
+            fps: info.fps,
+            video_bit_rate: info.video_bit_rate,
+            pix_fmt: info.pix_fmt,
+            folder: fid.clone(),
+            status: "pending".into(),
+            reencoded: None,
+            new_size: None,
+            error: None,
+        });
+        SCAN_STATE.lock().unwrap().scanned += 1;
     }
 
     // Carry-forward (read-only): a rescan must not reset files already
@@ -3644,6 +3731,10 @@ async fn library_scan(State(store): State<Store>, Json(req): Json<ScanReq>) -> R
         if let Some(o) = old.iter().find(|o| o.key() == key) {
             let keep = match o.status.as_str() {
                 "done" => true,
+                // Skipped files stay skipped across rescans (the skip list) —
+                // no re-evaluation, no re-queueing. The per-file ⟳ button or a
+                // manual requeue re-arms them when the user wants them back.
+                "skipped" => true,
                 "queued" | "running" | "dispatched" => live.contains(&key),
                 // "error" (and unknown) fall back to pending so a rescan
                 // retries the file.
@@ -3742,6 +3833,23 @@ async fn library_scan(State(store): State<Store>, Json(req): Json<ScanReq>) -> R
         if e.status != "pending" {
             continue;
         }
+        // Non-video gate — camera thumbnails (single-frame mjpeg in a .mp4
+        // shell, jpeg_pipe container, no duration) and other non-video files
+        // are catalogued but NEVER queued for processing.
+        let not_video = if e.video_codec.is_none() {
+            Some("no video stream".to_string())
+        } else if e.video_codec.as_deref() == Some("mjpeg") {
+            Some("still image (mjpeg)".to_string())
+        } else if e.duration.map_or(true, |d| d < 1.0) {
+            Some("no real duration (<1s)".to_string())
+        } else {
+            None
+        };
+        if let Some(reason) = not_video {
+            e.status = "notvideo".into();
+            e.error = Some(format!("비영상 — {reason}"));
+            continue;
+        }
         let folder = libcfg
             .folders
             .iter()
@@ -3809,6 +3917,9 @@ async fn library_scan(State(store): State<Store>, Json(req): Json<ScanReq>) -> R
             match dec {
                 GraphDecision::Skip => {
                     e.status = "skipped".into();
+                    // Skip list: remember WHY (shown in the library sheet).
+                    // Skipped entries survive rescans — re-arm with ⟳.
+                    e.error = Some("자동 스킵 — 로직/폴더 설정에 따라 처리하지 않음 (⟳으로 재큐잉)".into());
                     skipped.push(e.key());
                 }
                 GraphDecision::FailToFolder => {
@@ -3876,14 +3987,31 @@ async fn library_scan(State(store): State<Store>, Json(req): Json<ScanReq>) -> R
         s.set_library(v.clone());
         v
     };
+    let scanned = entries.len();
+    // Mark the scan finished (the UI keeps showing the last-run summary).
+    {
+        let mut st = SCAN_STATE.lock().unwrap();
+        st.active = false;
+        st.scanned = scanned;
+        st.total = scanned;
+        st.finished_queued = queued.len();
+        st.finished_skipped = skipped.len();
+    }
     persist_catalog(&store);
     Json(json!({
         "count": all.len(),
+        "scanned": scanned,
         "queued": queued,
         "skipped": skipped,
         "entries": all,
     }))
     .into_response()
+}
+
+/// GET /api/library/scan/progress — live (or last-run) scan progress.
+async fn scan_progress(State(_store): State<Store>) -> impl IntoResponse {
+    let st = SCAN_STATE.lock().unwrap().clone();
+    Json(serde_json::to_value(st).unwrap())
 }
 
 #[derive(serde::Deserialize)]
@@ -5161,6 +5289,7 @@ async fn main() {
         .route("/api/codecs", get(codecs))
         .route("/api/library", get(library_get))
         .route("/api/library/scan", post(library_scan))
+        .route("/api/library/scan/progress", get(scan_progress))
         .route("/api/fs/children", get(fs_children))
         .route("/api/library/auto", get(auto_get).post(auto_post))
         .route("/api/library/folders", get(folders_get).post(folders_post))

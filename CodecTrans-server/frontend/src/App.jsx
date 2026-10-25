@@ -7,6 +7,7 @@ const STATUS_LABEL = {
   running: "Transcoding…",
   done: "Done",
   error: "Error",
+  notvideo: "비영상",
 };
 
 // Map an HW encoder name (h264_nvenc, hevc_vaapi, av1_qsv, …) to a short
@@ -94,6 +95,12 @@ function nodeTitle(n) {
           return "크기 > " + (c.value ?? "∅") + " MB";
         case "sizeLt":
           return "크기 < " + (c.value ?? "∅") + " MB";
+        case "heightGte": {
+          const v = c.value ?? "∅";
+          const tag =
+            v >= 2160 ? " (4K+)" : v >= 1440 ? " (QHD+)" : v >= 1080 ? " (FHD+)" : v >= 720 ? " (HD+)" : "";
+          return "세로 ≥ " + v + "px" + tag;
+        }
         case "bitrateGt":
           return "비트레이트 > " + (c.value ?? "∅") + " Mbps";
         case "bitrateLt":
@@ -592,17 +599,46 @@ export default function App() {
 
   // Scan all enabled registered folders (read-only); the server auto-queues
   // newly found videos per the saved automation (logic blocks first, then the
-  // folder default target).
-  async function doScan() {
+  // folder default target). With a folderId: scan only that registered
+  // folder (the per-folder 스캔 button).
+  const [scanProg, setScanProg] = useState(null); // live {active, scanned, total, scope}
+  const [scanFolder, setScanFolder] = useState(""); // "" = whole-library scan
+  const scanTimer = useRef(null);
+  const stopScanPoll = () => {
+    if (scanTimer.current) {
+      clearInterval(scanTimer.current);
+      scanTimer.current = null;
+    }
+  };
+  useEffect(() => () => stopScanPoll(), []);
+  async function doScan(folderId) {
     setScanning(true);
+    setScanFolder(folderId || "");
     setError("");
+    const poll = async () => {
+      try {
+        setScanProg(await api.scanProgress());
+      } catch (e) {
+        /* progress is best-effort */
+      }
+    };
+    stopScanPoll();
+    poll();
+    scanTimer.current = setInterval(poll, 800);
     try {
-      const l = await api.libraryScan();
+      const l = await api.libraryScan(folderId || undefined);
       setLibrary({ root: "", entries: l.entries || [] });
+      flashBlock(
+        l.queued?.length
+          ? `스캔 완료 — ${l.scanned ?? "?"}개 확인, 큐잉 ${l.queued.length}건`
+          : `스캔 완료 — ${l.scanned ?? "?"}개 확인`
+      );
     } catch (err) {
       setError(err.message);
     } finally {
+      stopScanPoll();
       setScanning(false);
+      setScanFolder("");
     }
   }
 
@@ -683,7 +719,11 @@ export default function App() {
   const visibleEntries = (() => {
     // a sheet for a removed folder falls back to "all"
     const base =
-      libSel === "all" || !selFolder
+      libSel === "skipped"
+        ? library.entries.filter((e) => e.status === "skipped")
+        : libSel === "notvideo"
+        ? library.entries.filter((e) => e.status === "notvideo")
+        : libSel === "all" || !selFolder
         ? library.entries
         : library.entries.filter((e) => e.folder === libSel);
     const { key, dir } = libSort;
@@ -1584,7 +1624,13 @@ export default function App() {
                 <div className="row">
                   <span className={`status ${j.status}`}>{STATUS_LABEL[j.status] || j.status}</span>
                   {j.accelerated && <span className="accel" title={`HW: ${j.effectiveVideoCodec}`}>⚡</span>}
-                  <span className="jname">{j.outputFile || j.inputFile}</span>
+                  <span
+                    className="jname"
+                    title={j.inputFile || j.outputFile}
+                  >
+                    {(j.inputFile || j.outputFile || "").split("/").pop() ||
+                      j.id.slice(0, 8)}
+                  </span>
                   {j.libPath && (
                     <span
                       className="chip c-av1"
@@ -1596,6 +1642,15 @@ export default function App() {
                   <span className="jmeta">
                     {j.executedBy} · {j.effectiveVideoCodec} → {j.container}
                     {j.outputSize != null ? ` · ${fmtSize(j.outputSize)}` : ""}
+                    {j.outputFile ? (
+                      <span
+                        className="jout"
+                        title={`결과 파일: ${j.outputFile}`}
+                      >
+                        {" → "}
+                        {j.outputFile.split("/").pop()}
+                      </span>
+                    ) : null}
                   </span>
                 </div>
                 {(j.status === "running" || j.status === "dispatched") && (
@@ -2030,11 +2085,39 @@ export default function App() {
             </div>
             <div className="search">
               <button
-                onClick={doScan}
+                onClick={() => doScan()}
                 disabled={scanning || !folders.some((f) => f.enabled)}
               >
                 {scanning ? "Scanning…" : "전체 다시 스캔"}
               </button>
+              {scanning && (
+                <span className="scanprog" title={`스캔 범위: ${scanProg?.scope || "…"}`}>
+                  <span className="scanprog-txt">
+                    {scanProg?.total
+                      ? `스캔 중… ${scanProg.scanned}/${scanProg.total}`
+                      : "스캔 준비…"}
+                    {scanProg?.scope ? ` · ${scanProg.scope}` : ""}
+                  </span>
+                  <span className="bar" style={{ flex: 1, height: 6 }}>
+                    <span
+                      className="fill"
+                      style={{
+                        width:
+                          scanProg?.total > 0
+                            ? `${Math.round((scanProg.scanned / scanProg.total) * 100)}%`
+                            : "0%",
+                      }}
+                    />
+                  </span>
+                </span>
+              )}
+              {!scanning && scanProg?.active === false && (
+                <span className="meta dim">
+                  마지막 스캔: {scanProg.scanned}개 확인
+                  {scanProg.finished_queued ? `, 큐잉 ${scanProg.finished_queued}` : ""}
+                  {scanProg.finished_skipped ? `, 스킵 ${scanProg.finished_skipped}` : ""}
+                </span>
+              )}
             </div>
             {/* library sheets — per-library tabs (전체 + each registered folder) */}
             <div className="libsheets">
@@ -2062,6 +2145,27 @@ export default function App() {
                   )}
                 </button>
               ))}
+              <span className="libsheets-sep" />
+              <button
+                className={`libsheet${libSel === "skipped" ? " on" : ""}`}
+                onClick={() => setLibSel("skipped")}
+                title="스킵 목록 — 로직/폴더 설정에 따라 처리하지 않고 건너뜀 (재스캔에도 유지, ⟳으로 재큐잉)"
+              >
+                ⏭ 스킵
+                <span className="cnt">
+                  {library.entries.filter((e) => e.status === "skipped").length}
+                </span>
+              </button>
+              <button
+                className={`libsheet${libSel === "notvideo" ? " on" : ""}`}
+                onClick={() => setLibSel("notvideo")}
+                title="비영상 목록 — 영상 스트림이 없거나 길이가 없는 파일 (썸네일 mjpeg 등). 절대 큐에 들어가지 않음"
+              >
+                🖼 비영상
+                <span className="cnt">
+                  {library.entries.filter((e) => e.status === "notvideo").length}
+                </span>
+              </button>
             </div>
             {/* the selected library's config row */}
             {selFolder && (
@@ -2368,17 +2472,26 @@ export default function App() {
                                 ? "failed"
                                 : e.status === "queued"
                                 ? "running"
+                                : e.status === "notvideo"
+                                ? "notvideo"
+                                : e.status === "skipped"
+                                ? "skipped"
                                 : ""
                             }`}
                             title={
-                              e.status === "error" || e.status === "failed"
+                              e.status === "error" ||
+                              e.status === "failed" ||
+                              e.status === "skipped" ||
+                              e.status === "notvideo"
                                 ? e.error
                                 : undefined
                             }
                           >
-                            {e.status}
+                            {e.status === "notvideo" ? "비영상" : e.status}
                           </span>
-                          {(e.status === "done" || e.status === "error") && (
+                          {(e.status === "done" ||
+                            e.status === "error" ||
+                            e.status === "skipped") && (
                             <button
                               className="mini"
                               title="재인코딩 — 다시 큐에 넣기"
@@ -2453,6 +2566,14 @@ export default function App() {
                       {logics.find((l) => l.id === f.logicId)?.name || "로직"}
                     </span>
                   )}
+                  <button
+                    className="mini"
+                    title="이 폴더만 스캔 — 새 영상은 로직/인코딩 설정대로 큐잉"
+                    disabled={scanning}
+                    onClick={() => doScan(f.id)}
+                  >
+                    {scanning && scanFolder === f.id ? "스캔 중…" : "스캔"}
+                  </button>
                   <button
                     className="rm-del"
                     title="폴더 제거"
@@ -2553,6 +2674,10 @@ export default function App() {
                 <Pal kind="cond" preset={{ kind: "sizeLt" }}>
                   파일 크기 &lt;
                   <span>MB 단위로</span>
+                </Pal>
+                <Pal kind="cond" preset={{ kind: "heightGte", value: 1080 }}>
+                  해상도 세로 ≥
+                  <span>720(HD) / 1080(FHD) / 1440(QHD) / 2160(4K)</span>
                 </Pal>
                 <Pal kind="cond" preset={{ kind: "bitrateGt" }}>
                   원본 비트레이트 &gt;
@@ -2717,6 +2842,7 @@ export default function App() {
                                 <option value="srcCodec">원본 코덱 =</option>
                                 <option value="sizeGt">파일 크기 &gt;</option>
                                 <option value="sizeLt">파일 크기 &lt;</option>
+                                <option value="heightGte">해상도 세로 ≥</option>
                                 <option value="bitrateGt">원본 비트레이트 &gt;</option>
                                 <option value="bitrateLt">원본 비트레이트 &lt;</option>
                                 <option value="nameContains">이름에 포함</option>
@@ -2803,6 +2929,50 @@ export default function App() {
                                   />
                                   MB
                                 </span>
+                              )}
+                              {n.condition?.kind === "heightGte" && (
+                                <>
+                                  <select
+                                    value={
+                                      [720, 1080, 1440, 2160].includes(
+                                        Number(n.condition?.value)
+                                      )
+                                        ? String(n.condition?.value)
+                                        : ""
+                                    }
+                                    onChange={(e) =>
+                                      e.target.value &&
+                                      patchCond(n.id, {
+                                        value: Number(e.target.value),
+                                      })
+                                    }
+                                    title="세로 해상도 기준 (1080+ = 1080px 이상)"
+                                  >
+                                    <option value="">직접 입력…</option>
+                                    <option value="720">720 (HD 이상)</option>
+                                    <option value="1080">1080 (FHD 이상)</option>
+                                    <option value="1440">1440 (QHD 이상)</option>
+                                    <option value="2160">2160 (4K 이상)</option>
+                                  </select>
+                                  <span className="lunit">
+                                    <input
+                                      type="number"
+                                      className="num"
+                                      min="100"
+                                      step="10"
+                                      value={n.condition?.value ?? ""}
+                                      onChange={(e) =>
+                                        patchCond(n.id, {
+                                          value:
+                                            e.target.value === ""
+                                              ? null
+                                              : Number(e.target.value),
+                                        })
+                                      }
+                                    />
+                                    px
+                                  </span>
+                                </>
                               )}
                               {(n.condition?.kind === "bitrateGt" ||
                                 n.condition?.kind === "bitrateLt") && (
