@@ -1986,3 +1986,16 @@ button.mini.bad:hover {
   color: var(--muted);
   font-size: 0.92em;
 }
+
+/* ── logic canvas: live HW-capability warning on hwOnly encode nodes ── */
+.warnchip {
+  margin-top: 6px;
+  display: inline-block;
+  font-size: 11px;
+  padding: 3px 8px;
+  border-radius: 10px;
+  color: #ffb4a2;
+  background: rgba(160, 40, 20, 0.35);
+  border: 1px solid #7e2a18;
+  cursor: help;
+}

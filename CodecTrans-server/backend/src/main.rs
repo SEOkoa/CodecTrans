@@ -3024,7 +3024,12 @@ async fn dispatch_lib_job(
                         .iter()
                         .any(|n| usable_hw_encoders(n).iter().any(|h| codec_family(h) == family));
                     if !any_capable {
-                        return Err("HW only: no online node has a hardware encoder for this codec".into());
+                        let names: Vec<String> =
+                            online.iter().map(|n| n.display().to_string()).collect();
+                        return Err(format!(
+                            "HW only: no online node has a hardware {family} encoder (online: {}). Turn HW-only off for a software fallback, or use a codec the nodes can accelerate in hardware",
+                            if names.is_empty() { "none".to_string() } else { names.join(", ") }
+                        ));
                     }
                     online.iter().position(|n| {
                         counts.get(&n.id).copied().unwrap_or(0) < n.max_jobs
@@ -3040,7 +3045,10 @@ async fn dispatch_lib_job(
             };
             let (effective, accelerated) = resolve_video_codec(&vcodec, &usable_hw_encoders(&node));
             if hw_only && !accelerated {
-                return Err("HW only: no hardware encoder available for this codec".into());
+                return Err(format!(
+                    "HW only: node {} has no hardware {family} encoder",
+                    node.display()
+                ));
             }
             let fk = e.folder.as_deref().map(|k| format!("{k}/"));
             let dev_load = active_jobs_by_node_dev(store, fk.as_deref(), &node.id);
@@ -3061,7 +3069,20 @@ async fn dispatch_lib_job(
                     })
                 });
                 if !any_hw {
-                    return Err("HW only: no online node has a hardware encoder for this target".into());
+                    let cnames: Vec<String> = online
+                        .iter()
+                        .map(|n| n.display().to_string())
+                        .collect();
+                    let codecs: Vec<String> = t
+                        .choices
+                        .iter()
+                        .map(|ch| codec_family(ch.video_codec.as_deref().unwrap_or("h264")))
+                        .collect();
+                    return Err(format!(
+                        "HW only: no online node can hardware-encode {} (online: {}). Turn HW-only off for a software fallback, or pick a codec the nodes support in hardware",
+                        codecs.join("/"),
+                        if cnames.is_empty() { "none".to_string() } else { cnames.join(", ") }
+                    ));
                 }
             }
             let (node_id, node_name, effective, accelerated, gpu_device, eff) =

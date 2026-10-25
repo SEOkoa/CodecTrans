@@ -3088,19 +3088,59 @@ export default function App() {
                                 <option value="requeue">⬇ 큐로 되돌리기</option>
                               </select>
                               {n.action?.kind === "encode" && (
-                                <label
-                                  className="postenc-opt"
-                                  title="HW 가속으로 이 코덱을 할 수 없는 노드는 아예 받지 않음 — 소프트웨어 폴백도 없음. 온라인 노드 중 가능한 곳이 없으면 파일은 에러로 표시 (노드가 올라오면 재스캔으로 재시도)"
-                                >
-                                  <input
-                                    type="checkbox"
-                                    checked={!!n.action?.hwOnly}
-                                    onChange={(e) =>
-                                      patchAct(n.id, { hwOnly: e.target.checked })
-                                    }
-                                  />
-                                  ⚡ HW 전용 (비지원 노드에 안 보냄)
-                                </label>
+                                <>
+                                  <label
+                                    className="postenc-opt"
+                                    title="HW 가속으로 이 코덱을 할 수 없는 노드는 아예 받지 않음 — 소프트웨어 폴백도 없음. 온라인 노드 중 가능한 곳이 없으면 파일은 에러로 표시 (노드가 올라오면 재스캔으로 재시도)"
+                                  >
+                                    <input
+                                      type="checkbox"
+                                      checked={!!n.action?.hwOnly}
+                                      onChange={(e) =>
+                                        patchAct(n.id, { hwOnly: e.target.checked })
+                                      }
+                                    />
+                                    ⚡ HW 전용 (비지원 노드에 안 보냄)
+                                  </label>
+                                  {n.action?.hwOnly &&
+                                    (() => {
+                                      const a = n.action || {};
+                                      const codecs = a.target?.videoCodec
+                                        ? [a.target.videoCodec]
+                                        : (a.choices || [])
+                                            .map((c) => c.videoCodec)
+                                            .filter(Boolean);
+                                      if (!codecs.length) return null; // 폴더 기본 — 코덱 불명
+                                      const online = nodes.filter(
+                                        (x) => x.status === "online",
+                                      );
+                                      const missing = [
+                                        ...new Set(codecs.map(codecFamily)),
+                                      ].filter(
+                                        (fam) =>
+                                          !online.some((x) =>
+                                            (x.hwEncoders || []).some(
+                                              (h) => codecFamily(h) === fam,
+                                            ),
+                                          ),
+                                      );
+                                      if (!missing.length) return null;
+                                      return (
+                                        <div
+                                          className="warnchip"
+                                          title={`온라인 노드: ${
+                                            online.map((x) => x.name).join(", ") ||
+                                            "없음"
+                                          }\n${missing.join(
+                                            "/",
+                                          )} 하드웨어 인코더를 가진 노드가 없습니다 — 이 갈래로 온 파일은 에러 처리됩니다.\n⚡ HW 전용을 해제하면 소프트웨어 인코딩(느림)으로 진행합니다.`}
+                                        >
+                                          ⚠ {missing.join("/")} HW 인코더 노드
+                                          없음 — 에러 처리됩니다
+                                        </div>
+                                      );
+                                    })()}
+                                </>
                               )}
                               {n.action?.kind === "failToFolder" && (
                                 <div className="phint">
