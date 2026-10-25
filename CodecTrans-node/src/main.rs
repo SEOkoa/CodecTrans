@@ -332,23 +332,60 @@ fn enumerate_gpus() -> Vec<GpuDev> {
     let mut out: Vec<GpuDev> = Vec::new();
 
     // --- NVIDIA (discrete GPUs) ---
+    // Headless containers (QNAP) pass /dev/nvidia* but ship no nvidia-smi
+    // on PATH — fall back to the bundled userland series, each probed with
+    // its own libs (a version-skewed nvidia-smi fails with a driver
+    // mismatch and prints errors that must NOT be parsed as GPUs).
     let mut nvidia_devs: Vec<(u32, String)> = Vec::new();
-    if let Ok(o) = std::process::Command::new("nvidia-smi")
-        .args(["--query-gpu=index,name", "--format=csv,noheader"])
-        .output()
-    {
-        for line in String::from_utf8_lossy(&o.stdout).lines() {
-            let t = line.trim();
-            if t.is_empty() {
-                continue;
+    let smi_bins: Vec<(String, Option<String>)> = {
+        let mut v = vec![(String::from("nvidia-smi"), None)];
+        if let Ok(rd) = std::fs::read_dir("/opt/nvidia-userland") {
+            let mut series: Vec<String> = rd
+                .filter_map(|e| e.ok())
+                .map(|e| e.file_name().to_string_lossy().to_string())
+                .filter(|s| !s.is_empty() && s.chars().all(|c| c.is_ascii_digit()))
+                .collect();
+            series.sort();
+            for s in series {
+                v.push((
+                    format!("/opt/nvidia-userland/{s}/bin/nvidia-smi"),
+                    Some(format!("/opt/nvidia-userland/{s}/lib")),
+                ));
             }
-            let mut parts = t.splitn(2, ',');
-            let idx = parts
-                .next()
-                .and_then(|s| s.trim().parse::<u32>().ok())
-                .unwrap_or(out.len() as u32);
-            let name = parts.next().map(|s| s.trim().to_string()).unwrap_or_else(|| "NVIDIA GPU".into());
-            nvidia_devs.push((idx, name));
+        }
+        v
+    };
+    for (bin, lib) in &smi_bins {
+        let mut cmd = std::process::Command::new(bin);
+        if let Some(l) = lib {
+            cmd.env("LD_LIBRARY_PATH", l);
+        }
+        if let Ok(o) = cmd
+            .args(["--query-gpu=index,name", "--format=csv,noheader"])
+            .output()
+        {
+            for line in String::from_utf8_lossy(&o.stdout).lines() {
+                let t = line.trim();
+                if t.is_empty() {
+                    continue;
+                }
+                let mut parts = t.splitn(2, ',');
+                // Only well-formed "index, name" lines count — error
+                // output (mismatch, init failure) has no numeric index.
+                let idx = match parts.next().and_then(|s| s.trim().parse::<u32>().ok()) {
+                    Some(i) => i,
+                    None => continue,
+                };
+                let name = parts
+                    .next()
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or_else(|| "NVIDIA GPU".into());
+                nvidia_devs.push((idx, name));
+            }
+            if !nvidia_devs.is_empty() {
+                break;
+            }
         }
     }
 

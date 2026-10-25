@@ -220,6 +220,18 @@ header h1 {
   .est {
     overflow-wrap: anywhere;
   }
+  /* Stat cards: a 1fr track grows to its item's min-content (e.g. the
+     unbreakable "6.1.1-3ubuntu5" in the FFMPEG value) — force 0 min so
+     the value wraps inside the card instead of widening the grid. */
+  .statgrid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+  .stat {
+    min-width: 0;
+  }
+  .stat-val {
+    overflow-wrap: anywhere;
+  }
   /* Safety net: leftover horizontal overflow is clipped — the data tables
      have their own internal scroll (.libtable overflow-x:auto). */
   body {
