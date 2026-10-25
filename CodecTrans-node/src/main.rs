@@ -141,6 +141,38 @@ fn out_dir() -> PathBuf {
     let _ = std::fs::create_dir_all(&d);
     d
 }
+
+/// CT_PATH_MAP: comma-separated `from:to` prefix pairs remapping the
+/// server's source paths onto this host's filesystem. The server reports
+/// paths from ITS mounts (e.g. /media/Volume2/AV/x.mp4); the same tree can
+/// live elsewhere here — an NFS mount at ~/nfs (macOS: /media is
+/// unwritable on the sealed root) or /mnt/ctfs on a box. Example:
+///   CT_PATH_MAP=/media:/Users/<user>/nfs
+///   CT_PATH_MAP=/media:/mnt/ctfs
+/// First matching prefix wins; unmatched paths pass through unchanged.
+fn map_path(p: &str) -> String {
+    let map = std::env::var("CT_PATH_MAP").unwrap_or_default();
+    for pair in map.split(',') {
+        let pair = pair.trim();
+        if pair.is_empty() {
+            continue;
+        }
+        if let Some((from, to)) = pair.split_once(':') {
+            let from = from.trim_end_matches('/');
+            let to = to.trim().trim_end_matches('/');
+            if from.is_empty() || to.is_empty() {
+                continue;
+            }
+            if p == from {
+                return to.to_string();
+            }
+            if let Some(rest) = p.strip_prefix(&format!("{from}/")) {
+                return format!("{to}/{rest}");
+            }
+        }
+    }
+    p.to_string()
+}
 fn now_ms() -> i64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_millis() as i64).unwrap_or(0)
 }
@@ -1265,7 +1297,15 @@ async fn run_job(client: reqwest::Client, state: NState, server: String, node_id
     let local_in = job
         .local_input
         .as_deref()
-        .and_then(|p| std::path::Path::new(p).is_file().then(|| std::path::PathBuf::from(p)));
+        .and_then(|p| {
+            // Map the server-side path onto this host (CT_PATH_MAP) before
+            // probing — on NFS-backed nodes the media tree sits at a
+            // different absolute location than on the server.
+            let mapped = map_path(p);
+            std::path::Path::new(&mapped)
+                .is_file()
+                .then(|| std::path::PathBuf::from(mapped))
+        });
     let skip_download = local_in.is_some();
     let in_path = local_in.unwrap_or_else(|| in_dir().join(&job.input_file));
     let out_path = out_dir().join(&job.output_file);
