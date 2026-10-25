@@ -2007,6 +2007,17 @@ export default function App() {
                       {j.container}
                     </span>
                     {live && <span className="prog-pct">{pct}%</span>}
+                    <button
+                      className="mini"
+                      title={
+                        live
+                          ? "인코딩 중지 — 노드가 10초 안에 ffmpeg를 종료합니다"
+                          : "큐에서 제거"
+                      }
+                      onClick={() => api.jobCancel(j.id).catch(() => {})}
+                    >
+                      ✕
+                    </button>
                   </div>
                   {live && (
                     <div className="bar" style={{ height: 5 }}>

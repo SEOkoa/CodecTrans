@@ -1487,12 +1487,40 @@ async fn run_job(client: reqwest::Client, state: NState, server: String, node_id
         // ffmpeg writes progress with '\r' (same-line overwrite), not '\n'.
         // Line-based reading lumps every update into one line at the end ->
         // progress stuck at 0. Read in chunks, split on both '\r' and '\n'.
+        let mut cancelled = false;
         if let Some(mut s) = child.stderr.take() {
             let mut buf = [0u8; 8192];
             let mut pending = String::new();
             let mut last_report = 0.0f64;
+            // Heartbeat ticker: the server's cancel signal reaches the node
+            // on the next report — cap that latency at 10s instead of
+            // waiting for the next 5% progress step of a long encode.
+            let mut ticker = tokio::time::interval(std::time::Duration::from_secs(10));
+            ticker.tick().await; // first tick completes immediately
             loop {
-                let n = match s.read(&mut buf).await {
+                let read_res: std::io::Result<usize> = tokio::select! {
+                    n = s.read(&mut buf) => n,
+                    _ = ticker.tick() => {
+                        let hb = client
+                            .post(format!("{}/api/nodes/{}/report", server, node_id))
+                            .json(&json!({"jobId": job.id, "status": "running", "progress": last_report}))
+                            .send()
+                            .await;
+                        if let Ok(r) = hb {
+                            if let Ok(v) = r.json::<serde_json::Value>().await {
+                                if v.get("cancel").and_then(|c| c.as_bool()) == Some(true) {
+                                    eprintln!("[node] {} — cancel requested, killing ffmpeg", job.id);
+                                    let _ = child.kill().await;
+                                    cancelled = true;
+                                    last_err = Some("사용자 취소 — 중지됨".into());
+                                    break;
+                                }
+                            }
+                        }
+                        continue;
+                    }
+                };
+                let n = match read_res {
                     Ok(0) => break,
                     Ok(n) => n,
                     Err(_) => break,
@@ -1551,6 +1579,12 @@ async fn run_job(client: reqwest::Client, state: NState, server: String, node_id
                     last_err = Some(pending.trim().to_string());
                 }
             }
+        }
+        if cancelled {
+            // User stopped this attempt: no SW retry, no upload — just
+            // confirm the stop so the server re-arms the entry as pending.
+            let _ = child.wait().await;
+            break;
         }
         ok = child.wait().await.map(|s| s.success()).unwrap_or(false);
         if ok {

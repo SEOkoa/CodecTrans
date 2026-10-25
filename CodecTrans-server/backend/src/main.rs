@@ -1483,8 +1483,8 @@ pub struct TargetCfg {
     #[serde(default)]
     pub verify_output: bool,
     /// Replace the original: the finished file takes the source's path and
-    /// the original is kept next to it as `name.orig.ext`. Library jobs only.
-    /// (A second replace overwrites the previous `.orig` backup.)
+    /// the original is DELETED — full replace, no backup, so the disk space
+    /// actually shrinks. Library jobs only.
     #[serde(default)]
     pub replace_original: bool,
 }
@@ -1745,8 +1745,8 @@ pub enum PostOp {
         #[serde(default)]
         on_failure: Option<String>,
     },
-    /// The finished file takes the SOURCE path; the original is kept as
-    /// `stem.orig.ext` (tombstoned so rescans ignore it).
+    /// The finished file takes the SOURCE path; the original is deleted
+    /// (full replace, no backup — the space savings are real).
     Replace,
     /// Explicit "keep the output next to the source" step (already true
     /// for library jobs — makes it a visible node on the graph).
@@ -2021,24 +2021,57 @@ fn catalog_path() -> PathBuf {
 }
 
 fn load_catalog() -> Vec<LibraryEntry> {
-    std::fs::read_to_string(catalog_path())
+    let p = catalog_path();
+    if let Ok(s) = std::fs::read_to_string(&p) {
+        if let Ok(v) = serde_json::from_str::<Vec<LibraryEntry>>(&s) {
+            return v;
+        }
+        eprintln!("[CodecTrans] catalog.json is corrupt — trying catalog.json.bak");
+    }
+    std::fs::read_to_string(p.with_extension("json.bak"))
         .ok()
-        .and_then(|s| serde_json::from_str(&s).ok())
+        .and_then(|s| serde_json::from_str::<Vec<LibraryEntry>>(&s).ok())
         .unwrap_or_default()
 }
 
 /// Persist the in-memory catalog to disk and grow the re-encoded-name
-/// tombstone (see LibraryConfig::tombstone).
+/// tombstone (see LibraryConfig::tombstone). Atomic: serialize first (a
+/// serialize failure must NEVER truncate the live file), stage to a temp
+/// file, keep the previous generation as .bak, then rename over.
 fn persist_catalog(store: &Store) {
     let _g = LIB_CFG_LOCK.lock().unwrap_or_else(|p| p.into_inner());
     persist_catalog_locked(store);
 }
 fn persist_catalog_locked(store: &Store) {
     let entries = store.lock().unwrap().list_library();
-    let _ = std::fs::write(
-        catalog_path(),
-        serde_json::to_string(&entries).unwrap_or_default(),
-    );
+    let json = match serde_json::to_string(&entries) {
+        Ok(j) => j,
+        Err(e) => {
+            eprintln!("[CodecTrans] persist_catalog: serialize failed ({e}) — on-disk catalog untouched");
+            return;
+        }
+    };
+    let path = catalog_path();
+    let bak = path.with_extension("json.bak");
+    // Back up the current non-empty generation before overwriting it.
+    if let Ok(old) = std::fs::read(&path) {
+        if !old.is_empty() {
+            let _ = std::fs::write(&bak, &old);
+        }
+    }
+    let tmp = path.with_extension("json.tmp");
+    match std::fs::write(&tmp, json) {
+        Ok(()) => {
+            if std::fs::rename(&tmp, &path).is_err() {
+                let _ = std::fs::remove_file(&tmp);
+                eprintln!("[CodecTrans] persist_catalog: rename failed — on-disk catalog untouched");
+            }
+        }
+        Err(e) => {
+            let _ = std::fs::remove_file(&tmp);
+            eprintln!("[CodecTrans] persist_catalog: temp write failed ({e}) — on-disk catalog untouched");
+        }
+    }
     let mut c = load_lib_cfg();
     let mut seen: std::collections::HashSet<String> =
         c.tombstone.iter().cloned().collect();
@@ -3267,27 +3300,67 @@ fn eval_graph(
     }
     let mut visited: HashSet<usize> = HashSet::new();
 
-    // Post-encode chain: BFS over the encode's output port. Only enabled
-    // action nodes of the post kinds join the plan (in chain order);
-    // anything else (another primary action, a condition, the start) ends
-    // that branch — the graph stays linear after the encode.
+    // Post-encode chain: walk the encode's output port. Enabled action
+    // nodes of the post kinds join the plan (in chain order). Condition
+    // nodes chained after the encode (e.g. a post-encode srcHealth gate
+    // before replace) are EVALUATED with the same health map used during
+    // the scan; the recursion then follows ONLY the matching branch port.
+    // Anything else (another primary action, the start) ends that branch.
     fn post_chain(
         i: usize,
         g: &WorkflowGraph,
         out: &[Vec<(usize, Option<String>)>],
         visited: &mut HashSet<usize>,
         plan: &mut Vec<PostOp>,
+        e: &LibraryEntry,
+        online: &[Node],
+        health: &std::collections::HashMap<String, bool>,
+        // Some(b): node i is a condition — only the branch matching `b`
+        // continues. None: i is the encode (or a post action) — plain chain.
+        branch: Option<bool>,
     ) {
         for (j, port) in out[i].iter().cloned() {
-            // branch ports don't exist on action nodes — ignore them
-            if matches!(port.as_deref(), Some("true") | Some("false")) {
+            let n = &g.nodes[j];
+            if !n.enabled {
+                continue;
+            }
+            if let Some(b) = branch {
+                // Node i is a condition: its outgoing edges carry the branch
+                // label — proceed only on the edge matching the evaluation.
+                let want = match port.as_deref() {
+                    Some("true") => b,
+                    Some("false") => !b,
+                    _ => false,
+                };
+                if !want {
+                    continue;
+                }
+            }
+            if n.kind == "condition" {
+                // Gate after the encode: evaluate it, then follow the
+                // matching branch (condition-of-condition unsupported —
+                // the post chain stays linear in depth).
+                if branch.is_some() {
+                    continue;
+                }
+                let r = cond_matches(&n.condition, e, online, health);
+                if visited.insert(j) {
+                    post_chain(j, g, out, visited, plan, e, online, health, Some(r));
+                }
+                continue;
+            }
+            if n.kind != "action" {
+                continue; // start / unknown — chain ends here
+            }
+            // From a non-condition root, an edge labeled with a branch port
+            // is not a plain continuation (actions don't expose true/false
+            // ports) — ignore it.
+            if branch.is_none()
+                && matches!(port.as_deref(), Some("true") | Some("false"))
+            {
                 continue;
             }
             if !visited.insert(j) {
-                continue;
-            }
-            let n = &g.nodes[j];
-            if n.kind != "action" || !n.enabled {
                 continue;
             }
             let op = match n.action.kind.as_str() {
@@ -3303,7 +3376,7 @@ fn eval_graph(
             };
             if let Some(o) = op {
                 plan.push(o);
-                post_chain(j, g, out, visited, plan);
+                post_chain(j, g, out, visited, plan, e, online, health, None);
             }
         }
     }
@@ -3337,7 +3410,7 @@ fn eval_graph(
                             .unwrap_or_else(|| folder_target.clone());
                         let hw_only = n.action.hw_only;
                         let mut plan = Vec::new();
-                        post_chain(i, g, out, visited, &mut plan);
+                        post_chain(i, g, out, visited, &mut plan, e, online, health, None);
                         Some(GraphDecision::Encode {
                             target: t,
                             post: plan,
@@ -3808,6 +3881,21 @@ async fn library_scan(State(store): State<Store>, Json(req): Json<ScanReq>) -> R
                 e.new_size = o.new_size;
                 e.new_codec = o.new_codec.clone();
                 e.error = o.error.clone();
+                if o.status == "done" {
+                    // A replaced finished file sits AT the source path — the
+                    // fresh probe would see the ENCODED file. Keep the
+                    // historical SOURCE probe so the "before → after"
+                    // delta (size/codec) survives rescans.
+                    e.size = o.size;
+                    e.duration = o.duration;
+                    e.video_codec = o.video_codec.clone();
+                    e.audio_codec = o.audio_codec.clone();
+                    e.width = o.width;
+                    e.height = o.height;
+                    e.fps = o.fps;
+                    e.video_bit_rate = o.video_bit_rate;
+                    e.pix_fmt = o.pix_fmt.clone();
+                }
             }
         }
     }
@@ -4297,19 +4385,45 @@ async fn get_job(State(store): State<Store>, UrlPath(id): UrlPath<String>) -> Re
 }
 
 /// DELETE /api/jobs/:id — cancel a QUEUED job (remove it from the in-memory
-/// queue before a node claims it). Running/dispatched jobs can't be safely
-/// stopped server-side; they finish or error out on their own.
+/// queue before a node claims it). Running/dispatched jobs are marked
+/// cancelled immediately; the executing node picks the flag on its next
+/// progress report (≤10s heartbeat) and kills ffmpeg.
 async fn cancel_job(State(store): State<Store>, UrlPath(id): UrlPath<String>) -> Response {
-    let st = store.lock().unwrap().get(&id).map(|j| j.status);
+    let (st, node_id) = {
+        let s = store.lock().unwrap();
+        let j = s.jobs.get(&id);
+        (
+            j.map(|j| j.status.clone()),
+            j.map(|j| j.executed_by.clone()),
+        )
+    };
     match st {
         None => (StatusCode::NOT_FOUND, Json(json!({"error": "job not found"}))).into_response(),
         Some(s) if s == "queued" => {
             store.lock().unwrap().remove(&id);
             Json(json!({"ok": true, "cancelled": id})).into_response()
         }
+        Some(s) if s == "dispatched" || s == "running" => {
+            // Mark cancelled NOW; the node picks the flag on its next
+            // progress report (≤10s heartbeat) and kills ffmpeg. The entry
+            // is re-armed to pending when the node confirms the stop.
+            {
+                let mut s = store.lock().unwrap();
+                if let Some(j) = s.jobs.get_mut(&id) {
+                    j.status = "cancelled".into();
+                    j.error = Some("사용자 취소 — 중지됨".into());
+                    j.finished_at = Some(now_ms());
+                }
+            }
+            if let Some(nid) = node_id {
+                let c = store.lock().unwrap().redis();
+                let _ = set_current_job(c, &nid, None).await;
+            }
+            Json(json!({"ok": true, "cancelled": id})).into_response()
+        }
         Some(s) => (
             StatusCode::CONFLICT,
-            Json(json!({"error": format!("job is {s}, only queued jobs can be cancelled")})),
+            Json(json!({"error": format!("job is {s}, only queued/running jobs can be cancelled")})),
         )
             .into_response(),
     }
@@ -4683,15 +4797,26 @@ struct ReportReq {
 /// POST /api/nodes/:id/report — a node reports job progress / completion.
 async fn node_report(State(store): State<Store>, UrlPath(id): UrlPath<String>, Json(req): Json<ReportReq>) -> Response {
     let req_error = req.error.clone();
+    let was_cancelled = store
+        .lock()
+        .unwrap()
+        .jobs
+        .get(&req.job_id)
+        .map(|j| j.status == "cancelled")
+        .unwrap_or(false);
     {
         let mut s = store.lock().unwrap();
         if let Some(j) = s.jobs.get_mut(&req.job_id) {
-            j.status = req.status.clone();
+            if !was_cancelled {
+                // A cancelled job keeps its status — the node's final
+                // "error" report is just the kill confirmation.
+                j.status = req.status.clone();
+                if let Some(e) = req.error {
+                    j.error = Some(e);
+                }
+            }
             if let Some(p) = req.progress {
                 j.progress = p.clamp(0.0, 1.0);
-            }
-            if let Some(e) = req.error {
-                j.error = Some(e);
             }
             if let Some(o) = req.output_file {
                 j.output_file = o;
@@ -4712,21 +4837,42 @@ async fn node_report(State(store): State<Store>, UrlPath(id): UrlPath<String>, J
         let _ = set_current_job(c, &id, None).await;
     }
     // Library-automation job failed → mark the entry so a rescan re-queues it.
+    // A user-cancelling stop re-arms the entry as plain pending instead.
     if req.status == "error" {
-        let lp = store.lock().unwrap().jobs.get(&req.job_id).and_then(|j| j.lib_path.clone());
+        let (lp, cancelled) = {
+            let s = store.lock().unwrap();
+            let j = s.jobs.get(&req.job_id);
+            (
+                j.and_then(|j| j.lib_path.clone()),
+                j.map(|j| j.status == "cancelled").unwrap_or(false),
+            )
+        };
         if let Some(lp) = lp {
             {
                 let mut s = store.lock().unwrap();
                 s.update_library_entry(&lp, |e| {
-                    e.status = "error".into();
-                    e.error = req_error;
+                    if cancelled {
+                        e.status = "pending".into();
+                        e.error = None;
+                    } else {
+                        e.status = "error".into();
+                        e.error = req_error;
+                    }
                 });
             }
             // (lock dropped — persist_catalog re-acquires it)
             persist_catalog(&store);
         }
     }
-    Json(json!({"ok": true})).into_response()
+    let cancel = was_cancelled
+        || store
+            .lock()
+            .unwrap()
+            .jobs
+            .get(&req.job_id)
+            .map(|j| j.status == "cancelled")
+            .unwrap_or(false);
+    Json(json!({"ok": true, "cancel": cancel})).into_response()
 }
 
 /// GET /api/nodes/:id/file/:name (or /*name for library subpaths) — a node
@@ -4916,7 +5062,16 @@ async fn node_result(State(store): State<Store>, UrlPath(id): UrlPath<String>, m
     }
     if !got_file {
         let _ = std::fs::remove_file(&tmp_path);
-        return (StatusCode::BAD_REQUEST, Json(json!({"error": "missing file"}))).into_response();
+        return (StatusCode::BAD_REQUEST, Json(json!({ "error": "missing file" }))).into_response();
+    }
+    // A cancelled job's upload must not materialize: the user stopped this
+    // attempt — discard the staged artifact and leave the catalog untouched.
+    {
+        let st = store.lock().unwrap().jobs.get(&job_id).map(|j| j.status.clone());
+        if st.as_deref() == Some("cancelled") {
+            let _ = std::fs::remove_file(&tmp_path);
+            return Json(json!({ "ok": true, "ignored": "cancelled" })).into_response();
+        }
     }
     let path = outputs_dir().join(&out_name);
     if let Err(e) = std::fs::rename(&tmp_path, &path) {
@@ -5120,42 +5275,32 @@ async fn node_result(State(store): State<Store>, UrlPath(id): UrlPath<String>, m
                             }
                         }
                         PostOp::Replace => {
-                            // Replace-the-original: keep the source as
-                            // `stem.orig.ext` (overwrites a previous
-                            // backup), then move the finished file onto
-                            // the source path.
-                            let stem = src.file_stem().and_then(|x| x.to_str()).unwrap_or("").to_string();
-                            let ext = src.extension().and_then(|x| x.to_str()).unwrap_or("").to_string();
-                            let backup = if ext.is_empty() {
-                                src.with_file_name(format!("{stem}.orig"))
-                            } else {
-                                src.with_file_name(format!("{stem}.orig.{ext}"))
-                            };
-                            let backup_name = backup.file_name().and_then(|x| x.to_str()).unwrap_or("").to_string();
-                            let b0 = std::fs::rename(&src, &backup).is_ok();
-                            let b1 = {
-                                let ok = std::fs::copy(&src, &backup).is_ok();
-                                if ok {
-                                    let _ = std::fs::remove_file(&src);
-                                }
-                                ok
-                            };
-                            if !(b0 || b1) {
-                                return fail(format!("could not back up original ({src_name}) before replace"), lp, &job_id, &store);
-                            }
+                            // Full replace: the finished file takes the
+                            // SOURCE path and the original is deleted —
+                            // no backup (a kept backup defeats the point:
+                            // the disk space has to actually shrink).
+                            // rename overwrites the destination atomically
+                            // on POSIX; on targets where it refuses an
+                            // existing destination, remove and move again.
                             let r0 = std::fs::rename(&dest, &src).is_ok();
-                            let r1 = {
-                                let ok = std::fs::copy(&dest, &src).is_ok();
-                                if ok {
-                                    let _ = std::fs::remove_file(&dest);
+                            let r1 = if !r0 {
+                                if !src.exists() {
+                                    false
+                                } else if std::fs::remove_file(&src).is_ok() {
+                                    std::fs::rename(&dest, &src).is_ok()
+                                } else {
+                                    false
                                 }
-                                ok
+                            } else {
+                                true
                             };
-                            if !(r0 || r1) || wait_file_size(&src, size) != size {
-                                // Best effort: put the original back where it was.
-                                let _ = std::fs::remove_file(&src);
-                                let _ = std::fs::rename(&backup, &src);
-                                let _ = std::fs::remove_file(&dest);
+                            if !r1 || wait_file_size(&src, size) != size {
+                                // The original may already be gone — best
+                                // effort: restore it from the finished file
+                                // (same content, at least the path exists).
+                                if !src.exists() {
+                                    let _ = std::fs::rename(&dest, &src);
+                                }
                                 return fail(format!("replace failed while moving output onto {src_name}"), lp, &job_id, &store);
                             }
                             replaced = true;
@@ -5173,18 +5318,6 @@ async fn node_result(State(store): State<Store>, UrlPath(id): UrlPath<String>, m
                                     e.new_codec = eff;
                                     e.error = None;
                                 });
-                            }
-                            // Tombstone the backup name so rescans never
-                            // discover it as a fresh video (tombstones
-                            // only ever grow).
-                            {
-                                let _g = LIB_CFG_LOCK.lock().unwrap_or_else(|p| p.into_inner());
-                                let mut c = load_lib_cfg();
-                                if !c.tombstone.iter().any(|t| t == &backup_name) {
-                                    c.tombstone.push(backup_name);
-                                    c.tombstone.sort();
-                                }
-                                let _ = save_lib_cfg(&c);
                             }
                         }
                         PostOp::SaveHere => {
