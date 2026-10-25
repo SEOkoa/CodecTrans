@@ -975,6 +975,16 @@ struct RemoteJob {
     /// reported in our `accels`) the server pinned this encode to.
     #[serde(default)]
     gpu_device: Option<u32>,
+    /// Local fast path (input): the source's absolute path ON THE SERVER'S
+    /// HOST — when it exists on this node's filesystem (node on the same
+    /// NAS), read it directly instead of the multi-GB download.
+    #[serde(default)]
+    local_input: Option<String>,
+    /// Local fast path (output): the server's outputs/ dir, absolute path
+    /// ON THE SERVER'S HOST — when visible here, move the finished file
+    /// straight there (same-FS rename) and report `localStage`.
+    #[serde(default)]
+    local_output: Option<String>,
 }
 
 /// Multi-GPU device pinning: the server picked the concrete encoder AND a
@@ -1233,7 +1243,16 @@ async fn fail_job(
 }
 
 async fn run_job(client: reqwest::Client, state: NState, server: String, node_id: String, job: RemoteJob) {
-    let in_path = in_dir().join(&job.input_file);
+    // Local fast path (input): the job carries the source's absolute path on
+    // the SERVER's host. When that path exists on THIS node's filesystem
+    // (node on the same NAS), read it directly — no multi-GB loopback
+    // download, no workdir copy.
+    let local_in = job
+        .local_input
+        .as_deref()
+        .and_then(|p| std::path::Path::new(p).is_file().then(|| std::path::PathBuf::from(p)));
+    let skip_download = local_in.is_some();
+    let in_path = local_in.unwrap_or_else(|| in_dir().join(&job.input_file));
     let out_path = out_dir().join(&job.output_file);
 
     // File transfers (multi-GB in both directions) get their own client with
@@ -1245,6 +1264,7 @@ async fn run_job(client: reqwest::Client, state: NState, server: String, node_id
         .build()
         .unwrap();
 
+    if !skip_download {
     // 1. download input from server — streamed straight to disk (a 16GB
     // library source must never sit in RAM).
     let url = format!("{}/api/nodes/{}/file/{}", server, node_id, job.input_file);
@@ -1305,6 +1325,7 @@ async fn run_job(client: reqwest::Client, state: NState, server: String, node_id
         let _ = std::fs::remove_file(&in_path);
         fail_job(&client, &state, &server, &node_id, &job, msg).await;
         return;
+    }
     }
 
     // track locally + report running
@@ -1621,6 +1642,50 @@ async fn run_job(client: reqwest::Client, state: NState, server: String, node_id
     // held in RAM), over the long-timeout transfer client.
     if ok {
         if let Ok(size) = std::fs::metadata(&out_path).map(|m| m.len()) {
+            // Local fast path (output): the server's outputs/ dir is visible
+            // on this filesystem (node on the same NAS) — move the finished
+            // file straight there: a same-FS rename, ZERO bytes over the
+            // network (a 1.5GB upload at NAS speed is minutes + loopback
+            // CPU). The server verifies the size and runs the post-plan.
+            let staged = job.local_output.as_deref().and_then(|dir| {
+                let d = std::path::Path::new(dir);
+                if !d.is_dir() {
+                    return None;
+                }
+                let dest = d.join(&job.output_file);
+                let moved = std::fs::rename(&out_path, &dest).is_ok()
+                    || {
+                        let okc = std::fs::copy(&out_path, &dest).is_ok()
+                            && std::fs::remove_file(&out_path).is_ok();
+                        okc
+                    };
+                if !moved {
+                    return None;
+                }
+                let sz = std::fs::metadata(&dest).map(|m| m.len()).unwrap_or(0);
+                (sz == size).then_some(sz)
+            });
+            if let Some(sz) = staged {
+                let _ = client
+                    .post(format!("{}/api/nodes/{}/report", server, node_id))
+                    .json(&json!({
+                        "jobId": job.id,
+                        "status": "done",
+                        "progress": 1.0,
+                        "outputFile": job.output_file,
+                        "outputSize": sz,
+                        "localStage": true
+                    }))
+                    .send()
+                    .await;
+                let mut st = state.lock().unwrap();
+                update_job(&mut st, &job.id, |j| {
+                    j.status = "done".into();
+                    j.progress = 1.0;
+                    j.finished_at = Some(now_ms());
+                });
+                return;
+            }
             let form = reqwest::multipart::Form::new()
                 .part("jobId", reqwest::multipart::Part::text(job.id.clone()))
                 .part("outputFile", reqwest::multipart::Part::text(job.output_file.clone()))

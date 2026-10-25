@@ -171,6 +171,16 @@ pub struct Job {
     /// result arrives. Empty = plain encode (output lands next to source).
     #[serde(default)]
     pub post: Vec<PostOp>,
+    /// Absolute path of the source file ON THE SERVER'S HOST. A node whose
+    /// filesystem shares that path (a node container on the same NAS) reads
+    /// the input directly — skipping the multi-GB loopback download.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub local_input: Option<String>,
+    /// Absolute path of the server's outputs/ staging dir ON THE SERVER'S
+    /// HOST. A node sharing that filesystem moves its finished file straight
+    /// there (a same-FS rename) and reports `localStage` instead of uploading.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub local_output: Option<String>,
 }
 
 /// One accelerator as reported by a node: a physical device (GPU or iGPU)
@@ -285,6 +295,24 @@ pub struct LibraryEntry {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub new_codec: Option<String>,
     pub error: Option<String>,
+    /// Persisted encode decision (SavedDecision JSON) from the last scan
+    /// evaluation — lets a rescan re-DISPATCH a still-pending entry without
+    /// re-running the probe + srcHealth decode (the 5-minute auto-scan would
+    /// otherwise re-decode every queued-waiting file, burning the whole CPU
+    /// for no reason). Cleared whenever the entry leaves "pending" for
+    /// anything other than a failed dispatch.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub decision: Option<String>,
+}
+
+/// The outcome of a scan's graph evaluation for one file — persisted on the
+/// entry so later scans can re-dispatch (queue) it without re-evaluating.
+#[derive(Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SavedDecision {
+    pub target: TargetCfg,
+    pub post: Vec<PostOp>,
+    pub hw_only: bool,
 }
 
 impl LibraryEntry {
@@ -3346,6 +3374,12 @@ async fn dispatch_lib_job(
     } else {
         (eff.crf, None, None)
     };
+    // Local fast path: a node on the SAME filesystem (e.g. a node container
+    // on this NAS) can read the source and stage its output without any
+    // network transfer — the Job carries the host-absolute paths and the
+    // node checks whether they exist on its side.
+    let local_input = resolve_lib_source(&key, store)
+        .map(|p| p.to_string_lossy().to_string());
     let job = Job {
         id: uuid::Uuid::new_v4().to_string(),
         input_file: key.clone(),
@@ -3372,6 +3406,8 @@ async fn dispatch_lib_job(
         lib_path: Some(key),
         gpu_device,
         post: post.to_vec(),
+        local_input,
+        local_output: Some(outputs_dir().to_string_lossy().to_string()),
     };
     store.lock().unwrap().insert(job);
     Ok(true)
@@ -4013,7 +4049,7 @@ async fn library_scan(State(store): State<Store>, Json(req): Json<ScanReq>) -> R
     // instead of re-running ffprobe. This is what keeps the 5-minute
     // auto-scan cheap on a big library (only new/changed files pay the
     // probe cost) while a first scan still probes everything.
-    let sem = std::sync::Arc::new(tokio::sync::Semaphore::new(6));
+    let sem = std::sync::Arc::new(tokio::sync::Semaphore::new(3));
     let mut handles: Vec<tokio::task::JoinHandle<Option<LibraryEntry>>> =
         Vec::with_capacity(plan.len());
     for (fid, rootp, rel) in &plan {
@@ -4083,6 +4119,7 @@ async fn library_scan(State(store): State<Store>, Json(req): Json<ScanReq>) -> R
                 new_size: None,
                 new_codec: None,
                 error: None,
+                decision: None,
             })
         }));
     }
@@ -4129,6 +4166,10 @@ async fn library_scan(State(store): State<Store>, Json(req): Json<ScanReq>) -> R
                 // retries the file.
                 _ => false,
             };
+            // Keep the saved encode decision across rescans — a still-pending
+            // entry (dispatch failed: nodes busy) is re-DISPATCHED on the
+            // next scan instead of re-running probe + srcHealth decode.
+            e.decision = o.decision.clone();
             if keep {
                 e.status = o.status.clone();
                 e.reencoded = o.reencoded.clone();
@@ -4205,9 +4246,26 @@ async fn library_scan(State(store): State<Store>, Json(req): Json<ScanReq>) -> R
     //
     // Pass 1 — cheap per-entry gates (no concurrency needed).
     let mut todo: Vec<usize> = Vec::new();
+    let mut redispatch: Vec<usize> = Vec::new();
     for i in 0..entries.len() {
         if entries[i].status != "pending" {
             continue;
+        }
+        // Fast path: already evaluated in a previous scan (the saved
+        // decision was carried forward) and the file is unchanged (same
+        // size) — re-DISPATCH it directly, skipping the notvideo gate, the
+        // probe and the srcHealth decode. This is what keeps the 5-minute
+        // auto-scan cheap: a long queue merely waiting for a free node gets
+        // re-queued, not re-decoded (that re-decode storm pegged the CPU).
+        if entries[i].decision.as_ref().is_some_and(|d| !d.is_empty()) {
+            let size_changed = old
+                .iter()
+                .find(|o| o.key() == entries[i].key())
+                .is_some_and(|o| o.size != entries[i].size);
+            if !size_changed {
+                redispatch.push(i);
+                continue;
+            }
         }
         // Non-video gate — camera thumbnails (single-frame mjpeg in a .mp4
         // shell, jpeg_pipe container, no duration) and other non-video
@@ -4274,12 +4332,35 @@ async fn library_scan(State(store): State<Store>, Json(req): Json<ScanReq>) -> R
         }
         todo.push(i);
     }
+    // Re-dispatch (fast path): no re-evaluation — parse the saved decision
+    // and queue it. Ok(false) (nodes busy) / Err (hw-only but no capable
+    // node online) just leaves the entry pending: the next scan or a
+    // job-completion sweep retries it.
+    for i in &redispatch {
+        let e = entries[*i].clone();
+        let Some(d) = e
+            .decision
+            .as_ref()
+            .and_then(|s| serde_json::from_str::<SavedDecision>(s).ok())
+        else {
+            continue;
+        };
+        if let Ok(true) = dispatch_lib_job(&store, &e, &d.target, &d.post, d.hw_only).await {
+            let key = e.key();
+            let mut s = store.lock().unwrap();
+            s.update_library_entry(&key, |en| {
+                en.status = "queued".into();
+            });
+            drop(s);
+            SCAN_STATE.lock().unwrap().finished_queued += 1;
+        }
+    }
     // Pass 2 — one streaming task per surviving file.
     let online = std::sync::Arc::new(online);
     let eff_graph = std::sync::Arc::new(eff_graph);
     let health_depths = std::sync::Arc::new(health_depths);
     let live = std::sync::Arc::new(live);
-    let health_sem = std::sync::Arc::new(tokio::sync::Semaphore::new(4));
+    let health_sem = std::sync::Arc::new(tokio::sync::Semaphore::new(2));
     let libcfg = std::sync::Arc::new(libcfg);
     let store_t = store.clone();
     let mut handles: Vec<tokio::task::JoinHandle<(String, Option<String>)>> = Vec::new();
@@ -4392,6 +4473,7 @@ async fn library_scan(State(store): State<Store>, Json(req): Json<ScanReq>) -> R
                     evaluate(if h { &h_true } else { &h_false })
                 }
             };
+            let mut saved_decision: Option<String> = None;
             let outcome: Option<String> = match decision {
                 None => None,
                 Some(GraphDecision::Skip) => Some("skip".into()),
@@ -4423,6 +4505,15 @@ async fn library_scan(State(store): State<Store>, Json(req): Json<ScanReq>) -> R
                             post.push(PostOp::Replace);
                         }
                     }
+                    // Persist the decision so a later rescan can RE-DISPATCH
+                    // this entry (node was busy, or the server restarted
+                    // mid-scan) without re-running probe + srcHealth.
+                    saved_decision = serde_json::to_string(&SavedDecision {
+                        target: t.clone(),
+                        post: post.clone(),
+                        hw_only,
+                    })
+                    .ok();
                     // Never create a second job for a file that already has
                     // a live (queued/dispatched/running) one.
                     if live.contains(&key) {
@@ -4436,27 +4527,34 @@ async fn library_scan(State(store): State<Store>, Json(req): Json<ScanReq>) -> R
                     }
                 }
             };
-            // Apply to the store IMMEDIATELY — the dashboard must reflect
-            // this file the moment it is processed, not when the scan's
-            // collector loop later reaches this task's handle in spawn
-            // order (that lag made queued work invisible during long scans).
-            if let Some(mark) = &outcome {
+            // Persist the saved decision AND apply the outcome to the store
+            // IMMEDIATELY — the dashboard must reflect this file the moment
+            // it is processed, not when the scan's collector loop later
+            // reaches this task's handle in spawn order (that lag made
+            // queued work invisible during long scans). The decision is
+            // written even when dispatch failed (outcome None): the entry
+            // stays pending and a later scan must be able to re-dispatch it
+            // without re-running the health decode.
+            if saved_decision != e.decision || outcome.is_some() {
                 let mut e3 = e.clone();
-                match mark.as_str() {
-                    "skip" => {
-                        e3.status = "skipped".into();
-                        e3.error = Some("자동 스킵 — 로직/폴더 설정에 따라 처리하지 않음 (⟳으로 재큐잉)".into());
+                e3.decision = saved_decision;
+                if let Some(mark) = &outcome {
+                    match mark.as_str() {
+                        "skip" => {
+                            e3.status = "skipped".into();
+                            e3.error = Some("자동 스킵 — 로직/폴더 설정에 따라 처리하지 않음 (⟳으로 재큐잉)".into());
+                        }
+                        "queued" => e3.status = "queued".into(),
+                        s if s.starts_with("failed:") => {
+                            e3.status = "failed".into();
+                            e3.error = Some(format!("quarantined → {}", s["failed:".len()..].trim()));
+                        }
+                        s if s.starts_with("error:") => {
+                            e3.status = "error".into();
+                            e3.error = Some(s["error:".len()..].to_string());
+                        }
+                        _ => {}
                     }
-                    "queued" => e3.status = "queued".into(),
-                    s if s.starts_with("failed:") => {
-                        e3.status = "failed".into();
-                        e3.error = Some(format!("quarantined → {}", s["failed:".len()..].trim()));
-                    }
-                    s if s.starts_with("error:") => {
-                        e3.status = "error".into();
-                        e3.error = Some(s["error:".len()..].to_string());
-                    }
-                    _ => {}
                 }
                 {
                     let mut s = store_t.lock().unwrap();
@@ -4468,14 +4566,16 @@ async fn library_scan(State(store): State<Store>, Json(req): Json<ScanReq>) -> R
                         s.library.insert(key.clone(), e3);
                     }
                 }
-                match mark.as_str() {
-                    "queued" => {
-                        SCAN_STATE.lock().unwrap().finished_queued += 1;
+                if let Some(mark) = &outcome {
+                    match mark.as_str() {
+                        "queued" => {
+                            SCAN_STATE.lock().unwrap().finished_queued += 1;
+                        }
+                        "skip" => {
+                            SCAN_STATE.lock().unwrap().finished_skipped += 1;
+                        }
+                        _ => {}
                     }
-                    "skip" => {
-                        SCAN_STATE.lock().unwrap().finished_skipped += 1;
-                    }
-                    _ => {}
                 }
             }
             (key, outcome)
@@ -4714,6 +4814,8 @@ async fn transcode(State(store): State<Store>, Json(req): Json<TranscodeReq>) ->
         lib_path: None,
         gpu_device: None,
         post: Vec::new(),
+        local_input: None,
+        local_output: None,
     };
     let job_for_worker = job.clone();
     {
@@ -5142,6 +5244,43 @@ async fn node_poll(State(store): State<Store>, UrlPath(id): UrlPath<String>) -> 
     }
 }
 
+/// Keep the nodes fed: re-dispatch (via their SAVED decisions — no probe,
+/// no decode) up to `limit` entries that are still "pending" with an encode
+/// decision. Called when a job finishes (a worker slot freed up) so the
+/// queue drains continuously instead of in bursts per auto-scan.
+async fn sweep_redispatch(store: &Store, limit: usize) {
+    let candidates: Vec<LibraryEntry> = {
+        let s = store.lock().unwrap();
+        s.library
+            .values()
+            .filter(|e| {
+                e.status == "pending"
+                    && e.decision.as_ref().is_some_and(|d| !d.is_empty())
+            })
+            .cloned()
+            .take(limit)
+            .collect()
+    };
+    for e in candidates {
+        let Some(d) = e
+            .decision
+            .as_ref()
+            .and_then(|s| serde_json::from_str::<SavedDecision>(s).ok())
+        else {
+            continue;
+        };
+        if let Ok(true) = dispatch_lib_job(store, &e, &d.target, &d.post, d.hw_only).await {
+            let key = e.key();
+            let mut s = store.lock().unwrap();
+            s.update_library_entry(&key, |en| {
+                en.status = "queued".into();
+            });
+        }
+        // Ok(false)/Err (all busy / hw-only without a capable node online):
+        // stays pending — the next completion or scan retries it.
+    }
+}
+
 #[derive(serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct ReportReq {
@@ -5155,6 +5294,11 @@ struct ReportReq {
     output_file: Option<String>,
     #[serde(default)]
     output_size: Option<u64>,
+    /// Local fast path: the node (same filesystem as the server) already
+    /// moved the finished file into the server's outputs/ dir — no upload
+    /// happened; the server verifies it and runs the post-plan.
+    #[serde(default)]
+    local_stage: Option<bool>,
 }
 
 /// POST /api/nodes/:id/report — a node reports job progress / completion.
@@ -5181,8 +5325,8 @@ async fn node_report(State(store): State<Store>, UrlPath(id): UrlPath<String>, J
             if let Some(p) = req.progress {
                 j.progress = p.clamp(0.0, 1.0);
             }
-            if let Some(o) = req.output_file {
-                j.output_file = o;
+            if let Some(ref o) = req.output_file {
+                j.output_file = o.clone();
             }
             if let Some(sz) = req.output_size {
                 j.output_size = Some(sz);
@@ -5198,6 +5342,32 @@ async fn node_report(State(store): State<Store>, UrlPath(id): UrlPath<String>, J
     if req.status == "done" || req.status == "error" {
         let c = store.lock().unwrap().redis();
         let _ = set_current_job(c, &id, None).await;
+    }
+    // Keep the nodes fed: a worker slot just freed up — re-dispatch
+    // (saved-decision, no re-decode) pending entries that are waiting, so
+    // the slot is filled within seconds instead of the next 5-minute
+    // auto-scan.
+    if req.status == "done" || req.status == "error" {
+        sweep_redispatch(&store, 4).await;
+    }
+    // Local fast path: a same-filesystem node moved the finished file
+    // straight into outputs/ (no upload) — verify it and run the shared
+    // lib-job post-plan.
+    if req.status == "done" && req.local_stage.unwrap_or(false) && !was_cancelled {
+        if let Some(oon) = &req.output_file {
+            let p = outputs_dir().join(oon);
+            let expected = req.output_size.unwrap_or(0);
+            let sz = wait_file_size(&p, expected);
+            if expected == 0 || sz != expected {
+                let _ = std::fs::remove_file(&p);
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(json!({"error": format!("local stage verify failed: expected {expected}, got {sz}")})),
+                )
+                    .into_response();
+            }
+            return finish_lib_job(&store, req.job_id.clone(), oon.clone(), sz).await;
+        }
     }
     // Library-automation job failed → mark the entry so a rescan re-queues it.
     // A user-cancelling stop re-arms the entry as plain pending instead.
@@ -5462,160 +5632,150 @@ async fn node_result(State(store): State<Store>, UrlPath(id): UrlPath<String>, m
     };
     if let Some(lp) = &lp {
         if !lp.is_empty() {
-            // Resolve the real source from the catalog (registered
-            // folder, or legacy storage root).
-            if let Some(src) = resolve_lib_source(lp, &store) {
-                // Per-job post-encode plan (the ops chained on the encode
-                // node's output port; legacy target flags were folded in
-                // at dispatch time).
-                let (post_plan, src_dur) = {
-                    let s = store.lock().unwrap();
-                    let jp = s.jobs.get(&job_id).map(|j| j.post.clone()).unwrap_or_default();
-                    let sd = s.library.get(lp).and_then(|e| e.duration);
-                    (jp, sd)
-                };
-                let src_name = src.file_name().and_then(|x| x.to_str()).unwrap_or("").to_string();
-                let fail = |msg: String, lp: &str, job_id: &str, store: &Store| -> Response {
-                    {
-                        let mut s = store.lock().unwrap();
-                        s.update_library_entry(lp, |e| {
-                            e.status = "error".into();
-                            e.error = Some(msg.clone());
-                            e.reencoded = None;
-                            e.new_size = None;
-                            e.new_codec = None;
-                        });
-                        if let Some(j) = s.jobs.get_mut(job_id) {
-                            j.status = "error".into();
-                            j.error = Some(msg.clone());
-                            j.output_size = None;
-                        }
-                    }
-                    persist_catalog(store);
-                    (
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        Json(json!({ "error": msg })),
-                    )
-                        .into_response()
-                };
-                // Stage next to the source (never on top of it) so a failed
-                // health check can't corrupt the original.
-                let dest = src
-                    .parent()
-                    .map(|d| d.join(out_name.clone()))
-                    .unwrap_or_else(|| PathBuf::from(out_name.clone()));
-                if let Some(dir) = dest.parent() {
-                    let _ = std::fs::create_dir_all(dir);
+            return finish_lib_job(&store, job_id.clone(), out_name.clone(), size).await;
+        }
+    }
+    Json(json!({"ok": true, "file": out_name, "size": size})).into_response()
+}
+
+
+/// Post-arrival handling for LIBRARY jobs: the finished artifact is staged
+/// in outputs/ under `out_name` (`size` bytes, verified by the caller).
+/// Stage it next to the source, execute the post-encode plan IN CHAIN
+/// ORDER (verify/replace/saveHere/requeue), update the catalog. Shared by
+/// the upload path (node_result) and the local fast path (a same-filesystem
+/// node that moved the file itself and reported `localStage` — node_report).
+async fn finish_lib_job(store: &Store, job_id: String, out_name: String, size: u64) -> Response {
+    let lp = store
+        .lock()
+        .unwrap()
+        .jobs
+        .get(&job_id)
+        .and_then(|j| j.lib_path.clone())
+        .filter(|lp| !lp.is_empty());
+    let Some(lp) = lp else {
+        return Json(json!({"ok": true, "file": out_name, "size": size})).into_response();
+    };
+    let Some(src) = resolve_lib_source(&lp, store) else {
+        return Json(json!({"ok": true, "file": out_name, "size": size})).into_response();
+    };
+    let path = outputs_dir().join(out_name.clone());
+    let (post_plan, src_dur) = {
+        let s = store.lock().unwrap();
+        let jp = s.jobs.get(&job_id).map(|j| j.post.clone()).unwrap_or_default();
+        let sd = s.library.get(&lp).and_then(|e| e.duration);
+        (jp, sd)
+    };
+    let src_name = src.file_name().and_then(|x| x.to_str()).unwrap_or("").to_string();
+    let fail = |msg: String, lp: &str, job_id: &str, store: &Store| -> Response {
+        {
+            let mut s = store.lock().unwrap();
+            s.update_library_entry(&lp, |e| {
+                e.status = "error".into();
+                e.error = Some(msg.clone());
+                e.reencoded = None;
+                e.new_size = None;
+                e.new_codec = None;
+            });
+            if let Some(j) = s.jobs.get_mut(job_id) {
+                j.status = "error".into();
+                j.error = Some(msg.clone());
+                j.output_size = None;
+            }
+        }
+        persist_catalog(store);
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "error": msg })),
+        )
+            .into_response()
+    };
+    // Stage next to the source (never on top of it) so a failed
+    // health check can't corrupt the original.
+    let dest = src
+        .parent()
+        .map(|d| d.join(out_name.clone()))
+        .unwrap_or_else(|| PathBuf::from(out_name.clone()));
+    if let Some(dir) = dest.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    // rename fails across devices (e.g. outputs on /, storage on
+    // /tmp or a NAS mount) — fall back to copy + delete.
+    let renamed = std::fs::rename(&path, &dest).is_ok();
+    let moved = renamed || {
+        let ok = std::fs::copy(&path, &dest).is_ok();
+        if ok {
+            let _ = std::fs::remove_file(&path);
+        }
+        ok
+    };
+    // The artifact is only "done" when the DEST file's size is
+    // verified equal to the uploaded size — never before.
+    let dsize = wait_file_size(&dest, size);
+    if !moved || dsize != size {
+        eprintln!("[node_result] VERIFY FAIL dest {out_name}: moved={moved} dest_size={dsize} expected={size} job={job_id}");
+        let _ = std::fs::remove_file(&dest);
+        let _ = std::fs::remove_file(&path);
+        return fail(format!("output file failed size verification (got {dsize}, expected {size})"), &lp, &job_id, store);
+    }
+    let mut replaced = false;
+    let mut requeue = false;
+    // Execute the post-encode plan IN CHAIN ORDER. A failed
+    // health check stops the chain (don't replace a corrupt
+    // file with the original) and either errors the entry or
+    // sends it back to the queue, per the verify node's
+    // on-failure choice.
+    for op in &post_plan {
+        match op {
+            PostOp::Verify { mode, value, on_failure } => {
+                // Sampling: "all" checks every file; "pct" a
+                // random subset; "every" every Nth (stable key
+                // hash) — so a 10k-file folder isn't probed
+                // file by file.
+                if !verify_selected(&lp, mode.as_deref(), *value) {
+                    continue;
                 }
-                // rename fails across devices (e.g. outputs on /, storage on
-                // /tmp or a NAS mount) — fall back to copy + delete.
-                let renamed = std::fs::rename(&path, &dest).is_ok();
-                let moved = renamed || {
-                    let ok = std::fs::copy(&path, &dest).is_ok();
-                    if ok {
-                        let _ = std::fs::remove_file(&path);
-                    }
-                    ok
+                // The file must probe as a real video — a video
+                // stream present, positive duration, and at
+                // least half the source's length (a truncated/
+                // corrupt encode shows up here, not after the
+                // user hits play).
+                let info = probe_full(&dest.to_string_lossy()).await;
+                let odur = info.duration.unwrap_or(0.0);
+                let ok_video = info.video_codec.is_some() && odur > 0.0;
+                let ok_dur = match src_dur {
+                    Some(sd) if sd > 0.0 => odur >= sd * 0.5,
+                    _ => true,
                 };
-                // The artifact is only "done" when the DEST file's size is
-                // verified equal to the uploaded size — never before.
-                let dsize = wait_file_size(&dest, size);
-                if !moved || dsize != size {
-                    eprintln!("[node_result] VERIFY FAIL dest {out_name}: moved={moved} dest_size={dsize} expected={size} job={job_id}");
+                if !ok_video || !ok_dur {
+                    let vdbg = info
+                        .video_codec
+                        .clone()
+                        .unwrap_or_else(|| "<none>".into());
+                    eprintln!("[node_result] HEALTHCHECK FAIL {out_name}: video={vdbg} out_dur={odur} src_dur={src_dur:?} job={job_id}");
                     let _ = std::fs::remove_file(&dest);
-                    let _ = std::fs::remove_file(&path);
-                    return fail(format!("output file failed size verification (got {dsize}, expected {size})"), lp, &job_id, &store);
-                }
-                let mut replaced = false;
-                let mut requeue = false;
-                // Execute the post-encode plan IN CHAIN ORDER. A failed
-                // health check stops the chain (don't replace a corrupt
-                // file with the original) and either errors the entry or
-                // sends it back to the queue, per the verify node's
-                // on-failure choice.
-                for op in &post_plan {
-                    match op {
-                        PostOp::Verify { mode, value, on_failure } => {
-                            // Sampling: "all" checks every file; "pct" a
-                            // random subset; "every" every Nth (stable key
-                            // hash) — so a 10k-file folder isn't probed
-                            // file by file.
-                            if !verify_selected(lp, mode.as_deref(), *value) {
-                                continue;
-                            }
-                            // The file must probe as a real video — a video
-                            // stream present, positive duration, and at
-                            // least half the source's length (a truncated/
-                            // corrupt encode shows up here, not after the
-                            // user hits play).
-                            let info = probe_full(&dest.to_string_lossy()).await;
-                            let odur = info.duration.unwrap_or(0.0);
-                            let ok_video = info.video_codec.is_some() && odur > 0.0;
-                            let ok_dur = match src_dur {
-                                Some(sd) if sd > 0.0 => odur >= sd * 0.5,
-                                _ => true,
-                            };
-                            if !ok_video || !ok_dur {
-                                let vdbg = info
-                                    .video_codec
-                                    .clone()
-                                    .unwrap_or_else(|| "<none>".into());
-                                eprintln!("[node_result] HEALTHCHECK FAIL {out_name}: video={vdbg} out_dur={odur} src_dur={src_dur:?} job={job_id}");
-                                let _ = std::fs::remove_file(&dest);
-                                if on_failure.as_deref() == Some("failFolder") {
-                                    // Quarantine the SOURCE in the fail
-                                    // folder (settings) instead of
-                                    // erroring/requeueing.
-                                    let entry = store.lock().unwrap().library.get(lp).cloned();
-                                    if let Some(en) = entry {
-                                        match move_to_fail_folder(
-                                            &store,
-                                            &en,
-                                            &format!(
-                                                "output verify failed: video={vdbg} duration={odur}s (source {src_dur:?}s)"
-                                            ),
-                                        ) {
-                                            Ok(fp) => {
-                                                {
-                                                    let mut s = store.lock().unwrap();
-                                                    let msg = format!(
-                                                        "출력 검증 실패 — 실패 보관함으로 이동: {}",
-                                                        fp.display()
-                                                    );
-                                                    s.update_library_entry(lp, |e| {
-                                                        e.status = "failed".into();
-                                                        e.error = Some(msg.clone());
-                                                        e.reencoded = None;
-                                                        e.new_size = None;
-                                                        e.new_codec = None;
-                                                    });
-                                                    if let Some(j) = s.jobs.get_mut(&job_id) {
-                                                        j.status = "error".into();
-                                                        j.error = Some(msg.clone());
-                                                        j.output_size = None;
-                                                    }
-                                                }
-                                                persist_catalog(&store);
-                                                return (
-                                                    StatusCode::INTERNAL_SERVER_ERROR,
-                                                    Json(json!({ "error": "health check failed — quarantined to fail folder" })),
-                                                )
-                                                    .into_response();
-                                            }
-                                            Err(m) => eprintln!("[node_result] failFolder move failed: {m} — plain error"),
-                                        }
-                                    }
-                                }
-                                if on_failure.as_deref() == Some("requeue") {
-                                    // Back to the queue — the next scan
-                                    // dispatches a fresh attempt.
-                                    let msg = format!(
-                                        "health check failed: output video={vdbg} duration={odur}s (source {src_dur:?}s) — requeued"
-                                    );
+                    if on_failure.as_deref() == Some("failFolder") {
+                        // Quarantine the SOURCE in the fail
+                        // folder (settings) instead of
+                        // erroring/requeueing.
+                        let entry = store.lock().unwrap().library.get(&lp).cloned();
+                        if let Some(en) = entry {
+                            match move_to_fail_folder(
+                                &store,
+                                &en,
+                                &format!(
+                                    "output verify failed: video={vdbg} duration={odur}s (source {src_dur:?}s)"
+                                ),
+                            ) {
+                                Ok(fp) => {
                                     {
                                         let mut s = store.lock().unwrap();
-                                        s.update_library_entry(lp, |e| {
-                                            e.status = "pending".into();
+                                        let msg = format!(
+                                            "출력 검증 실패 — 실패 보관함으로 이동: {}",
+                                            fp.display()
+                                        );
+                                        s.update_library_entry(&lp, |e| {
+                                            e.status = "failed".into();
                                             e.error = Some(msg.clone());
                                             e.reencoded = None;
                                             e.new_size = None;
@@ -5630,98 +5790,127 @@ async fn node_result(State(store): State<Store>, UrlPath(id): UrlPath<String>, m
                                     persist_catalog(&store);
                                     return (
                                         StatusCode::INTERNAL_SERVER_ERROR,
-                                        Json(json!({ "error": "health check failed — requeued" })),
+                                        Json(json!({ "error": "health check failed — quarantined to fail folder" })),
                                     )
                                         .into_response();
                                 }
-                                return fail(format!("health check failed: output video={vdbg} duration={odur}s (source {src_dur:?}s)"), lp, &job_id, &store);
+                                Err(m) => eprintln!("[node_result] failFolder move failed: {m} — plain error"),
                             }
-                        }
-                        PostOp::Replace => {
-                            // Full replace: the finished file takes the
-                            // SOURCE path and the original is deleted —
-                            // no backup (a kept backup defeats the point:
-                            // the disk space has to actually shrink).
-                            // rename overwrites the destination atomically
-                            // on POSIX; on targets where it refuses an
-                            // existing destination, remove and move again.
-                            let r0 = std::fs::rename(&dest, &src).is_ok();
-                            let r1 = if !r0 {
-                                if !src.exists() {
-                                    false
-                                } else if std::fs::remove_file(&src).is_ok() {
-                                    std::fs::rename(&dest, &src).is_ok()
-                                } else {
-                                    false
-                                }
-                            } else {
-                                true
-                            };
-                            if !r1 || wait_file_size(&src, size) != size {
-                                // The original may already be gone — best
-                                // effort: restore it from the finished file
-                                // (same content, at least the path exists).
-                                if !src.exists() {
-                                    let _ = std::fs::rename(&dest, &src);
-                                }
-                                return fail(format!("replace failed while moving output onto {src_name}"), lp, &job_id, &store);
-                            }
-                            replaced = true;
-                            {
-                                let mut s = store.lock().unwrap();
-                                let eff = s
-                                    .jobs
-                                    .get(&job_id)
-                                    .map(|j| j.effective_video_codec.clone());
-                                s.update_library_entry(lp, |e| {
-                                    e.status = "done".into();
-                                    // The finished file now lives at the SOURCE path.
-                                    e.reencoded = Some(src_name.clone());
-                                    e.new_size = Some(size);
-                                    e.new_codec = eff;
-                                    e.error = None;
-                                });
-                            }
-                        }
-                        PostOp::SaveHere => {
-                            // Library jobs already stage the output next
-                            // to the source — the explicit node just
-                            // documents the intent on the graph.
-                        }
-                        PostOp::Requeue => {
-                            // After the rest of the plan: back to the
-                            // queue (a rescan re-dispatches the entry).
-                            requeue = true;
                         }
                     }
-                }
-                if !replaced {
-                    {
-                        let mut s = store.lock().unwrap();
-                        let eff = s
-                            .jobs
-                            .get(&job_id)
-                            .map(|j| j.effective_video_codec.clone());
-                        s.update_library_entry(lp, |e| {
-                            e.status = "done".into();
-                            e.reencoded = Some(out_name.clone());
-                            e.new_size = Some(size);
-                            e.new_codec = eff;
-                            e.error = None;
-                        });
+                    if on_failure.as_deref() == Some("requeue") {
+                        // Back to the queue — the next scan
+                        // dispatches a fresh attempt.
+                        let msg = format!(
+                            "health check failed: output video={vdbg} duration={odur}s (source {src_dur:?}s) — requeued"
+                        );
+                        {
+                            let mut s = store.lock().unwrap();
+                            s.update_library_entry(&lp, |e| {
+                                e.status = "pending".into();
+                                e.error = Some(msg.clone());
+                                e.reencoded = None;
+                                e.new_size = None;
+                                e.new_codec = None;
+                            });
+                            if let Some(j) = s.jobs.get_mut(&job_id) {
+                                j.status = "error".into();
+                                j.error = Some(msg.clone());
+                                j.output_size = None;
+                            }
+                        }
+                        persist_catalog(&store);
+                        return (
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            Json(json!({ "error": "health check failed — requeued" })),
+                        )
+                            .into_response();
                     }
+                    return fail(format!("health check failed: output video={vdbg} duration={odur}s (source {src_dur:?}s)"), &lp, &job_id, store);
                 }
-                if requeue {
+            }
+            PostOp::Replace => {
+                // Full replace: the finished file takes the
+                // SOURCE path and the original is deleted —
+                // no backup (a kept backup defeats the point:
+                // the disk space has to actually shrink).
+                // rename overwrites the destination atomically
+                // on POSIX; on targets where it refuses an
+                // existing destination, remove and move again.
+                let r0 = std::fs::rename(&dest, &src).is_ok();
+                let r1 = if !r0 {
+                    if !src.exists() {
+                        false
+                    } else if std::fs::remove_file(&src).is_ok() {
+                        std::fs::rename(&dest, &src).is_ok()
+                    } else {
+                        false
+                    }
+                } else {
+                    true
+                };
+                if !r1 || wait_file_size(&src, size) != size {
+                    // The original may already be gone — best
+                    // effort: restore it from the finished file
+                    // (same content, at least the path exists).
+                    if !src.exists() {
+                        let _ = std::fs::rename(&dest, &src);
+                    }
+                    return fail(format!("replace failed while moving output onto {src_name}"), &lp, &job_id, store);
+                }
+                replaced = true;
+                {
                     let mut s = store.lock().unwrap();
-                    s.update_library_entry(lp, |e| {
-                        e.status = "pending".into();
+                    let eff = s
+                        .jobs
+                        .get(&job_id)
+                        .map(|j| j.effective_video_codec.clone());
+                    s.update_library_entry(&lp, |e| {
+                        e.status = "done".into();
+                        // The finished file now lives at the SOURCE path.
+                        e.reencoded = Some(src_name.clone());
+                        e.new_size = Some(size);
+                        e.new_codec = eff;
+                        e.error = None;
                     });
                 }
-                // (lock dropped — persist_catalog re-acquires it)
-                persist_catalog(&store);
+            }
+            PostOp::SaveHere => {
+                // Library jobs already stage the output next
+                // to the source — the explicit node just
+                // documents the intent on the graph.
+            }
+            PostOp::Requeue => {
+                // After the rest of the plan: back to the
+                // queue (a rescan re-dispatches the entry).
+                requeue = true;
             }
         }
     }
+    if !replaced {
+        {
+            let mut s = store.lock().unwrap();
+            let eff = s
+                .jobs
+                .get(&job_id)
+                .map(|j| j.effective_video_codec.clone());
+            s.update_library_entry(&lp, |e| {
+                e.status = "done".into();
+                e.reencoded = Some(out_name.clone());
+                e.new_size = Some(size);
+                e.new_codec = eff;
+                e.error = None;
+            });
+        }
+    }
+    if requeue {
+        let mut s = store.lock().unwrap();
+        s.update_library_entry(&lp, |e| {
+            e.status = "pending".into();
+        });
+    }
+    // (lock dropped — persist_catalog re-acquires it)
+    persist_catalog(&store);
     Json(json!({"ok": true, "file": out_name, "size": size})).into_response()
 }
 
@@ -5827,6 +6016,8 @@ async fn dispatch(State(store): State<Store>, Json(req): Json<DispatchReq>) -> R
         lib_path: None,
         gpu_device,
         post: Vec::new(),
+        local_input: None,
+        local_output: Some(outputs_dir().to_string_lossy().to_string()),
     };
     store.lock().unwrap().insert(job);
     Json(json!({
