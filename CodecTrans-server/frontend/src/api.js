@@ -61,6 +61,9 @@ export const api = {
   codecs: () => jfetch("/api/codecs"),
   jobs: () => jfetch("/api/jobs"),
   job: (id) => jfetch(`/api/jobs/${id}`),
+  // cancel a single queued job / wipe the whole queued backlog
+  jobCancel: (id) => jfetch(`/api/jobs/${encodeURIComponent(id)}`, { method: "DELETE" }),
+  jobsClear: () => jfetch("/api/jobs/clear", { method: "DELETE" }),
   nodes: (status = "all") =>
     jfetch(`/api/nodes?status=${encodeURIComponent(status)}`),
   // worker settings (dashboard gear): display name, enabled backends,

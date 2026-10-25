@@ -25,7 +25,7 @@ use axum::{
     },
     http::StatusCode,
     response::{IntoResponse, Response},
-    routing::{get, post},
+    routing::{delete, get, post},
     Json,
     Router,
 };
@@ -331,6 +331,9 @@ impl JobStore {
         } else {
             None
         }
+    }
+    pub fn remove(&mut self, id: &str) -> Option<Job> {
+        self.jobs.remove(id)
     }
     pub fn get(&self, id: &str) -> Option<Job> {
         self.jobs.get(id).cloned()
@@ -3481,6 +3484,47 @@ async fn get_job(State(store): State<Store>, UrlPath(id): UrlPath<String>) -> Re
     }
 }
 
+/// DELETE /api/jobs/:id — cancel a QUEUED job (remove it from the in-memory
+/// queue before a node claims it). Running/dispatched jobs can't be safely
+/// stopped server-side; they finish or error out on their own.
+async fn cancel_job(State(store): State<Store>, UrlPath(id): UrlPath<String>) -> Response {
+    let st = store.lock().unwrap().get(&id).map(|j| j.status);
+    match st {
+        None => (StatusCode::NOT_FOUND, Json(json!({"error": "job not found"}))).into_response(),
+        Some(s) if s == "queued" => {
+            store.lock().unwrap().remove(&id);
+            Json(json!({"ok": true, "cancelled": id})).into_response()
+        }
+        Some(s) => (
+            StatusCode::CONFLICT,
+            Json(json!({"error": format!("job is {s}, only queued jobs can be cancelled")})),
+        )
+            .into_response(),
+    }
+}
+
+/// DELETE /api/jobs/clear — wipe every queued (not-yet-claimed) job in one
+/// shot. That's the "undo a mass-queue" button: a scan that auto-queued
+/// hundreds of files before the user finished setting up targets. Only
+/// `queued` jobs are removed — running/dispatched/done/error entries are
+/// kept (a worker may be mid-encode; history stays intact).
+async fn clear_jobs(State(store): State<Store>) -> Response {
+    let gone = {
+        let mut s = store.lock().unwrap();
+        let queued: Vec<String> = s
+            .jobs
+            .iter()
+            .filter(|(_, j)| j.status == "queued")
+            .map(|(id, _)| id.clone())
+            .collect();
+        for id in &queued {
+            s.jobs.remove(id);
+        }
+        queued.len()
+    };
+    Json(json!({"ok": true, "cancelled": gone})).into_response()
+}
+
 async fn download(UrlPath(name): UrlPath<String>) -> Response {
     // only serve from outputs/, block path traversal
     if name.contains("..") || name.contains('/') || name.contains('\\') {
@@ -3913,55 +3957,17 @@ async fn node_fetch_file(State(store): State<Store>, UrlPath((_id, name)): UrlPa
     }
 }
 
-/// Chunked byte stream over a tokio file (1 MiB reads) — feeds
-/// `axum::body::Body::from_stream` so large files are served without a
-/// whole-file buffer.
-struct FileChunkStream {
-    file: Option<tokio::fs::File>,
-    buf: Vec<u8>,
-}
-
-impl FileChunkStream {
-    fn new(f: tokio::fs::File) -> Self {
-        Self { file: Some(f), buf: vec![0u8; 1 << 20] }
-    }
-}
-
-impl futures_util::Stream for FileChunkStream {
-    type Item = Result<bytes::Bytes, std::io::Error>;
-
-    fn poll_next(mut self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> std::task::Poll<Option<Self::Item>> {
-        use tokio::io::AsyncRead;
-        let this = self.get_mut();
-        match this.file.as_mut() {
-            None => std::task::Poll::Ready(None),
-            Some(f) => {
-                this.buf.clear();
-                let (res, n) = {
-                    let mut rb = tokio::io::ReadBuf::new(&mut this.buf);
-                    let r = std::pin::Pin::new(f).poll_read(cx, &mut rb);
-                    (r, rb.filled().len())
-                };
-                match res {
-                    std::task::Poll::Ready(Ok(_)) => {
-                        if n == 0 {
-                            this.file = None;
-                            std::task::Poll::Ready(None)
-                        } else {
-                            this.buf.truncate(n);
-                            std::task::Poll::Ready(Some(Ok(this.buf.clone().into())))
-                        }
-                    }
-                    std::task::Poll::Ready(Err(e)) => std::task::Poll::Ready(Some(Err(e))),
-                    std::task::Poll::Pending => std::task::Poll::Pending,
-                }
-            }
-        }
-    }
-}
-
 /// Stream a file as an octet-stream response with Content-Length, reading in
 /// 1 MiB chunks from disk (never buffered whole).
+///
+/// IMPORTANT: the body must be built with async/await (`AsyncReadExt::read`
+/// inside `stream::unfold`), NOT a hand-rolled `Stream::poll_next` that calls
+/// `tokio::fs::File::poll_read` via `Pin::new`. The hand-rolled variant
+/// loses the waker after the first `Pending` (tokio::fs dispatches to the
+/// blocking pool) and the connection is dropped with ZERO response bytes —
+/// clients see "empty reply from server" / connection reset while every
+/// 404/200-without-file path looks fine. Regression-tested with
+/// /tmp/axum-repro (variants c=broken, e=working).
 async fn file_response(path: &std::path::Path) -> Response {
     match tokio::fs::File::open(path).await {
         Ok(f) => {
@@ -3975,10 +3981,18 @@ async fn file_response(path: &std::path::Path) -> Response {
                 axum::http::header::CONTENT_LENGTH,
                 len.to_string().parse().unwrap(),
             );
+            let stream = futures_util::stream::unfold(f, |mut f| async move {
+                let mut buf = vec![0u8; 1 << 20]; // 1 MiB chunk
+                match tokio::io::AsyncReadExt::read(&mut f, &mut buf).await {
+                    Ok(0) => None,
+                    Ok(n) => { buf.truncate(n); Some((Ok(bytes::Bytes::from(buf)), f)) }
+                    Err(e) => Some((Err(e), f)),
+                }
+            });
             (
                 StatusCode::OK,
                 headers,
-                axum::body::Body::from_stream(FileChunkStream::new(f)),
+                axum::body::Body::from_stream(stream),
             )
                 .into_response()
         }
@@ -4520,7 +4534,8 @@ async fn main() {
         .route("/api/transcode", post(transcode))
         .route("/api/dispatch", post(dispatch))
         .route("/api/jobs", get(list_jobs))
-        .route("/api/jobs/:id", get(get_job))
+        .route("/api/jobs/clear", delete(clear_jobs))
+        .route("/api/jobs/:id", get(get_job).delete(cancel_job))
         .route("/api/download/:name", get(download))
         // node management (distributed transcoding)
         .route("/api/nodes", get(list_nodes))

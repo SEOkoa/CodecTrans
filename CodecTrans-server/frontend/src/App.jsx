@@ -1359,7 +1359,49 @@ export default function App() {
                   </span>
                 )}
               </div>
+              {activeJob.status === "queued" && (
+                <button
+                  className="rm-del"
+                  title="큐에서 취소 (아직 노드가 안 가져간 대기 잡만 취소 가능)"
+                  onClick={async () => {
+                    try {
+                      await api.jobCancel(activeJob.id);
+                      setActiveJob(null);
+                      setJobs(await api.jobs());
+                    } catch (e) {
+                      setError(e.message);
+                    }
+                  }}
+                >
+                  ✕ 취소
+                </button>
+              )}
               {activeJob.error && <div className="err">{activeJob.error}</div>}
+            </div>
+          )}
+
+          {jobs.filter((j) => j.status === "queued").length > 0 && (
+            <div className="row" style={{ justifyContent: "space-between", marginBottom: 6 }}>
+              <span className="meta">
+                {jobs.filter((j) => j.status === "queued").length}건 대기 중
+              </span>
+              <button
+                className="rm-del"
+                title="대기(queued) 잡을 전부 지움 — 실행 중/완료/에러 기록은 유지"
+                onClick={async () => {
+                  const n = jobs.filter((j) => j.status === "queued").length;
+                  if (!window.confirm(`대기 중인 잡 ${n}건을 전부 취소할까요?`)) return;
+                  try {
+                    await api.jobsClear();
+                    if (activeJob?.status === "queued") setActiveJob(null);
+                    setJobs(await api.jobs());
+                  } catch (e) {
+                    setError(e.message);
+                  }
+                }}
+              >
+                🗑 큐 비우기
+              </button>
             </div>
           )}
 
@@ -1380,6 +1422,23 @@ export default function App() {
                   <a className="dl" href={api.downloadUrl(j.outputFile)} download>
                     ⬇ download
                   </a>
+                )}
+                {j.status === "queued" && (
+                  <button
+                    className="rm-del"
+                    title="큐에서 취소 (노드가 가져가기 전 대기 잡만 가능)"
+                    onClick={async () => {
+                      try {
+                        await api.jobCancel(j.id);
+                        if (activeJob?.id === j.id) setActiveJob(null);
+                        setJobs(await api.jobs());
+                      } catch (e) {
+                        setError(e.message);
+                      }
+                    }}
+                  >
+                    ✕
+                  </button>
                 )}
                 {j.error && <div className="err">{j.error}</div>}
               </div>
