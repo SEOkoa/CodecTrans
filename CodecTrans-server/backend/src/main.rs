@@ -4226,6 +4226,19 @@ async fn library_scan(State(store): State<Store>, Json(req): Json<ScanReq>) -> R
         if let Some(reason) = not_video {
             entries[i].status = "notvideo".into();
             entries[i].error = Some(format!("비영상 — {reason}"));
+            // Live: make it visible in the dashboard right away too.
+            {
+                let key = entries[i].key();
+                let e3 = entries[i].clone();
+                let mut s = store.lock().unwrap();
+                if s.library.contains_key(&key) {
+                    if let Some(e2) = s.library.get_mut(&key) {
+                        *e2 = e3;
+                    }
+                } else {
+                    s.library.insert(key, e3);
+                }
+            }
             continue;
         }
         // Disabled folder = index only: the file shows up in the catalog
@@ -4404,6 +4417,48 @@ async fn library_scan(State(store): State<Store>, Json(req): Json<ScanReq>) -> R
                     }
                 }
             };
+            // Apply to the store IMMEDIATELY — the dashboard must reflect
+            // this file the moment it is processed, not when the scan's
+            // collector loop later reaches this task's handle in spawn
+            // order (that lag made queued work invisible during long scans).
+            if let Some(mark) = &outcome {
+                let mut e3 = e.clone();
+                match mark.as_str() {
+                    "skip" => {
+                        e3.status = "skipped".into();
+                        e3.error = Some("자동 스킵 — 로직/폴더 설정에 따라 처리하지 않음 (⟳으로 재큐잉)".into());
+                    }
+                    "queued" => e3.status = "queued".into(),
+                    s if s.starts_with("failed:") => {
+                        e3.status = "failed".into();
+                        e3.error = Some(format!("quarantined → {}", s["failed:".len()..].trim()));
+                    }
+                    s if s.starts_with("error:") => {
+                        e3.status = "error".into();
+                        e3.error = Some(s["error:".len()..].to_string());
+                    }
+                    _ => {}
+                }
+                {
+                    let mut s = store_t.lock().unwrap();
+                    if s.library.contains_key(&key) {
+                        if let Some(e2) = s.library.get_mut(&key) {
+                            *e2 = e3;
+                        }
+                    } else {
+                        s.library.insert(key.clone(), e3);
+                    }
+                }
+                match mark.as_str() {
+                    "queued" => {
+                        SCAN_STATE.lock().unwrap().finished_queued += 1;
+                    }
+                    "skip" => {
+                        SCAN_STATE.lock().unwrap().finished_skipped += 1;
+                    }
+                    _ => {}
+                }
+            }
             (key, outcome)
         }));
     }
@@ -4435,14 +4490,8 @@ async fn library_scan(State(store): State<Store>, Json(req): Json<ScanReq>) -> R
                 }
             }
             match mark.as_str() {
-                "queued" => {
-                    queued.push(key);
-                    SCAN_STATE.lock().unwrap().finished_queued += 1;
-                }
-                "skip" => {
-                    skipped.push(key);
-                    SCAN_STATE.lock().unwrap().finished_skipped += 1;
-                }
+                "queued" => queued.push(key),
+                "skip" => skipped.push(key),
                 _ => {}
             }
         }
