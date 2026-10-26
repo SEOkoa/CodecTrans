@@ -316,6 +316,21 @@ pub struct LibraryEntry {
     /// applying the pre-change decision forever (stale filter).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub decision_version: Option<u64>,
+    /// Consecutive re-queues by a post-encode requeue node. Capped at
+    /// MAX_REQUEUE_ATTEMPTS — a DETERMINISTIC post-encode failure (e.g. the
+    /// srcHealth gate on a corrupted source) would otherwise re-encode the
+    /// same file forever: the saved decision replays encode+requeue on
+    /// every scan. Reset on fresh scan evaluation and on manual ⟳.
+    #[serde(default, skip_serializing_if = "is_zero_u32")]
+    pub requeue_count: u32,
+}
+
+/// Max consecutive post-encode re-queues per entry before it is parked as
+/// "error" for review (see the PostOp::Requeue handling in finish_lib_job).
+const MAX_REQUEUE_ATTEMPTS: u32 = 3;
+
+fn is_zero_u32(v: &u32) -> bool {
+    *v == 0
 }
 
 /// The outcome of a scan's graph evaluation for one file — persisted on the
@@ -3001,6 +3016,8 @@ async fn library_requeue(State(store): State<Store>, Json(req): Json<RequeueReq>
             e.reencoded = None;
             e.new_size = None;
             e.new_codec = None;
+            // Manual ⟳ is an explicit new attempt — cap starts over.
+            e.requeue_count = 0;
             // ⟳ means "decide this file AGAIN with the current logic" —
             // drop the saved decision so the next scan re-evaluates (probe
             // + graph) instead of the fast path re-dispatching the old one.
@@ -5057,6 +5074,7 @@ async fn library_scan(State(store): State<Store>, Json(req): Json<ScanReq>) -> R
                 error: None,
                 decision: None,
                 decision_version: None,
+                requeue_count: 0,
             })
         }));
     }
@@ -5462,6 +5480,8 @@ async fn library_scan(State(store): State<Store>, Json(req): Json<ScanReq>) -> R
                 let mut e3 = e.clone();
                 e3.decision = saved_decision;
                 e3.decision_version = Some(logic_version);
+                // Fresh evaluation — the requeue cap starts over.
+                e3.requeue_count = 0;
                 if let Some(mark) = &outcome {
                     match mark.as_str() {
                         "skip" => {
@@ -7022,7 +7042,17 @@ async fn finish_lib_job(store: &Store, job_id: String, out_name: String, size: u
         }
     }
     if !replaced {
-        {
+        // A LATE result must not resurrect an entry the user (or the
+        // requeue cap) parked as error/failed — the finished artifact
+        // stays staged next to the source, but the entry's fate holds.
+        let parked = {
+            let s = store.lock().unwrap_or_else(|p| p.into_inner());
+            s.library
+                .get(&lp)
+                .map(|e| matches!(e.status.as_str(), "error" | "failed"))
+                .unwrap_or(false)
+        };
+        if !parked {
             let mut s = store.lock().unwrap_or_else(|p| p.into_inner());
             let eff = s
                 .jobs
@@ -7035,13 +7065,50 @@ async fn finish_lib_job(store: &Store, job_id: String, out_name: String, size: u
                 e.new_codec = eff;
                 e.error = None;
             });
+        } else {
+            eprintln!("[finish] late result for parked entry {lp} — entry left untouched");
         }
     }
     if requeue {
         let mut s = store.lock().unwrap_or_else(|p| p.into_inner());
+        // A LATE result can land on an entry the user (or the cap below)
+        // already parked — never drag it back into the queue.
+        let parkable = s
+            .library
+            .get(&lp)
+            .map(|e| e.status == "done")
+            .unwrap_or(false);
+        let parked = s
+            .library
+            .get(&lp)
+            .map(|e| e.requeue_count + 1 >= MAX_REQUEUE_ATTEMPTS)
+            .unwrap_or(false);
         s.update_library_entry(&lp, |e| {
-            e.status = "pending".into();
+            if e.status != "done" {
+                eprintln!("[finish] requeue ignored — {lp} is now \"{}\"", e.status);
+                return;
+            }
+            e.requeue_count += 1;
+            if e.requeue_count >= MAX_REQUEUE_ATTEMPTS {
+                // Deterministic post-encode failure (e.g. the srcHealth gate
+                // on a corrupted source) — re-queuing would re-encode the
+                // same file forever. Park it as error for review; keep the
+                // latest staged artifact next to the source.
+                e.status = "error".into();
+                e.error = Some(format!(
+                    "재큐잉 제한({MAX_REQUEUE_ATTEMPTS}회) — 인코딩 후 헬스 재검사가 계속 실패해 재인코딩이 반복됩니다. 원본 손상 가능성, 파일을 확인하세요. (마지막 산출물: {out_name})"
+                ));
+                e.decision = None;
+                e.requeue_count = 0;
+                e.reencoded = Some(out_name.clone());
+                e.new_size = Some(size);
+            } else {
+                e.status = "pending".into();
+            }
         });
+        if parked && parkable {
+            eprintln!("[finish] requeue limit reached for {lp} — parked as error (artifact kept: {out_name})");
+        }
     }
     // (lock dropped — persist_catalog re-acquires it)
     persist_catalog(&store);
