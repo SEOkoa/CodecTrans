@@ -2701,6 +2701,13 @@ static PROBE_INFLIGHT: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec
 static PROBE_TASKS_STARTED: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
 
+/// Current phase of every not-yet-finished probe task, keyed by path.
+/// The watchdog dumps the phase histogram: with 3 permits, tasks in
+/// "work"/"probe" are the permit holders — if the ledger says 0 permits
+/// free but no task shows in a holding phase, the permit is leaked.
+static TASK_PHASES: std::sync::Mutex<std::collections::HashMap<String, &'static str>> =
+    std::sync::Mutex::new(std::collections::HashMap::new());
+
 /// RAII: marks a path as probe-in-flight while a probe task runs (dropped
 /// when the task ends — every path, including panics).
 struct ProbeInflightGuard(String);
@@ -2715,7 +2722,12 @@ impl Drop for ProbeInflightGuard {
         if let Ok(mut v) = PROBE_INFLIGHT.lock() {
             v.retain(|q| q != &self.0);
         }
+        TASK_PHASES.lock().unwrap_or_else(|x| x.into_inner()).remove(&self.0);
     }
+}
+
+fn phase_set(p: &str, ph: &'static str) {
+    TASK_PHASES.lock().unwrap_or_else(|x| x.into_inner()).insert(p.to_string(), ph);
 }
 
 /// Monotonic catalog revision — bumped every time the catalog hits disk.
@@ -5355,21 +5367,33 @@ async fn library_scan(State(store): State<Store>, Json(req): Json<ScanReq>) -> R
                 if !active {
                     break;
                 }
-                let list = PROBE_INFLIGHT.lock().unwrap_or_else(|x| x.into_inner()).clone();
                 let started = PROBE_TASKS_STARTED.load(std::sync::atomic::Ordering::Relaxed);
                 let avail = sem_w.available_permits();
-                if !list.is_empty() || avail < 3 {
-                    let head = list.iter().take(4).cloned().collect::<Vec<_>>().join(" | ");
+                let ph = TASK_PHASES.lock().unwrap_or_else(|x| x.into_inner()).clone();
+                let mut counts: std::collections::HashMap<&'static str, usize> =
+                    std::collections::HashMap::new();
+                for v in ph.values() {
+                    *counts.entry(v).or_insert(0) += 1;
+                }
+                if !ph.is_empty() || avail < 3 {
+                    let holders: Vec<String> = ph
+                        .iter()
+                        .filter(|(_, v)| **v != "wait")
+                        .map(|(k, _)| k.clone())
+                        .collect();
+                    let hhead = holders.iter().take(4).cloned().collect::<Vec<_>>().join(" | ");
                     eprintln!(
-                        "[scan] probe state: started={started} inflight({}) avail_permits={} — {head}",
-                        list.len(),
-                        avail
+                        "[scan] probe state: started={started} avail={avail} pending({}) phases={:?} holders({}): {hhead}",
+                        ph.len(),
+                        counts,
+                        holders.len()
                     );
                 }
             }
         });
     }
     PROBE_TASKS_STARTED.store(0, std::sync::atomic::Ordering::Relaxed);
+    TASK_PHASES.lock().unwrap_or_else(|x| x.into_inner()).clear();
     let mut handles: Vec<tokio::task::JoinHandle<Option<LibraryEntry>>> =
         Vec::with_capacity(plan.len());
     for (fid, rootp, rel) in &plan {
@@ -5396,6 +5420,7 @@ async fn library_scan(State(store): State<Store>, Json(req): Json<ScanReq>) -> R
         let sem = sem.clone();
         handles.push(tokio::spawn(async move {
             PROBE_TASKS_STARTED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            phase_set(&pstr, "wait");
             let _g = match tokio::time::timeout(
                 std::time::Duration::from_secs(120),
                 sem.clone().acquire_owned(),
@@ -5411,6 +5436,7 @@ async fn library_scan(State(store): State<Store>, Json(req): Json<ScanReq>) -> R
                     sem.clone().acquire_owned().await.expect("probe semaphore")
                 }
             };
+            phase_set(&pstr, "work");
             let _pf = ProbeInflightGuard(pstr.clone());
             let size = tokio::task::spawn_blocking({
                 let f = full.clone();
@@ -5437,7 +5463,10 @@ async fn library_scan(State(store): State<Store>, Json(req): Json<ScanReq>) -> R
                     audio_channels: None,
                     audio_bit_rate: None,
                 },
-                None => probe_full(&pstr).await,
+                None => {
+                    phase_set(&pstr, "probe");
+                    probe_full(&pstr).await
+                }
             };
             Some(LibraryEntry {
                 path: rel.to_string_lossy().to_string(),
