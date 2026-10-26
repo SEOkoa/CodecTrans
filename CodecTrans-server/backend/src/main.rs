@@ -2736,6 +2736,41 @@ fn phase_set(p: &str, ph: &'static str) {
     v.push((p.to_string(), ph));
 }
 
+/// Real HTTP liveness probe (used by the wedge-watch std thread). A TCP
+/// connect alone is useless — the kernel finishes the handshake on the
+/// listen backlog even when the server never accepts(). We send a minimal
+/// GET and require a response starting with "HTTP/1.1 200" within `to`.
+fn http_probe(target: &std::net::SocketAddr, to: std::time::Duration) -> bool {
+    use std::io::{Read, Write};
+    let mut st = match std::net::TcpStream::connect_timeout(target, to) {
+        Ok(s) => s,
+        Err(_) => return false,
+    };
+    let _ = st.set_read_timeout(Some(to));
+    let req = format!(
+        "GET /api/health HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nConnection: close\r\n\r\n",
+        target.port()
+    );
+    if st.write_all(req.as_bytes()).is_err() {
+        return false;
+    }
+    let mut buf = [0u8; 32];
+    let n = match st.read(&mut buf) {
+        Ok(n) if n > 0 => n,
+        _ => return false,
+    };
+    String::from_utf8_lossy(&buf[..n]).starts_with("HTTP/1.1 200")
+}
+
+/// Boot instant — the scan gate (see `BOOT_SCAN_GRACE_S`) compares against
+/// this so a scan POSTed seconds after a container start can't race the
+/// runtime's first connections (the 2026-10-27 wedge trigger pattern:
+/// an mDNS-resubscribing client re-POSTs a folder scan at T0+3s and the
+/// server wedges).
+static BOOT_TS: std::sync::LazyLock<std::time::Instant> =
+    std::sync::LazyLock::new(std::time::Instant::now);
+const BOOT_SCAN_GRACE_S: u64 = 120;
+
 /// Full-process state dump for the wedge forensics. Runs on a dedicated
 /// std::thread (NOT the tokio runtime — a wedged runtime would never poll
 /// a tokio watchdog). Called when 3 consecutive 10s listener probes fail.
@@ -2767,7 +2802,13 @@ fn wedge_dump(port: u16) {
     for t in &threads {
         eprintln!("[wedge-watch] {t}");
     }
-    // 2. The listener's accept queue (Recv-Q on the LISTEN socket).
+    // 2. The listener's accept queue (Recv-Q on the LISTEN socket) + our
+    //    open fd census (a vanished listener fd = a dead accept loop).
+    let nfd = std::fs::read_dir("/proc/self/fd")
+        .ok()
+        .map(|d| d.count())
+        .unwrap_or(0);
+    eprintln!("[wedge-watch] open fds: {nfd}");
     if let Ok(tcp) = std::fs::read_to_string("/proc/net/tcp") {
         let hexport = format!("{:04X}", port);
         for line in tcp.lines().skip(1) {
@@ -5328,6 +5369,27 @@ async fn library_scan(
 
 /// The actual scan (also called internally by the auto-rescan loop).
 async fn library_scan_inner(store: Store, req: ScanReq) -> Response {
+    // Boot gate (2026-10-27 wedge): a client that re-detects the server
+    // via mDNS re-POSTs its last scan seconds after a container start.
+    // That first heavy scan racing the runtime's first connections wedged
+    // the whole process (all workers idle-parked, listener dead). Refuse
+    // scans during the boot grace period — the client's retry (or the
+    // user's next click) lands on a settled runtime.
+    let since_boot = BOOT_TS.elapsed();
+    if since_boot.as_secs() < BOOT_SCAN_GRACE_S {
+        eprintln!(
+            "[scan] REFUSED — only {}s since boot (grace {}s), from req root={:?} folderId={:?}",
+            since_boot.as_secs(),
+            BOOT_SCAN_GRACE_S,
+            req.root,
+            req.folder_id
+        );
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({ "error": format!("server is still starting ({}s in) — retry in {}s", since_boot.as_secs(), BOOT_SCAN_GRACE_S.saturating_sub(since_boot.as_secs())) })),
+        )
+            .into_response();
+    }
     // Resolve roots: an explicit {root} wins (ad-hoc, no folder id);
     // then {folderId} (per-folder scan); otherwise ALL registered folders
     // — a manual scan is an explicit action; `enabled` only gates
@@ -7867,18 +7929,19 @@ async fn main() {
                     if started.elapsed() < std::time::Duration::from_secs(60) {
                         continue; // let the server settle (bind, first scan)
                     }
-                    let ok = std::net::TcpStream::connect_timeout(
-                        &target,
-                        std::time::Duration::from_secs(3),
-                    )
-                    .is_ok();
+                    // A plain TCP connect is NOT a valid wedge probe: the
+                    // kernel completes the 3-way handshake on the listen
+                    // backlog even when the server never accepts(), so a
+                    // wedged server still "accepts" connects. Probe with a
+                    // real HTTP request and require the response bytes.
+                    let ok = http_probe(&target, std::time::Duration::from_secs(5));
                     if ok {
                         fails = 0;
                         continue;
                     }
                     fails += 1;
                     if fails >= 3 {
-                        eprintln!("[wedge-watch] listener :{port} failed 3 probes in a row — dumping state");
+                        eprintln!("[wedge-watch] listener :{port} failed 3 HTTP probes in a row — dumping state");
                         wedge_dump(port);
                         fails = 0;
                     }
