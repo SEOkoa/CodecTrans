@@ -2695,6 +2695,12 @@ static SCAN_STATE: std::sync::Mutex<ScanState> = std::sync::Mutex::new(ScanState
 /// probe future is wedged, which parked the 2026-10-26 scan for 40+ min.
 static PROBE_INFLIGHT: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
 
+/// How many probe tasks have REACHED their first line (polled by a
+/// worker). Distinguishes "spawned but never polled" from "queued on the
+/// semaphore" when the scan stalls.
+static PROBE_TASKS_STARTED: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
 /// RAII: marks a path as probe-in-flight while a probe task runs (dropped
 /// when the task ends — every path, including panics).
 struct ProbeInflightGuard(String);
@@ -5336,24 +5342,34 @@ async fn library_scan(State(store): State<Store>, Json(req): Json<ScanReq>) -> R
     // auto-scan cheap on a big library (only new/changed files pay the
     // probe cost) while a first scan still probes everything.
     let sem = std::sync::Arc::new(tokio::sync::Semaphore::new(3));
-    // Diagnostic watchdog: while a scan is active, dump the probes
-    // currently in flight every 20s. The 2026-10-26 stall (790 probe
-    // tasks parked, 0 child processes) was invisible from the outside —
-    // this makes the in-flight set directly observable in the logs.
-    tokio::spawn(async move {
-        loop {
-            tokio::time::sleep(std::time::Duration::from_secs(20)).await;
-            let active = SCAN_STATE.lock().unwrap_or_else(|x| x.into_inner()).active;
-            if !active {
-                break;
+    // Diagnostic watchdog: while a scan is active, log the probe-phase
+    // state every 20s (started / in-flight / available permits). The
+    // 2026-10-26 stall was invisible from the outside — this makes the
+    // in-flight set and permit counts directly observable.
+    {
+        let sem_w = sem.clone();
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(std::time::Duration::from_secs(20)).await;
+                let active = SCAN_STATE.lock().unwrap_or_else(|x| x.into_inner()).active;
+                if !active {
+                    break;
+                }
+                let list = PROBE_INFLIGHT.lock().unwrap_or_else(|x| x.into_inner()).clone();
+                let started = PROBE_TASKS_STARTED.load(std::sync::atomic::Ordering::Relaxed);
+                let avail = sem_w.available_permits();
+                if !list.is_empty() || avail < 3 {
+                    let head = list.iter().take(4).cloned().collect::<Vec<_>>().join(" | ");
+                    eprintln!(
+                        "[scan] probe state: started={started} inflight({}) avail_permits={} — {head}",
+                        list.len(),
+                        avail
+                    );
+                }
             }
-            let list = PROBE_INFLIGHT.lock().unwrap_or_else(|x| x.into_inner()).clone();
-            if !list.is_empty() {
-                let head = list.iter().take(4).cloned().collect::<Vec<_>>().join(" | ");
-                eprintln!("[scan] probe inflight({}) — {head}", list.len());
-            }
-        }
-    });
+        });
+    }
+    PROBE_TASKS_STARTED.store(0, std::sync::atomic::Ordering::Relaxed);
     let mut handles: Vec<tokio::task::JoinHandle<Option<LibraryEntry>>> =
         Vec::with_capacity(plan.len());
     for (fid, rootp, rel) in &plan {
@@ -5379,7 +5395,22 @@ async fn library_scan(State(store): State<Store>, Json(req): Json<ScanReq>) -> R
         let old_entry = old_map.get(&key).cloned();
         let sem = sem.clone();
         handles.push(tokio::spawn(async move {
-            let _g = sem.acquire_owned().await.expect("probe semaphore");
+            PROBE_TASKS_STARTED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let _g = match tokio::time::timeout(
+                std::time::Duration::from_secs(120),
+                sem.clone().acquire_owned(),
+            )
+            .await
+            {
+                Ok(g) => g.expect("probe semaphore"),
+                Err(_) => {
+                    eprintln!(
+                        "[scan] probe semaphore starved >120s (avail={}) — {pstr}",
+                        sem.available_permits()
+                    );
+                    sem.clone().acquire_owned().await.expect("probe semaphore")
+                }
+            };
             let _pf = ProbeInflightGuard(pstr.clone());
             let size = tokio::task::spawn_blocking({
                 let f = full.clone();
