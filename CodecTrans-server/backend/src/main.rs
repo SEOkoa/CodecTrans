@@ -1641,6 +1641,32 @@ pub struct Condition {
     /// (default 10, clamped 1..=100).
     #[serde(default)]
     pub health_value: Option<u32>,
+    // ── plugin (extensible) conditions ─────────────────────────────
+    /// "field": which probed attribute to compare — "duration" (s) |
+    /// "size" (MB) | "bitrate" (Mbps) | "height" (px) | "width" (px) |
+    /// "fps" (numeric) or "name" | "codec" (family) | "container" |
+    /// "pixFmt" (text).
+    #[serde(default)]
+    pub field: Option<String>,
+    /// "field": operator — "gt" | "gte" | "lt" | "lte" (numeric fields,
+    /// threshold in `value`) or "eq" | "neq" | "contains" |
+    /// "startsWith" | "endsWith" (text fields, pattern in `pattern`,
+    /// case-insensitive).
+    #[serde(default)]
+    pub op: Option<String>,
+    /// "cmd" condition / "postCmd" action: a shell command (user
+    /// extension hook). Available env vars: CT_FILE (absolute source
+    /// path), CT_NAME, CT_DIR, CT_SIZE_MB, CT_DURATION_S, CT_CODEC,
+    /// CT_WIDTH, CT_HEIGHT, CT_FPS, CT_BITRATE_MBPS, CT_CONTAINER,
+    /// CT_PIXFMT — plus for postCmd: CT_OUTPUT, CT_OUTPUT_NAME,
+    /// CT_OUTPUT_SIZE_MB, CT_INPUT, CT_INPUT_NAME, CT_STATUS.
+    /// "cmd" condition: exit code 0 = ✓ (true), anything else = ✗.
+    #[serde(default)]
+    pub cmd: Option<String>,
+    /// "cmd" / "postCmd": timeout in seconds (default 30, clamped 1..=300).
+    /// On timeout the condition fails (✗) / the post command is abandoned.
+    #[serde(default)]
+    pub cmd_timeout: Option<u32>,
 }
 
 /// Block action — what to do with matching files.
@@ -1672,6 +1698,17 @@ pub struct Action {
     /// "requeue" (entry goes back to the queue for another attempt).
     #[serde(default)]
     pub verify_on_failure: Option<String>,
+    // ── plugin (extensible) action: "postCmd" ───────────────────
+    /// "postCmd": shell command run after the encode (in chain order).
+    /// Env vars: CT_OUTPUT, CT_OUTPUT_NAME, CT_OUTPUT_SIZE_MB, CT_INPUT,
+    /// CT_INPUT_NAME, CT_STATUS plus the source metadata vars (CT_NAME,
+    /// CT_SIZE_MB, CT_CODEC, CT_HEIGHT, … — see Condition.cmd docs).
+    /// Non-fatal: a failing command logs a warning, the chain continues.
+    #[serde(default)]
+    pub cmd: Option<String>,
+    /// "postCmd": timeout in seconds (default 30, clamped 1..=300).
+    #[serde(default)]
+    pub cmd_timeout: Option<u32>,
 }
 
 /// One automation block: condition → action. Blocks are evaluated in order,
@@ -1731,6 +1768,10 @@ pub struct LibraryConfig {
     /// is in flight.
     #[serde(default)]
     pub auto_scan_minutes: u32,
+    /// UI language: "ko" (default) | "en". Client-rendered, so it lives
+    /// here (server-level) and is picked up by GET /api/settings.
+    #[serde(default)]
+    pub language: Option<String>,
 }
 
 /// One quarantined file under `fail_dir` (dashboard 보관함 tab).
@@ -1831,6 +1872,16 @@ pub enum PostOp {
     /// folder logic to reprocess, or expect a re-encode loop if the same
     /// logic applies.
     Requeue,
+    /// User extension hook: run a shell command after the encode (in chain
+    /// order, with CT_OUTPUT / CT_INPUT / CT_STATUS env vars). Non-fatal —
+    /// a failing or timed-out command logs a warning and the chain
+    /// continues (it must never hold the file hostage).
+    Cmd {
+        #[serde(default)]
+        cmd: String,
+        #[serde(default)]
+        timeout: u32,
+    },
 }
 
 /// FNV-1a — stable across restarts (unlike a counter) so "every Nth"
@@ -2744,14 +2795,22 @@ struct SettingsBody {
     fail_dir: Option<Option<String>>,
     /// Auto-rescan interval in minutes (0 = off).
     auto_scan_minutes: Option<u32>,
+    /// UI language: "ko" | "en" (missing = leave as-is, null = default ko).
+    language: Option<Option<String>>,
 }
 
 /// GET /api/settings — server-level settings (fail folder, auto-rescan).
 async fn settings_get(State(_store): State<Store>) -> impl IntoResponse {
     let c = load_lib_cfg();
+    let lang = c
+        .language
+        .clone()
+        .filter(|l| l == "ko" || l == "en")
+        .unwrap_or_else(|| "ko".to_string());
     Json(json!({
         "failDir": c.fail_dir,
         "autoScanMinutes": c.auto_scan_minutes,
+        "language": lang,
     }))
 }
 
@@ -2767,8 +2826,18 @@ async fn settings_post(State(_store): State<Store>, Json(b): Json<SettingsBody>)
     if let Some(m) = b.auto_scan_minutes {
         c.auto_scan_minutes = m.min(1440);
     }
+    match b.language {
+        Some(None) => c.language = None,
+        Some(Some(l)) => c.language = Some(if l == "en" { "en" } else { "ko" }.to_string()),
+        None => {} // field absent — leave language untouched
+    }
+    let lang = c
+        .language
+        .clone()
+        .filter(|l| l == "ko" || l == "en")
+        .unwrap_or_else(|| "ko".to_string());
     match save_lib_cfg(&c) {
-        Ok(_) => Json(json!({ "ok": true, "failDir": c.fail_dir, "autoScanMinutes": c.auto_scan_minutes })).into_response(),
+        Ok(_) => Json(json!({ "ok": true, "failDir": c.fail_dir, "autoScanMinutes": c.auto_scan_minutes, "language": lang })).into_response(),
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(json!({ "error": e.to_string() })),
@@ -3582,11 +3651,139 @@ async fn dispatch_lib_job(
     Ok(true)
 }
 
+/// Resolve a plugin `field` name to (numeric, text) for the entry.
+fn field_value(
+    f: &str,
+    e: &LibraryEntry,
+) -> (Option<f64>, Option<String>) {
+    match f {
+        "duration" => (e.duration, None),
+        "size" => (Some(e.size as f64 / 1_048_576.0), None),
+        "bitrate" => (e.video_bit_rate.map(|b| b as f64 / 1_000_000.0), None),
+        "height" => (e.height.map(|h| h as f64), None),
+        "width" => (e.width.map(|w| w as f64), None),
+        "fps" => (e.fps, None),
+        "name" => (None, Some(e.name.clone())),
+        "codec" => (
+            None,
+            Some(
+                e.video_codec
+                    .as_deref()
+                    .map(codec_family)
+                    .unwrap_or_else(|| "other".into()),
+            ),
+        ),
+        "container" => (None, e.container.clone()),
+        "pixFmt" => (None, e.pix_fmt.clone()),
+        _ => (None, None),
+    }
+}
+
+/// Compare a plugin `field` value against the condition's op/threshold.
+fn field_cmp(c: &Condition, e: &LibraryEntry) -> bool {
+    let f = c.field.as_deref().unwrap_or("");
+    let op = c.op.as_deref().unwrap_or("gt");
+    let (num, txt) = field_value(f, e);
+    match op {
+        "gt" | "gte" | "lt" | "lte" => {
+            let v = c.value.unwrap_or(f64::INFINITY);
+            match num {
+                Some(x) if !x.is_nan() => match op {
+                    "gt" => x > v,
+                    "gte" => x >= v,
+                    "lt" => x < v,
+                    "lte" => x <= v,
+                    _ => false,
+                },
+                _ => false,
+            }
+        }
+        _ => {
+            // Text operators (eq/neq/contains/startsWith/endsWith) —
+            // case-insensitive. Numeric fields fall back to their decimal
+            // form so "eq 1080" also works on height.
+            let hay = txt
+                .or_else(|| num.map(|x| x.to_string()))
+                .map(|s| s.to_lowercase())
+                .unwrap_or_default();
+            let pat = c
+                .pattern
+                .clone()
+                .unwrap_or_default()
+                .to_lowercase();
+            match op {
+                "eq" => !hay.is_empty() && hay == pat,
+                "neq" => hay != pat,
+                "contains" => !pat.is_empty() && hay.contains(&pat),
+                "startsWith" => !pat.is_empty() && hay.starts_with(&pat),
+                "endsWith" => !pat.is_empty() && hay.ends_with(&pat),
+                _ => false,
+            }
+        }
+    }
+}
+
+/// Build the env for a plugin command (clean env + explicit vars — the
+/// command only ever sees what it is documented to get, plus PATH so
+/// normal tools resolve).
+fn cmd_env(e: &LibraryEntry, file: Option<&str>) -> Vec<(String, String)> {
+    let mut v: Vec<(String, String)> = Vec::new();
+    let put = |v: &mut Vec<(String, String)>, k: &str, s: String| {
+        if !s.is_empty() {
+            v.push((k.into(), s));
+        }
+    };
+    if let Some(f) = file {
+        let p = std::path::Path::new(f);
+        put(&mut v, "CT_FILE", f.to_string());
+        put(&mut v, "CT_NAME", e.name.clone());
+        put(
+            &mut v,
+            "CT_DIR",
+            p.parent().map(|d| d.to_string_lossy().into_owned()).unwrap_or_default(),
+        );
+    }
+    put(&mut v, "CT_SIZE_MB", (e.size as f64 / 1_048_576.0).to_string());
+    put(&mut v, "CT_DURATION_S", e.duration.map(|d| d.to_string()).unwrap_or_default());
+    put(&mut v, "CT_CODEC", e.video_codec.clone().unwrap_or_default());
+    put(&mut v, "CT_WIDTH", e.width.map(|w| w.to_string()).unwrap_or_default());
+    put(&mut v, "CT_HEIGHT", e.height.map(|h| h.to_string()).unwrap_or_default());
+    put(&mut v, "CT_FPS", e.fps.map(|x| x.to_string()).unwrap_or_default());
+    if let Some(b) = e.video_bit_rate {
+        put(&mut v, "CT_BITRATE_MBPS", (b as f64 / 1_000_000.0).to_string());
+    }
+    put(&mut v, "CT_CONTAINER", e.container.clone().unwrap_or_default());
+    put(&mut v, "CT_PIXFMT", e.pix_fmt.clone().unwrap_or_default());
+    if let Ok(path) = std::env::var("PATH") {
+        v.push(("PATH".into(), path));
+    }
+    v
+}
+
+/// Run a plugin command with a timeout. Returns Ok(success) or
+/// Err(reason) — callers decide whether a failure is fatal.
+async fn run_cmd(cmd: &str, timeout_s: u32, env: Vec<(String, String)>) -> Result<bool, String> {
+    let secs = timeout_s.clamp(1, 300).max(1) as u64;
+    let mut c = tokio::process::Command::new("sh");
+    c.arg("-c").arg(cmd).env_clear();
+    for (k, val) in env {
+        c.env(k, val);
+    }
+    c.kill_on_drop(true);
+    match tokio::time::timeout(std::time::Duration::from_secs(secs), c.output()).await {
+        Ok(Ok(o)) => Ok(o.status.success()),
+        Ok(Err(err)) => Err(format!("spawn: {err}")),
+        Err(_) => Err(format!("timeout after {secs}s")),
+    }
+}
+
 /// Does a block condition match a newly found library entry?
 /// `health` maps catalog key → source-file health (ffprobe: video stream +
 /// positive duration). Only consulted by the `srcHealth` condition; the map
 /// is built (awaited, non-blocking) by the caller when a graph uses it.
-fn cond_matches(
+/// Async because the `cmd` plugin condition runs a (timeout-bounded)
+/// shell command.
+async fn cond_matches(
     c: &Condition,
     e: &LibraryEntry,
     online: &[Node],
@@ -3639,6 +3836,32 @@ fn cond_matches(
             let pat = c.pattern.as_deref().unwrap_or("").to_lowercase();
             !pat.is_empty() && e.name.to_lowercase().contains(&pat)
         }
+        // ── plugin conditions ──────────────────────────────────────
+        // Generic field comparison — the "bring your own threshold"
+        // condition: duration/size/bitrate/height/width/fps or
+        // name/codec/container/pixFmt with gt/gte/lt/lte/eq/neq/
+        // contains/startsWith/endsWith.
+        "field" => {
+            if c.field.is_none() {
+                return false;
+            }
+            field_cmp(c, e)
+        }
+        // Shell command condition — the full extension hook: any check
+        // the user can express with a command (exit 0 = ✓).
+        "cmd" => {
+            let cmd = match c.cmd.as_deref() {
+                Some(x) if !x.trim().is_empty() => x.to_string(),
+                _ => return false,
+            };
+            match run_cmd(&cmd, c.cmd_timeout.unwrap_or(30), cmd_env(e, None)).await {
+                Ok(ok) => ok,
+                Err(why) => {
+                    eprintln!("[logic] cmd condition failed for {}: {why}", e.name);
+                    false
+                }
+            }
+        }
         _ => false,
     }
 }
@@ -3657,6 +3880,85 @@ enum GraphDecision {
     FailToFolder,
 }
 
+/// Per-file graph decision with the graph-precedence rules: 1) the
+/// folder's chosen NAMED logic (library-tab assignment), 2) legacy
+/// per-folder inline graph, 3) global library graph, 4) the folder's bulk
+/// default. Free (not closure) async fn because the `cmd` plugin
+/// condition awaits — a local fn item can't capture the scan task's
+/// dynamic environment.
+async fn evaluate_graph(
+    h: &std::collections::HashMap<String, bool>,
+    e: &LibraryEntry,
+    folder: Option<&FolderRule>,
+    libcfg: &LibraryConfig,
+    eff_graph: &Option<WorkflowGraph>,
+    online: &[Node],
+) -> Option<GraphDecision> {
+    let folder_target: TargetCfg = folder
+        .map(|f| f.target.clone())
+        .unwrap_or_default();
+    // Graph precedence: 1) the folder's chosen NAMED logic
+    // (library-tab assignment), 2) legacy per-folder inline
+    // graph, 3) global library graph. None of them -> the
+    // folder's bulk default below.
+    let logic_graph: Option<&WorkflowGraph> = folder
+        .and_then(|f| f.logic_id.as_deref())
+        .and_then(|lid| libcfg.logics.iter().find(|l| l.id == lid))
+        .map(|l| &l.graph);
+    let folder_graph: Option<&WorkflowGraph> = folder
+        .filter(|f| {
+            f.graph
+                .nodes
+                .iter()
+                .any(|n| n.kind == "condition" || n.kind == "action")
+        })
+        .map(|f| &f.graph);
+    let g = logic_graph
+        .or(folder_graph)
+        .or_else(|| eff_graph.as_ref());
+    if let Some(g) = g {
+        // Walk the node graph; first action reached wins, its
+        // output port carries the post-encode plan. No action
+        // reached -> the folder's bulk default below.
+        Some(
+            eval_graph(g, e, online, &folder_target, h)
+                .await
+                .unwrap_or_else(|| {
+                    if folder_target.video_codec.is_some() {
+                        GraphDecision::Encode {
+                            target: folder_target.clone(),
+                            post: Vec::new(),
+                            hw_only: false,
+                        }
+                    } else {
+                        GraphDecision::Skip
+                    }
+                }),
+        )
+    } else if e.folder.is_some() {
+        if folder_target.video_codec.is_some() {
+            Some(GraphDecision::Encode {
+                target: folder_target.clone(),
+                post: Vec::new(),
+                hw_only: false,
+            })
+        } else {
+            Some(GraphDecision::Skip)
+        }
+    } else {
+        let ac = load_auto();
+        if ac.enabled {
+            Some(GraphDecision::Encode {
+                target: ac.into(),
+                post: Vec::new(),
+                hw_only: false,
+            })
+        } else {
+            None
+        }
+    }
+}
+
 /// Evaluate the node graph for one file: from every `start` node follow the
 /// edges — a condition's ✓ port is taken when the condition matches (a
 /// disabled condition acts as an open gate), ✗ when it doesn't — and the
@@ -3665,7 +3967,7 @@ enum GraphDecision {
 /// `health` feeds the `srcHealth` condition (source ffprobe result map).
 /// None = the file reached no action (caller falls back to the folder
 /// default).
-fn eval_graph(
+async fn eval_graph(
     g: &WorkflowGraph,
     e: &LibraryEntry,
     online: &[Node],
@@ -3707,19 +4009,22 @@ fn eval_graph(
     // before replace) are EVALUATED with the same health map used during
     // the scan; the recursion then follows ONLY the matching branch port.
     // Anything else (another primary action, the start) ends that branch.
-    fn post_chain(
+    // (Boxed future: the recursion needs indirection — a recursive async
+    // fn would be infinitely sized.)
+    fn post_chain<'a>(
         i: usize,
-        g: &WorkflowGraph,
-        out: &[Vec<(usize, Option<String>)>],
-        visited: &mut HashSet<usize>,
-        plan: &mut Vec<PostOp>,
-        e: &LibraryEntry,
-        online: &[Node],
-        health: &std::collections::HashMap<String, bool>,
+        g: &'a WorkflowGraph,
+        out: &'a [Vec<(usize, Option<String>)>],
+        visited: &'a mut HashSet<usize>,
+        plan: &'a mut Vec<PostOp>,
+        e: &'a LibraryEntry,
+        online: &'a [Node],
+        health: &'a std::collections::HashMap<String, bool>,
         // Some(b): node i is a condition — only the branch matching `b`
         // continues. None: i is the encode (or a post action) — plain chain.
         branch: Option<bool>,
-    ) {
+    ) -> futures_util::future::BoxFuture<'a, ()> {
+        Box::pin(async move {
         for (j, port) in out[i].iter().cloned() {
             let n = &g.nodes[j];
             if !n.enabled {
@@ -3744,9 +4049,9 @@ fn eval_graph(
                 if branch.is_some() {
                     continue;
                 }
-                let r = cond_matches(&n.condition, e, online, health);
+                let r = cond_matches(&n.condition, e, online, health).await;
                 if visited.insert(j) {
-                    post_chain(j, g, out, visited, plan, e, online, health, Some(r));
+                    post_chain(j, g, out, visited, plan, e, online, health, Some(r)).await;
                 }
                 continue;
             }
@@ -3773,32 +4078,46 @@ fn eval_graph(
                 "replace" => Some(PostOp::Replace),
                 "saveHere" => Some(PostOp::SaveHere),
                 "requeue" => Some(PostOp::Requeue),
+                "postCmd" => {
+                    let cmd = n.action.cmd.clone().unwrap_or_default();
+                    if cmd.trim().is_empty() {
+                        None
+                    } else {
+                        Some(PostOp::Cmd {
+                            cmd,
+                            timeout: n.action.cmd_timeout.unwrap_or(30),
+                        })
+                    }
+                }
                 _ => None, // another primary action — chain ends here
             };
             if let Some(o) = op {
                 plan.push(o);
-                post_chain(j, g, out, visited, plan, e, online, health, None);
+                post_chain(j, g, out, visited, plan, e, online, health, None).await;
             }
         }
+        })
     }
 
-    fn rec(
+    // (Boxed future — recursion, same reason as post_chain.)
+    fn rec<'a>(
         i: usize,
-        g: &WorkflowGraph,
-        out: &[Vec<(usize, Option<String>)>],
-        visited: &mut HashSet<usize>,
-        e: &LibraryEntry,
-        online: &[Node],
-        folder_target: &TargetCfg,
-        health: &std::collections::HashMap<String, bool>,
-    ) -> Option<GraphDecision> {
+        g: &'a WorkflowGraph,
+        out: &'a [Vec<(usize, Option<String>)>],
+        visited: &'a mut HashSet<usize>,
+        e: &'a LibraryEntry,
+        online: &'a [Node],
+        folder_target: &'a TargetCfg,
+        health: &'a std::collections::HashMap<String, bool>,
+    ) -> futures_util::future::BoxFuture<'a, Option<GraphDecision>> {
+        Box::pin(async move {
         if !visited.insert(i) {
             return None;
         }
         let n = &g.nodes[i];
         let result: bool = match n.kind.as_str() {
             "start" => true,
-            "condition" => !n.enabled || cond_matches(&n.condition, e, online, health),
+            "condition" => !n.enabled || cond_matches(&n.condition, e, online, health).await,
             "action" => {
                 if !n.enabled {
                     return None;
@@ -3811,7 +4130,7 @@ fn eval_graph(
                             .unwrap_or_else(|| folder_target.clone());
                         let hw_only = n.action.hw_only;
                         let mut plan = Vec::new();
-                        post_chain(i, g, out, visited, &mut plan, e, online, health, None);
+                        post_chain(i, g, out, visited, &mut plan, e, online, health, None).await;
                         Some(GraphDecision::Encode {
                             target: t,
                             post: plan,
@@ -3847,17 +4166,20 @@ fn eval_graph(
                 _ => false,
             };
             if taken {
-                if let Some(d) = rec(j, g, out, visited, e, online, folder_target, health) {
+                if let Some(d) =
+                    rec(j, g, out, visited, e, online, folder_target, health).await
+                {
                     return Some(d);
                 }
             }
         }
         None
+        })
     }
 
     for (i, n) in g.nodes.iter().enumerate() {
         if n.kind == "start" {
-            if let Some(d) = rec(i, g, &out, &mut visited, e, online, folder_target, health) {
+            if let Some(d) = rec(i, g, &out, &mut visited, e, online, folder_target, health).await {
                 return Some(d);
             }
         }
@@ -4595,80 +4917,22 @@ async fn library_scan(State(store): State<Store>, Json(req): Json<ScanReq>) -> R
             // reaches the SAME decision with srcHealth true AND false, the
             // decode is pure waste for this file (it is skipped by cheaper
             // conditions first) — only files whose outcome actually depends
-            // on the health gate pay for the decode.
-            let evaluate = |h: &std::collections::HashMap<String, bool>| -> Option<GraphDecision> {
-                // Graph precedence: 1) the folder's chosen NAMED logic
-                // (library-tab assignment), 2) legacy per-folder inline
-                // graph, 3) global library graph. None of them -> the
-                // folder's bulk default below.
-                let logic_graph: Option<&WorkflowGraph> = folder
-                    .and_then(|f| f.logic_id.as_deref())
-                    .and_then(|lid| libcfg.logics.iter().find(|l| l.id == lid))
-                    .map(|l| &l.graph);
-                let folder_graph: Option<&WorkflowGraph> = folder
-                    .filter(|f| {
-                        f.graph
-                            .nodes
-                            .iter()
-                            .any(|n| n.kind == "condition" || n.kind == "action")
-                    })
-                    .map(|f| &f.graph);
-                let g = logic_graph
-                    .or(folder_graph)
-                    .or_else(|| eff_graph.as_ref().as_ref());
-                if let Some(g) = g {
-                    // Walk the node graph; first action reached wins, its
-                    // output port carries the post-encode plan. No action
-                    // reached -> the folder's bulk default below.
-                    Some(
-                        eval_graph(g, &e, &online[..], &folder_target, h)
-                            .unwrap_or_else(|| {
-                                if folder_target.video_codec.is_some() {
-                                    GraphDecision::Encode {
-                                        target: folder_target.clone(),
-                                        post: Vec::new(),
-                                        hw_only: false,
-                                    }
-                                } else {
-                                    GraphDecision::Skip
-                                }
-                            }),
-                    )
-                } else if e.folder.is_some() {
-                    if folder_target.video_codec.is_some() {
-                        Some(GraphDecision::Encode {
-                            target: folder_target.clone(),
-                            post: Vec::new(),
-                            hw_only: false,
-                        })
-                    } else {
-                        Some(GraphDecision::Skip)
-                    }
-                } else {
-                    let ac = load_auto();
-                    if ac.enabled {
-                        Some(GraphDecision::Encode {
-                            target: ac.into(),
-                            post: Vec::new(),
-                            hw_only: false,
-                        })
-                    } else {
-                        None
-                    }
-                }
-            };
+            // on the health gate pay for the decode. (evaluate_graph is a
+            // free async fn — a local fn item can't capture this block's
+            // dynamic environment.)
             let h_true = std::collections::HashMap::from([(key.clone(), true)]);
             let h_false = std::collections::HashMap::from([(key.clone(), false)]);
             let decision = if health_depths.is_empty() {
-                evaluate(&h_true)
+                evaluate_graph(&h_true, &e, folder, &libcfg, &eff_graph, &online).await
             } else if health_conc == 0 {
                 // Workers disabled (CT_HEALTH_WORKERS=0): the decode never
                 // runs, so the gate can only ever pass — evaluate as
                 // healthy. (Corrupt files are no longer quarantined.)
-                evaluate(&h_true)
+                evaluate_graph(&h_true, &e, folder, &libcfg, &eff_graph, &online).await
             } else {
-                let d_true = evaluate(&h_true);
-                let d_false = evaluate(&h_false);
+                let d_true = evaluate_graph(&h_true, &e, folder, &libcfg, &eff_graph, &online).await;
+                let d_false =
+                    evaluate_graph(&h_false, &e, folder, &libcfg, &eff_graph, &online).await;
                 if d_true == d_false {
                     // The health gate changes nothing for this file — skip
                     // the decode entirely.
@@ -4685,7 +4949,15 @@ async fn library_scan(State(store): State<Store>, Json(req): Json<ScanReq>) -> R
                         }
                         None => false,
                     };
-                    evaluate(if h { &h_true } else { &h_false })
+                    evaluate_graph(
+                        if h { &h_true } else { &h_false },
+                        &e,
+                        folder,
+                        &libcfg,
+                        &eff_graph,
+                        &online,
+                    )
+                    .await
                 }
             };
             let mut saved_decision: Option<String> = None;
@@ -6108,6 +6380,46 @@ async fn finish_lib_job(store: &Store, job_id: String, out_name: String, size: u
                 // After the rest of the plan: back to the
                 // queue (a rescan re-dispatches the entry).
                 requeue = true;
+            }
+            PostOp::Cmd { cmd, timeout } => {
+                // User extension hook (post-processing command). Runs
+                // in chain order with CT_OUTPUT/CT_INPUT/CT_STATUS env
+                // vars. NON-FATAL: a failure or timeout logs a warning
+                // and the chain continues — the file's fate must never
+                // depend on a user script.
+                if cmd.trim().is_empty() {
+                    continue;
+                }
+                // Clone the entry out of the lock BEFORE the await (never
+                // hold the store lock across an async command).
+                let entry = store
+                    .lock()
+                    .unwrap()
+                    .library
+                    .get(&lp)
+                    .cloned();
+                if let Some(en) = entry {
+                    let src_str = src.to_string_lossy().into_owned();
+                    let mut env = cmd_env(&en, Some(&src_str));
+                    env.push(("CT_OUTPUT".into(), dest.to_string_lossy().into_owned()));
+                    env.push(("CT_OUTPUT_NAME".into(), out_name.clone()));
+                    env.push((
+                        "CT_OUTPUT_SIZE_MB".into(),
+                        (size as f64 / 1_048_576.0).to_string(),
+                    ));
+                    env.push(("CT_INPUT".into(), src_str.clone()));
+                    env.push(("CT_INPUT_NAME".into(), src_name.clone()));
+                    env.push(("CT_STATUS".into(), "done".into()));
+                    match run_cmd(cmd, *timeout, env).await {
+                        Ok(true) => {}
+                        Ok(false) => eprintln!(
+                            "[logic] postCmd exited non-zero (non-fatal) for {out_name} job={job_id}"
+                        ),
+                        Err(why) => eprintln!(
+                            "[logic] postCmd failed (non-fatal) for {out_name} job={job_id}: {why}"
+                        ),
+                    }
+                }
             }
         }
     }
