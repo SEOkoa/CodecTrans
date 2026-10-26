@@ -43,7 +43,7 @@ use tokio::process::Command;
 use tower_http::services::ServeDir;
 use tower_http::cors::CorsLayer;
 use axum::middleware::Next;
-use axum::extract::Request;
+use axum::extract::{ConnectInfo, Request};
 use axum::http::header;
 
 // ============================================================
@@ -2736,6 +2736,115 @@ fn phase_set(p: &str, ph: &'static str) {
     v.push((p.to_string(), ph));
 }
 
+/// Full-process state dump for the wedge forensics. Runs on a dedicated
+/// std::thread (NOT the tokio runtime — a wedged runtime would never poll
+/// a tokio watchdog). Called when 3 consecutive 10s listener probes fail.
+/// The 2026-10-27 wedge: all tokio workers parked on futex, the accept
+/// queue filling, nothing logged — this dump is what the post-mortem
+/// waits for.
+fn wedge_dump(port: u16) {
+    eprintln!("[wedge-watch] ===== state dump (listener :{} unresponsive) =====", port);
+    // 1. Every thread: state + kernel wchan.
+    let mut threads = Vec::new();
+    if let Ok(rd) = std::fs::read_dir("/proc/self/task") {
+        for e in rd.flatten() {
+            let tid = e.file_name().to_string_lossy().to_string();
+            let stat = std::fs::read_to_string(format!("/proc/self/task/{tid}/stat")).ok();
+            let wchan = std::fs::read_to_string(format!("/proc/self/task/{tid}/wchan")).ok();
+            if let Some(s) = stat {
+                // stat: pid (comm) state ppid ...  — comm may contain spaces.
+                let close = s.rfind(')').unwrap_or(0);
+                let state = s.get(close + 2..close + 3).unwrap_or("?");
+                let name = &s[1..close];
+                threads.push(format!(
+                    "  tid={tid} comm={name} state={state} wchan={:?}",
+                    wchan.map(|w| w.trim().to_string())
+                ));
+            }
+        }
+    }
+    eprintln!("[wedge-watch] threads ({}):", threads.len());
+    for t in &threads {
+        eprintln!("[wedge-watch] {t}");
+    }
+    // 2. The listener's accept queue (Recv-Q on the LISTEN socket).
+    if let Ok(tcp) = std::fs::read_to_string("/proc/net/tcp") {
+        let hexport = format!("{:04X}", port);
+        for line in tcp.lines().skip(1) {
+            let f: Vec<&str> = line.split_whitespace().collect();
+            if f.len() > 3 && f[1].ends_with(&format!(":{hexport}")) && f[3] == "0A" {
+                eprintln!("[wedge-watch] LISTEN :{} accept-queue(Recv-Q)={} send-Q={}", port, f[2], f[4].split_whitespace().next().unwrap_or("?"));
+            }
+        }
+    }
+    // 3. Scan + probe ledger.
+    let st = SCAN_STATE.lock().unwrap_or_else(|x| x.into_inner()).clone();
+    eprintln!("[wedge-watch] SCAN_STATE: active={} scanned={} total={}", st.active, st.scanned, st.total);
+    let infl = PROBE_INFLIGHT.lock().unwrap_or_else(|x| x.into_inner()).clone();
+    let started = PROBE_TASKS_STARTED.load(std::sync::atomic::Ordering::Relaxed);
+    let ph = TASK_PHASES.lock().unwrap_or_else(|x| x.into_inner()).clone();
+    let mut counts: std::collections::HashMap<&'static str, usize> = std::collections::HashMap::new();
+    for (_, v) in &ph {
+        *counts.entry(v).or_insert(0) += 1;
+    }
+    eprintln!("[wedge-watch] probe ledger: started={started} inflight={} phases={:?}", infl.len(), counts);
+    for (k, v) in ph.iter().take(8) {
+        eprintln!("[wedge-watch]   phase[{v}]: {k}");
+    }
+    // 4. Jobs + library (short locks, clone counts only — never hold the
+    //    store guard across any await, and this is a std thread anyway).
+    {
+        let guard = WEDGE_STORE.lock().unwrap_or_else(|x| x.into_inner());
+        if let Some(st) = guard.as_ref() {
+            if let Ok(s) = std::sync::Mutex::lock(st) {
+                let n_jobs = s.jobs.len();
+                let n_lib = s.library.len();
+                let running = s.jobs.values().filter(|j| j.status == "running").count();
+                eprintln!("[wedge-watch] store: jobs={n_jobs} (running={running}) library={n_lib}");
+            }
+        }
+    }
+    // 5. Child processes (ffprobe/ffmpeg) on this host.
+    if let Ok(rd) = std::fs::read_dir("/proc") {
+        for d in rd.flatten() {
+            let p = d.path();
+            let Some(c) = std::fs::read_to_string(p.join("comm")).ok() else { continue };
+            let c = c.trim();
+            if c.starts_with("ffmpeg") || c.starts_with("ffprobe") {
+                let state = std::fs::read_to_string(p.join("stat"))
+                    .ok()
+                    .and_then(|stat| {
+                        stat.rfind(')')
+                            .and_then(|i| stat.get(i + 2..i + 3).map(|x| x.to_string()))
+                    })
+                    .unwrap_or_default();
+                let cmd = std::fs::read_to_string(p.join("cmdline"))
+                    .ok()
+                    .map(|c| c.replace('\0', " "))
+                    .unwrap_or_default();
+                eprintln!(
+                    "[wedge-watch]   child {} {c} state={state} {cmd}",
+                    p.file_name().unwrap_or_default().to_string_lossy()
+                );
+            }
+        }
+    }
+    // 6. Our own memory.
+    if let Ok(status) = std::fs::read_to_string("/proc/self/status") {
+        for line in status.lines() {
+            if line.starts_with("VmRSS") || line.starts_with("Threads") {
+                eprintln!("[wedge-watch] {line}");
+            }
+        }
+    }
+    eprintln!("[wedge-watch] ===== end state dump =====");
+}
+
+/// Store handle kept for wedge_dump (the dump runs on a plain std thread
+/// that cannot reach main's locals). Set once in main.
+static WEDGE_STORE: std::sync::Mutex<Option<std::sync::Arc<std::sync::Mutex<JobStore>>>> =
+    std::sync::Mutex::new(None);
+
 /// Monotonic catalog revision — bumped every time the catalog hits disk.
 /// Lets GET /api/library answer 304 Not Modified to the UI's 2s poll (the
 /// full 4k-entry JSON body is ~1MB; 304 is 0 bytes) without any content
@@ -5205,7 +5314,20 @@ fn sub_str_of(p: &std::path::Path) -> String {
 /// ffprobing each video (non-destructive: entries of folders not scanned
 /// this time are kept) and auto-queues newly found files per the saved
 /// automation (logic blocks first, then the folder's default target).
-async fn library_scan(State(store): State<Store>, Json(req): Json<ScanReq>) -> Response {
+async fn library_scan(
+    State(store): State<Store>,
+    ConnectInfo(remote): ConnectInfo<std::net::SocketAddr>,
+    Json(req): Json<ScanReq>,
+) -> Response {
+    eprintln!(
+        "[scan] POST /api/library/scan from {} — root={:?} folderId={:?}",
+        remote, req.root, req.folder_id
+    );
+    library_scan_inner(store, req).await
+}
+
+/// The actual scan (also called internally by the auto-rescan loop).
+async fn library_scan_inner(store: Store, req: ScanReq) -> Response {
     // Resolve roots: an explicit {root} wins (ad-hoc, no folder id);
     // then {folderId} (per-folder scan); otherwise ALL registered folders
     // — a manual scan is an explicit action; `enabled` only gates
@@ -7716,6 +7838,55 @@ async fn dispatch(State(store): State<Store>, Json(req): Json<DispatchReq>) -> R
 async fn main() {
     let port: u16 = std::env::var("CT_PORT").ok().and_then(|s| s.parse().ok()).unwrap_or(8400);
 
+    // Wedge forensics (2026-10-27): the server wedges with every thread
+    // parked and NOTHING logged — capture panics loudly and keep a plain
+    // std thread that probes the listener and dumps full state when it
+    // goes silent (a tokio task would never run if the runtime wedges).
+    std::panic::set_hook(Box::new(|info| {
+        let msg = if let Some(s) = info.payload().downcast_ref::<&str>() {
+            (*s).to_string()
+        } else if let Some(s) = info.payload().downcast_ref::<String>() {
+            s.clone()
+        } else {
+            "<non-string panic payload>".into()
+        };
+        eprintln!("[PANIC] thread {:?}: {msg}", std::thread::current().name());
+        eprintln!("[PANIC] backtrace:\n{:?}", std::backtrace::Backtrace::force_capture());
+    }));
+    {
+        let port = port;
+        std::thread::Builder::new()
+            .name("wedge-watch".into())
+            .spawn(move || {
+                let mut fails = 0usize;
+                let started = std::time::Instant::now();
+                let target: std::net::SocketAddr =
+                    format!("127.0.0.1:{port}").parse().unwrap();
+                loop {
+                    std::thread::sleep(std::time::Duration::from_secs(10));
+                    if started.elapsed() < std::time::Duration::from_secs(60) {
+                        continue; // let the server settle (bind, first scan)
+                    }
+                    let ok = std::net::TcpStream::connect_timeout(
+                        &target,
+                        std::time::Duration::from_secs(3),
+                    )
+                    .is_ok();
+                    if ok {
+                        fails = 0;
+                        continue;
+                    }
+                    fails += 1;
+                    if fails >= 3 {
+                        eprintln!("[wedge-watch] listener :{port} failed 3 probes in a row — dumping state");
+                        wedge_dump(port);
+                        fails = 0;
+                    }
+                }
+            })
+            .ok();
+    }
+
     // Node registry backend: Redis (persistent node identity + liveness).
     let redis_url = std::env::var("CT_REDIS").unwrap_or_else(|_| "redis://127.0.0.1:6379".into());
     let rclient = redis::Client::open(redis_url.clone()).expect("redis client");
@@ -7730,6 +7901,11 @@ async fn main() {
     };
     println!("[CodecTrans] node registry -> redis {redis_url}");
     let store: Store = Arc::new(Mutex::new(JobStore::new(rconn)));
+    // Hand a clone to the wedge-watch std thread for its state dumps.
+    WEDGE_STORE
+        .lock()
+        .unwrap_or_else(|x| x.into_inner())
+        .replace(store.clone());
 
     // Restore the persisted library catalog (survives restarts — a rescan
     // must not re-queue finished files).
@@ -7848,7 +8024,12 @@ async fn main() {
         None => println!("[CodecTrans] WARNING: CT_API_TOKEN not set — the API is open to every device on this network. For LAN-wide exposure set CT_API_TOKEN here AND on each node."),
     }
     let listener = tokio::net::TcpListener::bind(&addr).await.expect("bind");
-    axum::serve(listener, app).await.unwrap();
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+    )
+    .await
+    .unwrap();
 }
 
 /// Read a TXT property value as a UTF-8 string (best-effort).
@@ -8154,9 +8335,9 @@ async fn spawn_mdns(store: &Store, port: u16) {
                 if scanning {
                     continue;
                 }
-                let resp = library_scan(
-                    State(store.clone()),
-                    Json(ScanReq { root: None, folder_id: None, limit: Some(5000) }),
+                let resp = library_scan_inner(
+                    store.clone(),
+                    ScanReq { root: None, folder_id: None, limit: Some(5000) },
                 )
                 .await;
                 let queued = {
