@@ -2705,8 +2705,9 @@ static PROBE_TASKS_STARTED: std::sync::atomic::AtomicUsize =
 /// The watchdog dumps the phase histogram: with 3 permits, tasks in
 /// "work"/"probe" are the permit holders — if the ledger says 0 permits
 /// free but no task shows in a holding phase, the permit is leaked.
-static TASK_PHASES: std::sync::Mutex<std::collections::HashMap<String, &'static str>> =
-    std::sync::Mutex::new(std::collections::HashMap::new());
+/// (Vec, not HashMap: HashMap::new is not const-evaluable in statics.)
+static TASK_PHASES: std::sync::Mutex<Vec<(String, &'static str)>> =
+    std::sync::Mutex::new(Vec::new());
 
 /// RAII: marks a path as probe-in-flight while a probe task runs (dropped
 /// when the task ends — every path, including panics).
@@ -2722,12 +2723,17 @@ impl Drop for ProbeInflightGuard {
         if let Ok(mut v) = PROBE_INFLIGHT.lock() {
             v.retain(|q| q != &self.0);
         }
-        TASK_PHASES.lock().unwrap_or_else(|x| x.into_inner()).remove(&self.0);
+        TASK_PHASES
+            .lock()
+            .unwrap_or_else(|x| x.into_inner())
+            .retain(|(k, _)| k != &self.0);
     }
 }
 
 fn phase_set(p: &str, ph: &'static str) {
-    TASK_PHASES.lock().unwrap_or_else(|x| x.into_inner()).insert(p.to_string(), ph);
+    let mut v = TASK_PHASES.lock().unwrap_or_else(|x| x.into_inner());
+    v.retain(|(k, _)| k != p);
+    v.push((p.to_string(), ph));
 }
 
 /// Monotonic catalog revision — bumped every time the catalog hits disk.
@@ -5372,13 +5378,13 @@ async fn library_scan(State(store): State<Store>, Json(req): Json<ScanReq>) -> R
                 let ph = TASK_PHASES.lock().unwrap_or_else(|x| x.into_inner()).clone();
                 let mut counts: std::collections::HashMap<&'static str, usize> =
                     std::collections::HashMap::new();
-                for v in ph.values() {
+                for (_, v) in ph.iter() {
                     *counts.entry(v).or_insert(0) += 1;
                 }
                 if !ph.is_empty() || avail < 3 {
                     let holders: Vec<String> = ph
                         .iter()
-                        .filter(|(_, v)| **v != "wait")
+                        .filter(|(_, v)| *v != "wait")
                         .map(|(k, _)| k.clone())
                         .collect();
                     let hhead = holders.iter().take(4).cloned().collect::<Vec<_>>().join(" | ");
