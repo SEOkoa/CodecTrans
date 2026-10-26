@@ -938,19 +938,46 @@ fn pick_node_encoder_idx(online: &[Node], counts: &std::collections::HashMap<Str
 /// holding SCAN_LOCK; one stuck probe would freeze ALL scanning until restart,
 /// exactly the decode_window_ok failure mode that already has a timeout).
 async fn ffprobe_out(args: &[&str], path: &str) -> Option<String> {
-    let r = tokio::time::timeout(
-        std::time::Duration::from_secs(60),
-        Command::new("ffprobe").args(args).arg(path).output(),
-    )
-    .await;
-    match r {
-        Ok(Ok(o)) => Some(String::from_utf8_lossy(&o.stdout).into_owned()),
+    // Explicit spawn + wait + kill-on-timeout. The old `timeout(60s,
+    // cmd.output())` DROPPED the future on expiry, orphaning the ffprobe
+    // child: it kept reading the (stalling) NAS file with the pipe ends
+    // dead, and the drop also meant the output was never collected. A
+    // wedged probe could then sit on the scan's 3-permit semaphore
+    // forever (2026-10-26 stall: 790 probe tasks parked, 0 child procs).
+    let mut child = match tokio::process::Command::new("ffprobe")
+        .args(args)
+        .arg(path)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+    {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("[CodecTrans] ffprobe failed {path}: {e}");
+            return None;
+        }
+    };
+    match tokio::time::timeout(std::time::Duration::from_secs(60), child.wait()).await {
+        Ok(Ok(_)) => {
+            // wait finished — drain the remaining buffered output.
+            match child.wait_with_output().await {
+                Ok(o) => Some(String::from_utf8_lossy(&o.stdout).into_owned()),
+                Err(e) => {
+                    eprintln!("[CodecTrans] ffprobe drain failed {path}: {e}");
+                    None
+                }
+            }
+        }
         Ok(Err(e)) => {
             eprintln!("[CodecTrans] ffprobe failed {path}: {e}");
             None
         }
         Err(_) => {
-            eprintln!("[CodecTrans] ffprobe TIMEOUT(60s) {path} — treated as unreadable");
+            // KILL + reap so the child (and its stalled NAS read) is
+            // actually gone before the next probe starts.
+            let _ = child.kill().await;
+            let _ = child.wait().await;
+            eprintln!("[CodecTrans] ffprobe TIMEOUT(60s) {path} — killed, treated as unreadable");
             None
         }
     }
@@ -2661,6 +2688,29 @@ static SCAN_STATE: std::sync::Mutex<ScanState> = std::sync::Mutex::new(ScanState
     finished_queued: 0,
     finished_skipped: 0,
 });
+
+/// Paths of probes currently RUNNING (under the probe semaphore). A
+/// diagnostic watchdog dumps this list while a scan is active — if the
+/// list is non-empty but no ffprobe processes exist (or vice versa), the
+/// probe future is wedged, which parked the 2026-10-26 scan for 40+ min.
+static PROBE_INFLIGHT: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+
+/// RAII: marks a path as probe-in-flight while a probe task runs (dropped
+/// when the task ends — every path, including panics).
+struct ProbeInflightGuard(String);
+impl ProbeInflightGuard {
+    fn new(p: String) -> Self {
+        PROBE_INFLIGHT.lock().unwrap_or_else(|x| x.into_inner()).push(p.clone());
+        ProbeInflightGuard(p)
+    }
+}
+impl Drop for ProbeInflightGuard {
+    fn drop(&mut self) {
+        if let Ok(mut v) = PROBE_INFLIGHT.lock() {
+            v.retain(|q| q != &self.0);
+        }
+    }
+}
 
 /// Monotonic catalog revision — bumped every time the catalog hits disk.
 /// Lets GET /api/library answer 304 Not Modified to the UI's 2s poll (the
@@ -5286,6 +5336,24 @@ async fn library_scan(State(store): State<Store>, Json(req): Json<ScanReq>) -> R
     // auto-scan cheap on a big library (only new/changed files pay the
     // probe cost) while a first scan still probes everything.
     let sem = std::sync::Arc::new(tokio::sync::Semaphore::new(3));
+    // Diagnostic watchdog: while a scan is active, dump the probes
+    // currently in flight every 20s. The 2026-10-26 stall (790 probe
+    // tasks parked, 0 child processes) was invisible from the outside —
+    // this makes the in-flight set directly observable in the logs.
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(std::time::Duration::from_secs(20)).await;
+            let active = SCAN_STATE.lock().unwrap_or_else(|x| x.into_inner()).active;
+            if !active {
+                break;
+            }
+            let list = PROBE_INFLIGHT.lock().unwrap_or_else(|x| x.into_inner()).clone();
+            if !list.is_empty() {
+                let head = list.iter().take(4).cloned().collect::<Vec<_>>().join(" | ");
+                eprintln!("[scan] probe inflight({}) — {head}", list.len());
+            }
+        }
+    });
     let mut handles: Vec<tokio::task::JoinHandle<Option<LibraryEntry>>> =
         Vec::with_capacity(plan.len());
     for (fid, rootp, rel) in &plan {
@@ -5310,6 +5378,7 @@ async fn library_scan(State(store): State<Store>, Json(req): Json<ScanReq>) -> R
         let sem = sem.clone();
         handles.push(tokio::spawn(async move {
             let _g = sem.acquire_owned().await.expect("probe semaphore");
+            let _pf = ProbeInflightGuard(pstr.clone());
             let info = match reuse {
                 Some(o) => MediaInfo {
                     duration: o.duration,
