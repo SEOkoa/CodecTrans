@@ -146,6 +146,12 @@ pub struct Job {
     pub progress: f64,           // 0.0 .. 1.0
     pub created_at: i64,
     pub started_at: Option<i64>,
+    /// When the node CLAIMED this job (queued -> dispatched). The
+    /// stuck-dispatched self-heal must age from THIS, not created_at: a job
+    /// that sat in the queue for 9 minutes must not be re-queued 30 seconds
+    /// after a legitimate claim (that steals an in-flight encode).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dispatched_at: Option<i64>,
     pub finished_at: Option<i64>,
     pub error: Option<String>,
     pub input_size: Option<u64>,
@@ -420,6 +426,7 @@ impl JobStore {
         let Some(id) = best_id else { return None };
         let mut j = self.jobs.get(&id)?.clone();
         j.status = "dispatched".into();
+        j.dispatched_at = Some(now_ms());
         self.jobs.insert(j.id.clone(), j.clone());
         Some(j)
     }
@@ -706,6 +713,53 @@ async fn set_current_job(c: RConn, id: &str, job: Option<&str>) {
         .arg(v)
         .query_async::<i32>(&mut c)
         .await;
+}
+
+/// jobId -> {node_id, lib_path} claim mapping. In-memory jobs are VOLATILE
+/// (a server restart wipes them) but a node can keep encoding for minutes
+/// after one — with this mapping the finished artifact can still be routed
+/// next to its source instead of orphaning in outputs/.
+async fn set_job_mapping(c: RConn, job_id: &str, lib_path: Option<&str>, node_id: &str) {
+    let key = format!("ct:job:{job_id}");
+    let mut c = c;
+    let mut cmd = redis::cmd("HSET");
+    cmd.arg(key.clone());
+    cmd.arg("node_id");
+    cmd.arg(node_id);
+    if let Some(lp) = lib_path.filter(|l| !l.is_empty()) {
+        cmd.arg("lib_path");
+        cmd.arg(lp);
+    }
+    let _ = cmd.query_async::<i32>(&mut c).await;
+    let _ = redis::cmd("EXPIRE")
+        .arg(key)
+        .arg(86_400)
+        .query_async::<i32>(&mut c)
+        .await;
+}
+
+async fn get_job_mapping(c: RConn, job_id: &str) -> Option<Vec<(String, String)>> {
+    let mut c = c;
+    let v: Vec<redis::Value> = redis::cmd("HGETALL")
+        .arg(format!("ct:job:{job_id}"))
+        .query_async(&mut c)
+        .await
+        .ok()?;
+    if v.is_empty() {
+        return None;
+    }
+    let val_to_s = |v: &redis::Value| match v {
+        redis::Value::BulkString(b) => String::from_utf8_lossy(b).to_string(),
+        redis::Value::Int(n) => n.to_string(),
+        other => format!("{other:?}"),
+    };
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i + 1 < v.len() {
+        out.push((val_to_s(&v[i]), val_to_s(&v[i + 1])));
+        i += 2;
+    }
+    Some(out)
 }
 
 /// All nodes, filtered. status: "online" (default) | "offline" | "all";
@@ -2629,12 +2683,21 @@ fn load_catalog() -> Vec<LibraryEntry> {
 /// serialize failure must NEVER truncate the live file), stage to a temp
 /// file, keep the previous generation as .bak, then rename over.
 fn persist_catalog(store: &Store) {
-    let _g = LIB_CFG_LOCK.lock().unwrap_or_else(|p| p.into_inner());
-    persist_catalog_locked(store);
-}
-fn persist_catalog_locked(store: &Store) {
+    // Snapshot under the store lock ONLY — no file I/O while a global lock
+    // is held. Under memory pressure a 5MB catalog write can take seconds on
+    // ZFS; holding a lock across it stalled every settings save and every
+    // other persist (one of the wedge amplifiers of 2026-10-26).
     let entries = store.lock().unwrap_or_else(|p| p.into_inner()).list_library();
-    let json = match serde_json::to_string(&entries) {
+    persist_catalog_snapshot(&entries);
+}
+
+/// Persist a catalog snapshot. No global locks are held for the heavy I/O
+/// (serialize + .bak + tmp + rename of the multi-MB catalog); only the
+/// short tombstone-upkeep section takes LIB_CFG_LOCK (small file, shared
+/// with the settings-save handlers). Concurrent persists converge: writes
+/// are atomic and last-writer-wins.
+fn persist_catalog_snapshot(entries: &[LibraryEntry]) {
+    let json = match serde_json::to_string(entries) {
         Ok(j) => j,
         Err(e) => {
             eprintln!("[CodecTrans] persist_catalog: serialize failed ({e}) — on-disk catalog untouched");
@@ -2643,11 +2706,31 @@ fn persist_catalog_locked(store: &Store) {
     };
     let path = catalog_path();
     let bak = path.with_extension("json.bak");
-    // Back up the current non-empty generation before overwriting it.
-    if let Ok(old) = std::fs::read(&path) {
-        if !old.is_empty() {
-            let _ = std::fs::write(&bak, &old);
+    // Back up the current generation before overwriting — but only when the
+    // on-disk file actually changed since the last persist (otherwise the
+    // .bak already IS that generation; skipping saves a full read+write of
+    // the catalog on every job completion).
+    let sig: Option<(u64, i64)> = std::fs::metadata(&path).ok().map(|m| {
+        (
+            m.len(),
+            m.modified()
+                .ok()
+                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|d| d.as_nanos() as i64)
+                .unwrap_or(0),
+        )
+    });
+    static LAST_SIG: std::sync::Mutex<Option<(u64, i64)>> = std::sync::Mutex::new(None);
+    let mut last = LAST_SIG.lock().unwrap_or_else(|p| p.into_inner());
+    if sig.as_ref() != last.as_ref() {
+        if sig.is_some() {
+            if let Ok(old) = std::fs::read(&path) {
+                if !old.is_empty() {
+                    let _ = std::fs::write(&bak, &old);
+                }
+            }
         }
+        *last = sig;
     }
     let tmp = path.with_extension("json.tmp");
     match std::fs::write(&tmp, json) {
@@ -2662,10 +2745,11 @@ fn persist_catalog_locked(store: &Store) {
             eprintln!("[CodecTrans] persist_catalog: temp write failed ({e}) — on-disk catalog untouched");
         }
     }
+    let _g = LIB_CFG_LOCK.lock().unwrap_or_else(|p| p.into_inner());
     let mut c = load_lib_cfg();
     let mut seen: std::collections::HashSet<String> =
         c.tombstone.iter().cloned().collect();
-    for e in &entries {
+    for e in entries {
         if let Some(r) = &e.reencoded {
             seen.insert(r.clone());
         }
@@ -2872,7 +2956,7 @@ async fn folders_post(State(store): State<Store>, Json(mut b): Json<FoldersBody>
             eprintln!("[CodecTrans] folders_post: removed {removed} orphaned catalog entries");
         }
     }
-    persist_catalog_locked(&store);
+    persist_catalog(&store);
     Json(json!({ "ok": true, "folders": b.folders })).into_response()
 }
 
@@ -3861,6 +3945,7 @@ async fn dispatch_lib_job(
         progress: 0.0,
         created_at: now_ms(),
         started_at: None,
+        dispatched_at: None,
         finished_at: None,
         error: None,
         input_size: Some(e.size),
@@ -4000,7 +4085,18 @@ fn cmd_env(e: &LibraryEntry, file: Option<&str>) -> Vec<(String, String)> {
 
 /// Run a plugin command with a timeout. Returns Ok(success) or
 /// Err(reason) — callers decide whether a failure is fatal.
+/// Global cap on concurrent external shell spawns from the server (per-file
+/// plugin `cmd` conditions and actions). Probe (3) and health decode
+/// (CT_HEALTH_WORKERS) already have their own bounds; without this, a
+/// 4000-file scan with a cmd condition could fork a matching storm of
+/// shell children.
+fn cmd_sem() -> &'static tokio::sync::Semaphore {
+    static SEM: std::sync::OnceLock<tokio::sync::Semaphore> = std::sync::OnceLock::new();
+    SEM.get_or_init(|| tokio::sync::Semaphore::new(4))
+}
+
 async fn run_cmd(cmd: &str, timeout_s: u32, env: Vec<(String, String)>) -> Result<bool, String> {
+    let _g = cmd_sem().acquire().await.expect("cmd sem");
     let secs = timeout_s.clamp(1, 300).max(1) as u64;
     let mut c = tokio::process::Command::new("sh");
     c.arg("-c").arg(cmd).env_clear();
@@ -4124,6 +4220,31 @@ enum GraphDecision {
 /// default. Free (not closure) async fn because the `cmd` plugin
 /// condition awaits — a local fn item can't capture the scan task's
 /// dynamic environment.
+/// The effective workflow graph for a file: 1) the folder's chosen NAMED
+/// logic (library-tab assignment), 2) legacy per-folder inline graph,
+/// 3) global library graph. None -> the caller falls back to the folder's
+/// bulk default. Shared by the graph evaluation AND the per-file srcHealth
+/// depth (only THIS file's graph may decide its decode depth).
+fn effective_graph_for<'a>(
+    folder: Option<&'a FolderRule>,
+    libcfg: &'a LibraryConfig,
+    eff_graph: &'a Option<WorkflowGraph>,
+) -> Option<&'a WorkflowGraph> {
+    let logic_graph: Option<&'a WorkflowGraph> = folder
+        .and_then(|f| f.logic_id.as_deref())
+        .and_then(|lid| libcfg.logics.iter().find(|l| l.id == lid))
+        .map(|l| &l.graph);
+    let folder_graph: Option<&'a WorkflowGraph> = folder
+        .filter(|f| {
+            f.graph
+                .nodes
+                .iter()
+                .any(|n| n.kind == "condition" || n.kind == "action")
+        })
+        .map(|f| &f.graph);
+    logic_graph.or(folder_graph).or_else(|| eff_graph.as_ref())
+}
+
 async fn evaluate_graph(
     h: &std::collections::HashMap<String, bool>,
     e: &LibraryEntry,
@@ -4139,21 +4260,7 @@ async fn evaluate_graph(
     // (library-tab assignment), 2) legacy per-folder inline
     // graph, 3) global library graph. None of them -> the
     // folder's bulk default below.
-    let logic_graph: Option<&WorkflowGraph> = folder
-        .and_then(|f| f.logic_id.as_deref())
-        .and_then(|lid| libcfg.logics.iter().find(|l| l.id == lid))
-        .map(|l| &l.graph);
-    let folder_graph: Option<&WorkflowGraph> = folder
-        .filter(|f| {
-            f.graph
-                .nodes
-                .iter()
-                .any(|n| n.kind == "condition" || n.kind == "action")
-        })
-        .map(|f| &f.graph);
-    let g = logic_graph
-        .or(folder_graph)
-        .or_else(|| eff_graph.as_ref());
+    let g = effective_graph_for(folder, libcfg, eff_graph);
     if let Some(g) = g {
         // Walk the node graph; first action reached wins, its
         // output port carries the post-encode plan. No action
@@ -5024,23 +5131,11 @@ async fn library_scan(State(store): State<Store>, Json(req): Json<ScanReq>) -> R
     } else {
         None
     };
-    // srcHealth condition support: when ANY applicable graph has the
-    // condition, run the decode-based integrity check on EVERY pending
-    // entry's source (per-file; each file is checked at the depth its
-    // graph asks for).
-    let health_depths: Vec<(String, u32)> = {
-        let mut graphs: Vec<&WorkflowGraph> = Vec::new();
-        if let Some(g) = eff_graph.as_ref() {
-            graphs.push(g);
-        }
-        for l in &libcfg.logics {
-            graphs.push(&l.graph);
-        }
-        for f in &libcfg.folders {
-            graphs.push(&f.graph);
-        }
-        src_health_depths(&graphs)
-    };
+    // srcHealth condition support is resolved PER FILE below: each file's
+    // effective graph decides whether (and at what depth) its source gets
+    // the decode-based integrity check. (A union over every folder and
+    // logic forced a full-file decode on files whose own graph only used a
+    // shallow spot-check — and vice versa.)
 
     // ---- Streaming gate + health + dispatch -------------------------
     // Each pending file flows through as its own task:
@@ -5174,7 +5269,6 @@ async fn library_scan(State(store): State<Store>, Json(req): Json<ScanReq>) -> R
     // Pass 2 — one streaming task per surviving file.
     let online = std::sync::Arc::new(online);
     let eff_graph = std::sync::Arc::new(eff_graph);
-    let health_depths = std::sync::Arc::new(health_depths);
     let live = std::sync::Arc::new(live);
     // Health decode workers. CT_HEALTH_WORKERS overrides per deployment
     // (0 = OFF: no decode runs, the srcHealth gate evaluates as healthy);
@@ -5203,7 +5297,6 @@ async fn library_scan(State(store): State<Store>, Json(req): Json<ScanReq>) -> R
         let e = entries[i].clone();
         let online = online.clone();
         let eff_graph = eff_graph.clone();
-        let health_depths = health_depths.clone();
         let live = live.clone();
         let health_sem = health_sem.clone();
         let libcfg = libcfg.clone();
@@ -5225,7 +5318,14 @@ async fn library_scan(State(store): State<Store>, Json(req): Json<ScanReq>) -> R
             // dynamic environment.)
             let h_true = std::collections::HashMap::from([(key.clone(), true)]);
             let h_false = std::collections::HashMap::from([(key.clone(), false)]);
-            let decision = if health_depths.is_empty() {
+            // This file's own srcHealth depth: derived from its EFFECTIVE
+            // graph only. Empty = the file's graph never asks for a decode
+            // -> evaluate without touching the source.
+            let file_depths: Vec<(String, u32)> =
+                effective_graph_for(folder, &libcfg, &eff_graph)
+                    .map(|g| src_health_depths(&[g]))
+                    .unwrap_or_default();
+            let decision = if file_depths.is_empty() {
                 evaluate_graph(&h_true, &e, folder, &libcfg, &eff_graph, &online).await
             } else if health_conc == 0 {
                 // Workers disabled (CT_HEALTH_WORKERS=0): the decode never
@@ -5248,7 +5348,7 @@ async fn library_scan(State(store): State<Store>, Json(req): Json<ScanReq>) -> R
                     let h = match resolve_lib_source(&key, &store_t) {
                         Some(p) => {
                             let _g = health_sem.acquire_owned().await.expect("health sem");
-                            decode_health_check(&p.to_string_lossy(), e.duration, &health_depths).await
+                            decode_health_check(&p.to_string_lossy(), e.duration, &file_depths).await
                         }
                         None => false,
                     };
@@ -5616,6 +5716,7 @@ async fn transcode(State(store): State<Store>, Json(req): Json<TranscodeReq>) ->
         progress: 0.0,
         created_at: now_ms(),
         started_at: None,
+        dispatched_at: None,
         finished_at: None,
         error: None,
         input_size,
@@ -6152,6 +6253,7 @@ async fn node_poll(State(store): State<Store>, UrlPath(id): UrlPath<String>) -> 
         let claimed = store.lock().unwrap_or_else(|p| p.into_inner()).claim_for_node(&id);
         if let Some(job) = claimed {
             let c = store.lock().unwrap_or_else(|p| p.into_inner()).redis();
+            let _ = set_job_mapping(c.clone(), &job.id, job.lib_path.as_deref(), &id).await;
             let _ = set_current_job(c, &id, Some(&job.id)).await;
             return match serde_json::to_value(job) {
                 Ok(v) => Json(json!({"job": v, "config": cfg})).into_response(),
@@ -6296,7 +6398,22 @@ async fn node_report(State(store): State<Store>, UrlPath(id): UrlPath<String>, J
                 )
                     .into_response();
             }
-            return finish_lib_job(&store, req.job_id.clone(), oon.clone(), sz).await;
+            // lib_path: in-memory job, else the Redis claim mapping (the
+            // job may have been wiped by a server restart mid-encode).
+            let recovered = {
+                let s = store.lock().unwrap_or_else(|p| p.into_inner());
+                s.jobs.get(&req.job_id).and_then(|j| j.lib_path.clone())
+            };
+            let lp_eff = if recovered.as_deref().map(str::is_empty).unwrap_or(true) {
+                let c = store.lock().unwrap_or_else(|p| p.into_inner()).redis();
+                get_job_mapping(c, &req.job_id)
+                    .await
+                    .and_then(|m| m.into_iter().find(|(k, _)| k == "lib_path").map(|(_, v)| v))
+                    .filter(|l| !l.is_empty())
+            } else {
+                recovered
+            };
+            return finish_lib_job(&store, req.job_id.clone(), oon.clone(), sz, lp_eff).await;
         }
     }
     // Library-automation job failed → mark the entry so a rescan re-queues it.
@@ -6553,18 +6670,36 @@ async fn node_result(State(store): State<Store>, UrlPath(id): UrlPath<String>, m
     }
     let size = tmp_size;
     // Library-automation jobs land next to the source file, not in outputs/.
-    let lp = {
+    // A job missing from memory (server restarted mid-encode) is recovered
+    // from the Redis claim mapping — otherwise the finished artifact would
+    // orphan in outputs/ and the entry would sit "running" forever.
+    let mut lp: Option<String> = None;
+    {
         let mut s = store.lock().unwrap_or_else(|p| p.into_inner());
-        let lp = s.jobs.get(&job_id).and_then(|j| j.lib_path.clone());
         if let Some(j) = s.jobs.get_mut(&job_id) {
             j.output_file = out_name.clone();
             j.output_size = Some(size);
+            lp = j.lib_path.clone();
         }
-        lp
-    };
+    }
+    if lp.as_deref().map(str::is_empty).unwrap_or(true) {
+        let c = store.lock().unwrap_or_else(|p| p.into_inner()).redis();
+        if let Some(map) = get_job_mapping(c, &job_id).await {
+            if let Some(l) = map
+                .into_iter()
+                .find(|(k, _)| k == "lib_path")
+                .map(|(_, v)| v)
+            {
+                if !l.is_empty() {
+                    eprintln!("[node_result] job {job_id} lost (server restart) — lib_path recovered from Redis");
+                    lp = Some(l);
+                }
+            }
+        }
+    }
     if let Some(lp) = &lp {
         if !lp.is_empty() {
-            return finish_lib_job(&store, job_id.clone(), out_name.clone(), size).await;
+            return finish_lib_job(&store, job_id.clone(), out_name.clone(), size, Some(lp.clone())).await;
         }
     }
     Json(json!({"ok": true, "file": out_name, "size": size})).into_response()
@@ -6577,13 +6712,18 @@ async fn node_result(State(store): State<Store>, UrlPath(id): UrlPath<String>, m
 /// ORDER (verify/replace/saveHere/requeue), update the catalog. Shared by
 /// the upload path (node_result) and the local fast path (a same-filesystem
 /// node that moved the file itself and reported `localStage` — node_report).
-async fn finish_lib_job(store: &Store, job_id: String, out_name: String, size: u64) -> Response {
-    let lp = store
-        .lock().unwrap_or_else(|p| p.into_inner())
-        .jobs
-        .get(&job_id)
-        .and_then(|j| j.lib_path.clone())
-        .filter(|lp| !lp.is_empty());
+async fn finish_lib_job(store: &Store, job_id: String, out_name: String, size: u64, lp_override: Option<String>) -> Response {
+    let lp = lp_override
+        .filter(|l| !l.is_empty())
+        .or_else(|| {
+            store
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .jobs
+                .get(&job_id)
+                .and_then(|j| j.lib_path.clone())
+                .filter(|lp| !lp.is_empty())
+        });
     let Some(lp) = lp else {
         return Json(json!({"ok": true, "file": out_name, "size": size})).into_response();
     };
@@ -6976,6 +7116,7 @@ async fn dispatch(State(store): State<Store>, Json(req): Json<DispatchReq>) -> R
         progress: 0.0,
         created_at: now_ms(),
         started_at: None,
+        dispatched_at: None,
         finished_at: None,
         error: None,
         input_size,
@@ -7033,6 +7174,32 @@ async fn main() {
         "[CodecTrans] library catalog: {} entries",
         store.lock().unwrap_or_else(|p| p.into_inner()).list_library().len()
     );
+
+    // Startup hygiene: a crashed upload leaves `.inprogress_*` staging
+    // files in outputs/ forever. Anything older than an hour is a leak —
+    // drop it (a live upload rewrites its own temp within minutes).
+    {
+        let dir = outputs_dir();
+        if let Ok(rd) = std::fs::read_dir(&dir) {
+            let now = std::time::SystemTime::now();
+            for ent in rd.flatten() {
+                let name = ent.file_name().to_string_lossy().to_string();
+                if name.starts_with(".inprogress_") {
+                    let old = ent
+                        .metadata()
+                        .ok()
+                        .and_then(|m| m.modified().ok())
+                        .and_then(|t| now.duration_since(t).ok())
+                        .map(|d| d > std::time::Duration::from_secs(3600))
+                        .unwrap_or(false);
+                    if old {
+                        eprintln!("[CodecTrans] startup: removed orphan staging file {name}");
+                        let _ = std::fs::remove_file(ent.path());
+                    }
+                }
+            }
+        }
+    }
 
     // GPU availability for the scan's health decode: probe the bundled
     // NVIDIA userland (container images carry it; a bare host without a
@@ -7307,7 +7474,7 @@ async fn spawn_mdns(store: &Store, port: u16) {
                 {
                     let mut s = store.lock().unwrap_or_else(|p| p.into_inner());
                     for j in s.jobs.values_mut() {
-                        if j.status == "dispatched" && now - j.created_at > 600_000 {
+                        if j.status == "dispatched" && now - j.dispatched_at.unwrap_or(j.created_at) > 600_000 {
                             j.status = "queued".to_string();
                             j.node_id = None;
                             eprintln!("[CodecTrans] job {} stuck dispatched 10m — requeued", j.id);

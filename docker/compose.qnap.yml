@@ -1,0 +1,79 @@
+# CodecTrans stack — QNAP Container Station (docker compose v5.1.1-qnap3)
+#
+# Deploy (QNAP):
+#   /share/<your-data-volume>/.qpkg/container-station/bin/docker compose -f compose.yml up -d
+#
+# Notes:
+# - Memory/CPU caps are deliberate (2026-10-26 incident): a runaway container
+#   must OOM-restart (restart policy brings it back, in-flight jobs re-queue)
+#   instead of starving the host. Idle usage is tiny (server ~50MB, node ~6MB);
+#   4GB covers worst-case transcode + health decodes with margin.
+# - Redis data (node registry AOF) persists in redis-data/ — safe to recreate.
+# - The QEMU VM (Home Assistant) on this box is OUTSIDE this stack.
+services:
+  redis:
+    image: redis:7-alpine
+    container_name: codectrans-redis
+    restart: unless-stopped
+    network_mode: host
+    command: ["redis-server", "--appendonly", "yes", "--port", "6380"]
+    volumes:
+      - /share/Container/codectrans/redis-data:/data
+    mem_limit: 1g
+    cpus: 1
+
+  server:
+    image: seokoa/codectrans-server:latest
+    container_name: codectrans-server
+    restart: unless-stopped
+    network_mode: host
+    environment:
+      CT_REDIS: redis://127.0.0.1:6380
+      CT_BASE: /data
+      TZ: Asia/Seoul
+      NVIDIA_VISIBLE_DEVICES: "all"
+      NVIDIA_DRIVER_CAPABILITIES: "all"
+      CT_PORT: "8400"
+      CT_FRONTEND: /opt/ct/frontend/dist
+      CT_MAX_UPLOAD_MB: "16384"
+    volumes:
+      - /share/Container/codectrans/config:/data
+      - /share/YourVolume1:/media/Volume1
+      - /share/YourVolume2:/media/Volume2
+      - /share/YourVolume3:/media/Volume3
+    devices:
+      - /dev/nvidia0
+      - /dev/nvidiactl
+      - /dev/nvidia-uvm
+      - /dev/nvidia-uvm-tools
+    mem_limit: 4g
+    cpus: 4
+
+  node:
+    image: seokoa/codectrans-node:latest
+    container_name: codectrans-node
+    restart: unless-stopped
+    network_mode: host
+    environment:
+      CT_NODE_NAME: qnap-3050-node
+      CT_SERVER: http://127.0.0.1:8400
+      CT_MAX_JOBS: "2"
+      CT_WORKDIR: /opt/ct/work
+      CT_BIND: "all"
+      CT_PORT: "8401"
+      TZ: Asia/Seoul
+      NVIDIA_VISIBLE_DEVICES: "all"
+      NVIDIA_DRIVER_CAPABILITIES: "all"
+    volumes:
+      - /share/Container/codectrans/work:/opt/ct/work
+      - /share/Container/codectrans/config/outputs:/data/outputs
+      - /share/YourVolume1:/media/Volume1
+      - /share/YourVolume2:/media/Volume2
+      - /share/YourVolume3:/media/Volume3
+    devices:
+      - /dev/nvidia0
+      - /dev/nvidiactl
+      - /dev/nvidia-uvm
+      - /dev/nvidia-uvm-tools
+    mem_limit: 4g
+    cpus: 4
