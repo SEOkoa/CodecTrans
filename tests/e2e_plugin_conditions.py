@@ -133,6 +133,28 @@ try:
     print("D2 (height gte 200, expect queued):", d2)
 
     print("\nSUMMARY:", json.dumps(results, ensure_ascii=False, indent=1))
+
+    # --- verification ---
+    def st(sc, sub):
+        return [x[1] for x in results[sc][sub]]
+    checks = [
+        ("A_field_nomatch.skip",     st("A_field", "no_match"),  ["skipped"]),
+        ("B_field_match.encode",     st("B_field", "all_match"), ["pending"]),
+        ("C_cmd.no_marker.skip",     st("C_cmd", "no_marker"),   ["skipped"]),
+        ("C_cmd.with_marker.encode", st("C_cmd", "with_marker"), ["pending"]),
+        ("D_height.lte100.skip",     st("D_height", "lte100"),   ["skipped"]),
+        ("D_height.gte200.encode",   st("D_height", "gte200"),   ["pending"]),
+    ]
+    ok = True
+    for name, got, want in checks:
+        good = got == want
+        ok = ok and good
+        print(f"{'PASS' if good else 'FAIL'}  {name}: got={got} want={want}")
+    print("ALL SCENARIOS PASSED" if ok else "SOME SCENARIOS FAILED")
+    VERIFY_OK = ok
 finally:
     srv.terminate()
     print("server stopped")
+if not VERIFY_OK:
+    import sys
+    sys.exit(1)
