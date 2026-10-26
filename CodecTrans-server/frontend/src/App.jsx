@@ -1277,6 +1277,19 @@ export default function App() {
     const v = viewRef.current;
     return { x: (e.clientX - rect.left - v.x) / v.k, y: (e.clientY - rect.top - v.y) / v.k };
   };
+  // Touch shim: expose clientX/Y/target so mouse-based handlers work on mobile.
+  const asPointer = (e) => {
+    const t = (e.touches && e.touches[0]) || (e.changedTouches && e.changedTouches[0]);
+    return t
+      ? {
+          clientX: t.clientX,
+          clientY: t.clientY,
+          target: e.target,
+          preventDefault: () => e.preventDefault(),
+          stopPropagation: () => e.stopPropagation(),
+        }
+      : e;
+  };
   const onNodeDown = (e, n) => {
     if (e.target.closest("input,select,button,label,textarea")) return;
     const w = toWorld(e);
@@ -1360,10 +1373,30 @@ export default function App() {
     window.addEventListener("mousemove", move);
     window.addEventListener("mouseup", up);
     window.addEventListener("wheel", wheel, { passive: false });
+    // Touch: pan / drag-node / draw-wire with one finger (touch-action:none
+    // on .gcanvas stops the browser from stealing the gesture for scrolling).
+    const gestureActive = () =>
+      !!(panRef.current || dragRef.current || pendingRef.current);
+    const tmove = (e) => {
+      if (!gestureActive()) return;
+      e.preventDefault();
+      move(asPointer(e));
+    };
+    const tup = (e) => {
+      if (!gestureActive()) return;
+      e.preventDefault();
+      up(asPointer(e));
+    };
+    window.addEventListener("touchmove", tmove, { passive: false });
+    window.addEventListener("touchend", tup);
+    window.addEventListener("touchcancel", tup);
     return () => {
       window.removeEventListener("mousemove", move);
       window.removeEventListener("mouseup", up);
       window.removeEventListener("wheel", wheel);
+      window.removeEventListener("touchmove", tmove);
+      window.removeEventListener("touchend", tup);
+      window.removeEventListener("touchcancel", tup);
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
@@ -1698,34 +1731,40 @@ export default function App() {
             </div>
           )}
 
-          {jobs.filter((j) => j.status === "queued").length > 0 && (
+          {jobs.filter((j) => j.status === "queued" && !j.libPath).length > 0 && (
             <div className="row" style={{ justifyContent: "space-between", marginBottom: 6 }}>
               <span className="meta">
-                {jobs.filter((j) => j.status === "queued").length}건 대기 중
+                {jobs.filter((j) => j.status === "queued" && !j.libPath).length}건 대기 중
+                {jobs.some((j) => j.status === "queued" && j.libPath) &&
+                  " (자동화 큐 제외)"}
               </span>
-              <button
-                className="rm-del"
-                title="대기(queued) 잡을 전부 지움 — 실행 중/완료/에러 기록은 유지"
-                onClick={async () => {
-                  const n = jobs.filter((j) => j.status === "queued").length;
-                  if (!window.confirm(`대기 중인 잡 ${n}건을 전부 취소할까요?`)) return;
-                  try {
-                    await api.jobsClear();
-                    if (activeJob?.status === "queued") setActiveJob(null);
-                    setJobs(await api.jobs());
-                  } catch (e) {
-                    setError(e.message);
-                  }
-                }}
-              >
-                🗑 큐 비우기
-              </button>
+              {jobs.every((j) => !j.libPath || j.status !== "queued") && (
+                <button
+                  className="rm-del"
+                  title="대기(queued) 잡을 전부 지움 — 실행 중/완료/에러 기록은 유지"
+                  onClick={async () => {
+                    const n = jobs.filter((j) => j.status === "queued").length;
+                    if (!window.confirm(`대기 중인 잡 ${n}건을 전부 취소할까요?`)) return;
+                    try {
+                      await api.jobsClear();
+                      if (activeJob?.status === "queued") setActiveJob(null);
+                      setJobs(await api.jobs());
+                    } catch (e) {
+                      setError(e.message);
+                    }
+                  }}
+                >
+                  🗑 큐 비우기
+                </button>
+              )}
             </div>
           )}
 
           <div className="history">
-            {jobs.length === 0 && <div className="empty">No jobs yet.</div>}
-            {jobs.map((j) => (
+            {jobs.filter((j) => !j.libPath).length === 0 && (
+              <div className="empty">No jobs yet.</div>
+            )}
+            {jobs.filter((j) => !j.libPath).map((j) => (
               <div key={j.id} className="job">
                 <div className="row">
                   <span className={`status ${j.status}`}>{STATUS_LABEL[j.status] || j.status}</span>
@@ -2940,6 +2979,7 @@ export default function App() {
                 className="gcanvas"
                 ref={canvasRef}
                 onMouseDown={(e) => onCanvasDown(e)}
+                onTouchStart={(e) => onCanvasDown(asPointer(e))}
                 onDragOver={(e) => e.preventDefault()}
                 onDrop={onCanvasDrop}
               >
@@ -2991,7 +3031,11 @@ export default function App() {
                         className={`gnode kind-${n.kind}${dragId === n.id ? " dragging" : ""}`}
                         style={{ left: n.x, top: n.y }}
                       >
-                        <div className="ghead" onMouseDown={(e) => onNodeDown(e, n)}>
+                        <div
+                          className="ghead"
+                          onMouseDown={(e) => onNodeDown(e, n)}
+                          onTouchStart={(e) => onNodeDown(asPointer(e), n)}
+                        >
                           <span
                             className={
                               "gchip " +
@@ -3632,6 +3676,7 @@ export default function App() {
                             className="gsock out"
                             style={{ top: 9 }}
                             onMouseDown={(e) => onSocketDown(e, n, "")}
+                            onTouchStart={(e) => onSocketDown(asPointer(e), n, "")}
                             title="출력 — 새 영상"
                           />
                         )}
@@ -3640,6 +3685,7 @@ export default function App() {
                             className="gsock out"
                             style={{ top: 9 }}
                             onMouseDown={(e) => onSocketDown(e, n, "")}
+                            onTouchStart={(e) => onSocketDown(asPointer(e), n, "")}
                             title="출력 — ‘인코딩 이후’ 노드(검증/대치/…)를 연결"
                           />
                         )}
@@ -3649,12 +3695,14 @@ export default function App() {
                               className="gsock out t"
                               style={{ top: 9 }}
                               onMouseDown={(e) => onSocketDown(e, n, "true")}
+                              onTouchStart={(e) => onSocketDown(asPointer(e), n, "true")}
                               title="✓ 조건이 맞으면"
                             />
                             <div
                               className="gsock out f"
                               style={{ top: 27 }}
                               onMouseDown={(e) => onSocketDown(e, n, "false")}
+                              onTouchStart={(e) => onSocketDown(asPointer(e), n, "false")}
                               title="✗ 조건이 안 맞으면"
                             />
                             <div className="glab t" style={{ top: 9 }}>✓</div>
