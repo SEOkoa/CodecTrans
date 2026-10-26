@@ -304,6 +304,12 @@ pub struct LibraryEntry {
     /// anything other than a failed dispatch.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub decision: Option<String>,
+    /// logic_version of the config when `decision` was made. Decisions
+    /// older than the current version are RE-EVALUATED on the next scan —
+    /// the logic changed in between, so a blind re-dispatch would keep
+    /// applying the pre-change decision forever (stale filter).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub decision_version: Option<u64>,
 }
 
 /// The outcome of a scan's graph evaluation for one file — persisted on the
@@ -1858,6 +1864,17 @@ pub struct LibraryConfig {
     /// here (server-level) and is picked up by GET /api/settings.
     #[serde(default)]
     pub language: Option<String>,
+    /// Bumped on EVERY settings save (logic / graph / folders / …). Saved
+    /// encode decisions carry the version they were made with; a scan
+    /// re-evaluates any decision whose version is older than this, so an
+    /// edited filter re-decides already-pending files instead of
+    /// re-dispatching stale decisions forever.
+    #[serde(default = "default_logic_version")]
+    pub logic_version: u64,
+}
+
+fn default_logic_version() -> u64 {
+    1
 }
 
 /// One quarantined file under `fail_dir` (dashboard 보관함 tab).
@@ -2474,10 +2491,17 @@ fn scan_scope_label(roots: &[(Option<String>, PathBuf)], libcfg: &LibraryConfig)
 }
 
 fn save_lib_cfg(c: &LibraryConfig) -> std::io::Result<()> {
+    // Every settings save invalidates saved decisions: persist the config
+    // with a bumped logic_version so the next scan re-evaluates pending
+    // entries against the NEW logic (a blind re-dispatch would otherwise
+    // keep applying pre-change decisions forever — a newly added codec
+    // filter would never skip files decided before the edit).
+    let mut c = c.clone();
+    c.logic_version = c.logic_version.saturating_add(1);
     // Atomic (mirrors persist_catalog_locked): serialize first, keep the
     // previous generation as .bak, stage to a temp file, rename over. A power
     // loss mid-write must never corrupt the folders/logics/settings file.
-    let json = serde_json::to_string_pretty(c)?;
+    let json = serde_json::to_string_pretty(&c)?;
     let p = lib_cfg_path();
     let bak = p.with_extension("json.bak");
     if let Ok(old) = std::fs::read(&p) {
@@ -2806,6 +2830,11 @@ async fn library_requeue(State(store): State<Store>, Json(req): Json<RequeueReq>
             e.reencoded = None;
             e.new_size = None;
             e.new_codec = None;
+            // ⟳ means "decide this file AGAIN with the current logic" —
+            // drop the saved decision so the next scan re-evaluates (probe
+            // + graph) instead of the fast path re-dispatching the old one.
+            e.decision = None;
+            e.decision_version = None;
         })
         .is_some()
     };
@@ -4613,6 +4642,10 @@ async fn library_scan(State(store): State<Store>, Json(req): Json<ScanReq>) -> R
     // — a manual scan is an explicit action; `enabled` only gates
     // auto-queueing, never whether a folder can be scanned.
     let libcfg = load_lib_cfg();
+    // The version of the logic that THIS scan evaluates against. Saved
+    // decisions older than this are re-evaluated (the logic changed since
+    // they were made); newer/equal ones take the cheap re-dispatch path.
+    let logic_version = libcfg.logic_version;
     let roots: Vec<(Option<String>, PathBuf)> =
         if let Some(r) = req.root.filter(|r| !r.trim().is_empty()) {
             let r = r.trim().to_string();
@@ -4829,6 +4862,7 @@ async fn library_scan(State(store): State<Store>, Json(req): Json<ScanReq>) -> R
                 new_codec: None,
                 error: None,
                 decision: None,
+                decision_version: None,
             })
         }));
     }
@@ -4879,6 +4913,7 @@ async fn library_scan(State(store): State<Store>, Json(req): Json<ScanReq>) -> R
             // entry (dispatch failed: nodes busy) is re-DISPATCHED on the
             // next scan instead of re-running probe + srcHealth decode.
             e.decision = o.decision.clone();
+            e.decision_version = o.decision_version;
             if keep {
                 e.status = o.status.clone();
                 e.reencoded = o.reencoded.clone();
@@ -4961,12 +4996,18 @@ async fn library_scan(State(store): State<Store>, Json(req): Json<ScanReq>) -> R
             continue;
         }
         // Fast path: already evaluated in a previous scan (the saved
-        // decision was carried forward) and the file is unchanged (same
-        // size) — re-DISPATCH it directly, skipping the notvideo gate, the
-        // probe and the srcHealth decode. This is what keeps the 5-minute
+        // decision was carried forward), the file is unchanged (same size)
+        // AND the decision was made under the CURRENT logic version —
+        // re-DISPATCH it directly, skipping the notvideo gate, the probe
+        // and the srcHealth decode. This is what keeps the 5-minute
         // auto-scan cheap: a long queue merely waiting for a free node gets
         // re-queued, not re-decoded (that re-decode storm pegged the CPU).
-        if entries[i].decision.as_ref().is_some_and(|d| !d.is_empty()) {
+        // A decision older than logic_version means the logic changed after
+        // it was made — it must fall through and re-evaluate, or a newly
+        // added filter (e.g. "skip av1/hevc") would never apply to it.
+        if entries[i].decision.as_ref().is_some_and(|d| !d.is_empty())
+            && entries[i].decision_version.unwrap_or(0) >= logic_version
+        {
             let size_changed = old_map
                 .get(&entries[i].key())
                 .is_some_and(|o| o.size != entries[i].size);
@@ -5094,7 +5135,7 @@ async fn library_scan(State(store): State<Store>, Json(req): Json<ScanReq>) -> R
     let health_sem = std::sync::Arc::new(tokio::sync::Semaphore::new(health_conc.max(1)));
     let libcfg = std::sync::Arc::new(libcfg);
     let store_t = store.clone();
-    let mut handles: Vec<tokio::task::JoinHandle<(String, Option<String>)>> = Vec::new();
+    let mut handles: Vec<tokio::task::JoinHandle<(String, Option<String>, Option<LibraryEntry>)>> = Vec::new();
     for i in todo {
         let e = entries[i].clone();
         let online = online.clone();
@@ -5225,10 +5266,15 @@ async fn library_scan(State(store): State<Store>, Json(req): Json<ScanReq>) -> R
             // queued work invisible during long scans). The decision is
             // written even when dispatch failed (outcome None): the entry
             // stays pending and a later scan must be able to re-dispatch it
-            // without re-running the health decode.
+            // without re-running the health decode. The SAME entry is also
+            // returned to the collector: the scan's final set_library() is
+            // built from the local vector, so a store-only write would be
+            // clobbered by the decision-less local copy.
+            let mut updated: Option<LibraryEntry> = None;
             if saved_decision != e.decision || outcome.is_some() {
                 let mut e3 = e.clone();
                 e3.decision = saved_decision;
+                e3.decision_version = Some(logic_version);
                 if let Some(mark) = &outcome {
                     match mark.as_str() {
                         "skip" => {
@@ -5247,6 +5293,7 @@ async fn library_scan(State(store): State<Store>, Json(req): Json<ScanReq>) -> R
                         _ => {}
                     }
                 }
+                updated = Some(e3.clone());
                 {
                     let mut s = store_t.lock().unwrap_or_else(|p| p.into_inner());
                     if s.library.contains_key(&key) {
@@ -5269,7 +5316,7 @@ async fn library_scan(State(store): State<Store>, Json(req): Json<ScanReq>) -> R
                     }
                 }
             }
-            (key, outcome)
+            (key, outcome, updated)
         }));
     }
     // Collect outcomes as each file's task finishes (streaming: the queue
@@ -5281,27 +5328,33 @@ async fn library_scan(State(store): State<Store>, Json(req): Json<ScanReq>) -> R
     let mut queued: Vec<String> = Vec::new();
     let mut skipped: Vec<String> = Vec::new();
     for h in handles {
-        if let Ok((key, outcome)) = h.await {
+        if let Ok((key, outcome, updated)) = h.await {
             let mark = outcome.unwrap_or_default();
             if let Some(&idx) = entry_idx.get(&key) {
-                let e2 = &mut entries[idx];
-                match mark.as_str() {
-                    "skip" => {
-                        e2.status = "skipped".into();
-                        // Skip list: remember WHY (shown in the library sheet).
-                        // Skipped entries survive rescans — re-arm with ⟳.
-                        e2.error = Some("자동 스킵 — 로직/폴더 설정에 따라 처리하지 않음 (⟳으로 재큐잉)".into());
+                if let Some(e3) = updated {
+                    // The task's updated entry is authoritative (status AND the
+                    // saved decision / decision_version). Adopting it whole —
+                    // a mark-only status patch would drop the decision that the
+                    // final set_library() persists from this local vector.
+                    entries[idx] = e3;
+                } else {
+                    let e2 = &mut entries[idx];
+                    match mark.as_str() {
+                        "skip" => {
+                            e2.status = "skipped".into();
+                            e2.error = Some("자동 스킵 — 로직/폴더 설정에 따라 처리하지 않음 (⟳으로 재큐잉)".into());
+                        }
+                        "queued" => e2.status = "queued".into(),
+                        s if s.starts_with("failed:") => {
+                            e2.status = "failed".into();
+                            e2.error = Some(format!("quarantined → {}", s["failed:".len()..].trim()));
+                        }
+                        s if s.starts_with("error:") => {
+                            e2.status = "error".into();
+                            e2.error = Some(s["error:".len()..].to_string());
+                        }
+                        _ => {}
                     }
-                    "queued" => e2.status = "queued".into(),
-                    s if s.starts_with("failed:") => {
-                        e2.status = "failed".into();
-                        e2.error = Some(format!("quarantined → {}", s["failed:".len()..].trim()));
-                    }
-                    s if s.starts_with("error:") => {
-                        e2.status = "error".into();
-                        e2.error = Some(s["error:".len()..].to_string());
-                    }
-                    _ => {}
                 }
             }
             match mark.as_str() {
@@ -5979,6 +6032,11 @@ async fn node_poll(State(store): State<Store>, UrlPath(id): UrlPath<String>) -> 
 /// decision. Called when a job finishes (a worker slot freed up) so the
 /// queue drains continuously instead of in bursts per auto-scan.
 async fn sweep_redispatch(store: &Store, limit: usize) {
+    // Only re-dispatch decisions made under the CURRENT logic version —
+    // a settings save bumps the version, and stale decisions must wait for
+    // the scan to re-evaluate them (a newly added filter would otherwise
+    // be bypassed by this fast path between scans).
+    let logic_version = load_lib_cfg().logic_version;
     let candidates: Vec<LibraryEntry> = {
         let s = store.lock().unwrap_or_else(|p| p.into_inner());
         s.library
@@ -5986,6 +6044,7 @@ async fn sweep_redispatch(store: &Store, limit: usize) {
             .filter(|e| {
                 e.status == "pending"
                     && e.decision.as_ref().is_some_and(|d| !d.is_empty())
+                    && e.decision_version.unwrap_or(0) >= logic_version
             })
             .cloned()
             .take(limit)
@@ -7146,8 +7205,46 @@ async fn spawn_mdns(store: &Store, port: u16) {
                             orphans.len()
                         );
                     }
+                    // --- queued jobs decided under a STALE logic version ---
+                    // Any settings save bumps logic_version, invalidating
+                    // decisions made before it. Cancel jobs that have not
+                    // started yet so a node never encodes a file the NEW
+                    // logic now skips (e.g. a just-added "skip av1/hevc"
+                    // filter). Re-arm the entry (pending, decision cleared)
+                    // so the next scan re-decides it.
+                    let ver = load_lib_cfg().logic_version;
+                    let stale: Vec<String> = s
+                        .jobs
+                        .values()
+                        .filter(|j| j.status == "queued")
+                        .filter_map(|j| j.lib_path.clone())
+                        .filter(|lp| !lp.is_empty())
+                        .filter(|lp| {
+                            s.library
+                                .get(lp)
+                                .is_some_and(|e| e.decision_version.unwrap_or(0) < ver)
+                        })
+                        .collect();
+                    for lp in &stale {
+                        let mut hit = false;
+                        for j in s.jobs.values_mut() {
+                            if j.status == "queued" && j.lib_path.as_deref() == Some(lp.as_str()) {
+                                j.status = "cancelled".to_string();
+                                j.finished_at = Some(now);
+                                hit = true;
+                            }
+                        }
+                        if let Some(e) = s.library.get_mut(lp) {
+                            e.status = "pending".to_string();
+                            e.decision = None;
+                            e.decision_version = None;
+                        }
+                        if hit {
+                            eprintln!("[CodecTrans] stale queued job(s) for {lp} cancelled — logic changed");
+                        }
+                    }
                     drop(s);
-                    if !orphans.is_empty() || changed {
+                    if !orphans.is_empty() || !stale.is_empty() || changed {
                         persist_catalog(&store);
                     }
                 }

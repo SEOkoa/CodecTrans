@@ -1345,6 +1345,29 @@ fn remove_job_scratch(in_path: &std::path::Path, out_path: &std::path::Path, dow
     let _ = std::fs::remove_file(out_path);
 }
 
+/// Percent-encode a filesystem path for use in a URL path, preserving `/`.
+/// Each segment is encoded byte-wise (UTF-8) so `#` → %23, space → %20,
+/// unicode → %XX triplets, while unreserved bytes pass through untouched.
+/// Without this, any `#` in a filename truncates the URL at the fragment
+/// delimiter and the request hits the wrong path (404).
+fn url_path_segments(path: &str) -> String {
+    path.split('/')
+        .map(|seg| {
+            let mut out = String::with_capacity(seg.len() * 3);
+            for b in seg.bytes() {
+                match b {
+                    b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                        out.push(b as char)
+                    }
+                    _ => out.push_str(&format!("%{b:02X}")),
+                }
+            }
+            out
+        })
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
 async fn run_job(client: reqwest::Client, state: NState, server: String, node_id: String, job: RemoteJob) {
     // Local fast path (input): the job carries the source's absolute path on
     // the SERVER's host. When that path exists on THIS node's filesystem
@@ -1378,12 +1401,25 @@ async fn run_job(client: reqwest::Client, state: NState, server: String, node_id
     if !skip_download {
     // 1. download input from server — streamed straight to disk (a 16GB
     // library source must never sit in RAM).
-    let url = format!("{}/api/nodes/{}/file/{}", server, node_id, job.input_file);
+    //
+    // The path MUST be percent-encoded: input_file is a filename and
+    // routinely contains `#` (hashtags), spaces, and unicode. A raw `#` in
+    // a URL is the fragment delimiter — the url crate (and reqwest) silently
+    // truncate the path at the first `#`, so the server 404s on a file
+    // like "… #초귀요미 JK #F2PV.mp4" → "failed to download input from
+    // server". Encode each path segment (keep `/`), so `#` → %23 etc.
+    let url = format!("{}/api/nodes/{}/file/{}", server, node_id, url_path_segments(&job.input_file));
     let dl = xfer.get(&url).send().await;
     let dl = match dl {
         Ok(r) if r.status().is_success() => r,
-        _ => {
-            fail_job(&client, &state, &server, &node_id, &job, "failed to download input from server".into()).await;
+        Ok(r) => {
+            let status = r.status();
+            // Drain nothing — the body is an error JSON; keep it terse.
+            fail_job(&client, &state, &server, &node_id, &job, format!("failed to download input from server (HTTP {status})")).await;
+            return;
+        }
+        Err(e) => {
+            fail_job(&client, &state, &server, &node_id, &job, format!("failed to download input from server: {e}")).await;
             return;
         }
     };
