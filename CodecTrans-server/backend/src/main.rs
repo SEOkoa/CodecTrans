@@ -1605,9 +1605,16 @@ pub struct Condition {
     /// "bitrateGt" | "bitrateLt" | "nodeHasHw" | "nameContains"
     #[serde(default)]
     pub kind: String,
-    /// srcCodec: source codec name to match (h264, hevc, av1, ...)
+    /// srcCodec (legacy): single source codec name to match (h264, hevc,
+    /// av1, ...). Kept for saved-logic compat — merged with `codecs`.
     #[serde(default)]
     pub codec: Option<String>,
+    /// srcCodec (multi-select): the source codec FAMILIES to match —
+    /// h264, hevc (h265), av1, vp9, mpeg4. Matches when the entry's
+    /// probed codec normalizes (codec_family) to ANY selected one.
+    /// Empty/absent = any codec.
+    #[serde(default)]
+    pub codecs: Vec<String>,
     /// sizeGt/sizeLt: threshold in MB; bitrateGt/bitrateLt: Mbps
     #[serde(default)]
     pub value: Option<f64>,
@@ -3593,7 +3600,25 @@ fn cond_matches(
         // treated as UNHEALTHY (✗ branch) so a probe hiccup never sends a
         // possibly corrupt source to the encoder.
         "srcHealth" => health.get(&e.key()).copied().unwrap_or(false),
-        "srcCodec" => e.video_codec.as_deref() == c.codec.as_deref(),
+        // Multi-select source-codec filter: normalize BOTH sides to a
+        // family (codec_family) so encoder ids (libx264, libsvtav1) and
+        // probed names (h264, av1) compare equal. Legacy single `codec`
+        // is merged in; an empty selection means ANY codec.
+        "srcCodec" => {
+            let mut sel: Vec<String> = c.codecs.clone();
+            if let Some(one) = c.codec.clone() {
+                sel.push(one);
+            }
+            if sel.is_empty() {
+                return true;
+            }
+            let efam = e
+                .video_codec
+                .as_deref()
+                .map(codec_family)
+                .unwrap_or_else(|| "other".into());
+            sel.iter().any(|s| codec_family(s) == efam)
+        }
         "sizeGt" => size_mb > c.value.unwrap_or(f64::INFINITY),
         "sizeLt" => size_mb < c.value.unwrap_or(f64::INFINITY),
         // Height (세로) >= value: 720 (HD), 1080 (FHD), 1440 (QHD), 2160 (4K).

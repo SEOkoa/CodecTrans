@@ -89,8 +89,12 @@ function nodeTitle(n) {
       return "새 영상 발견";
     case "condition":
       switch (c.kind) {
-        case "srcCodec":
-          return "코덱 = " + (c.codec ? codec(c.codec) : "∅");
+        case "srcCodec": {
+          const sel = c.codecs || (c.codec ? [c.codec] : []);
+          return sel.length
+            ? "코덱 = " + sel.map(codec).join(", ")
+            : "코덱 = 어떤 것이든";
+        }
         case "sizeGt":
           return "크기 > " + (c.value ?? "∅") + " MB";
         case "sizeLt":
@@ -3038,21 +3042,43 @@ export default function App() {
                                 </>
                               )}
                               {n.condition?.kind === "srcCodec" && (
-                                <select
-                                  value={n.condition?.codec || ""}
-                                  onChange={(e) =>
-                                    patchCond(n.id, { codec: e.target.value || null })
-                                  }
-                                >
-                                  <option value="">(어떤 코덱이든)</option>
-                                  {(codecs?.videoCodecs || [])
-                                    .filter((c) => c.id !== "copy")
-                                    .map((c) => (
-                                      <option key={c.id} value={c.id}>
-                                        {c.label}
-                                      </option>
-                                    ))}
-                                </select>
+                                <div className="chips codecpick">
+                                  {[
+                                    ["h264", "H.264"],
+                                    ["hevc", "HEVC"],
+                                    ["av1", "AV1"],
+                                    ["vp9", "VP9"],
+                                    ["mpeg4", "MPEG-4"],
+                                  ].map(([id, label]) => {
+                                    const cur =
+                                      n.condition?.codecs ||
+                                      (n.condition?.codec ? [n.condition.codec] : []);
+                                    const on = cur.includes(id);
+                                    return (
+                                      <button
+                                        key={id}
+                                        type="button"
+                                        className={
+                                          "chipbtn chip " +
+                                          (CODEC_CHIPS[id]?.cls || "c-other") +
+                                          (on ? " on" : "")
+                                        }
+                                        onClick={() =>
+                                          patchCond(n.id, {
+                                            codecs: on
+                                              ? cur.filter((x) => x !== id)
+                                              : [...cur, id],
+                                          })
+                                        }
+                                      >
+                                        {label}
+                                      </button>
+                                    );
+                                  })}
+                                  <span className="gsub" title="여러 개 선택 가능 — 선택한 코덱 중 하나와 일치하면 ✓. 아무것도 안 고르면 어떤 코덱이든 통과">
+                                    여러 선택 가능 (안 고르면 전부)
+                                  </span>
+                                </div>
                               )}
                               {(n.condition?.kind === "sizeGt" ||
                                 n.condition?.kind === "sizeLt") && (

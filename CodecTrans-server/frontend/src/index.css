@@ -792,6 +792,22 @@ code {
   border-radius: 999px;
   line-height: 1.3;
 }
+/* Selectable codec-filter chips (logic editor): off = faded, on = full */
+.chipbtn {
+  cursor: pointer;
+  border: 1px solid transparent;
+  background: transparent;
+  font-family: inherit;
+  opacity: 0.38;
+  transition: opacity 0.12s ease, box-shadow 0.12s ease;
+}
+.chipbtn:hover {
+  opacity: 0.7;
+}
+.chipbtn.on {
+  opacity: 1;
+  box-shadow: 0 0 0 2px var(--bg), 0 0 0 3.5px currentColor;
+}
 .c-h264 {
   background: #2f6feb;
 }
