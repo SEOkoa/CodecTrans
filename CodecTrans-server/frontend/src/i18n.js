@@ -434,6 +434,14 @@ export const STR_EN = {
   "상태로 보관합니다. 스캔 또는 ⟳ 버튼으로 다시 큐에 넣을 수 있습니다.": " . Put it back in the queue with a scan or the ⟳ button.",
   "리큐 제한 ": "Requeue limit ",
   "회 저장됨 ✓": " saved ✓",
+  "선택: ": "Selected: ",
+  "건": " items",
+  "재인코딩": "Re-encode",
+  "스킵": "Skip",
+  "재인코딩 — ": "Re-encode ",
+  "건을 처리할까요?": " items to process?",
+  "선택 해제": "Clear selection",
+  "모두 선택": "Select all",
 };
 
 let _lang = "ko";

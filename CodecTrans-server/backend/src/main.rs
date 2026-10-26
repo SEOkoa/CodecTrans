@@ -3130,6 +3130,80 @@ async fn library_requeue(State(store): State<Store>, Json(req): Json<RequeueReq>
     Json(json!({ "ok": true })).into_response()
 }
 
+/// POST /api/library/batch — apply requeue/skip to MANY entries in one call
+/// (row checkboxes). Single lock + single catalog persist: 50 selections
+/// cost one serialization, not 50.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct LibraryBatchReq {
+    action: String, // "requeue" | "skip"
+    keys: Vec<String>,
+}
+async fn library_batch(State(store): State<Store>, Json(req): Json<LibraryBatchReq>) -> Response {
+    if req.keys.is_empty() {
+        return Json(json!({ "ok": true, "applied": 0 })).into_response();
+    }
+    if !matches!(req.action.as_str(), "requeue" | "skip") {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": "action must be requeue or skip" })),
+        )
+            .into_response();
+    }
+    let applied = {
+        let mut s = store.lock().unwrap_or_else(|p| p.into_inner());
+        let mut n = 0usize;
+        for k in &req.keys {
+            if req.action == "requeue" {
+                // Same semantics as the single ⟳ (library_requeue).
+                if s.update_library_entry(k, |e| {
+                    e.status = "pending".into();
+                    e.error = None;
+                    e.reencoded = None;
+                    e.new_size = None;
+                    e.new_codec = None;
+                    e.requeue_count = 0;
+                    e.decision = None;
+                    e.decision_version = None;
+                })
+                .is_some()
+                {
+                    n += 1;
+                }
+            } else {
+                // skip: cancel any queued job for the file, park the entry.
+                for j in s.jobs.values_mut() {
+                    if j.status == "queued" && j.input_file == *k {
+                        j.status = "cancelled".into();
+                        j.error = Some("user skipped the file (batch)".into());
+                        j.finished_at = Some(now_ms());
+                    }
+                }
+                let hit = s.update_library_entry(k, |e| {
+                    // never clobber a finished encode with a mass skip
+                    if e.status == "done" {
+                        return;
+                    }
+                    e.status = "skipped".into();
+                    e.error = Some("수동 스킵 — ⟳으로 재큐잉 가능".into());
+                    e.decision = None;
+                    e.requeue_count = 0;
+                });
+                if hit.is_some() {
+                    // count it unless it was "done" (left untouched)
+                    let still_done = s.library.get(k).is_some_and(|e| e.status == "done");
+                    if !still_done {
+                        n += 1;
+                    }
+                }
+            }
+        }
+        n
+    };
+    persist_catalog(&store);
+    Json(json!({ "ok": true, "applied": applied, "requested": req.keys.len() })).into_response()
+}
+
 async fn auto_get(State(_store): State<Store>) -> impl IntoResponse {
     Json(load_auto())
 }
@@ -7517,6 +7591,7 @@ async fn main() {
         )
         .route("/api/library/requeue", post(library_requeue))
         .route("/api/library/skip", post(library_skip))
+        .route("/api/library/batch", post(library_batch))
         .route("/api/queue/pause", get(queue_pause_get).post(queue_pause_all))
         // server-level settings + the fail (quarantine) folder 보관함
         .route("/api/settings", get(settings_get).post(settings_post))

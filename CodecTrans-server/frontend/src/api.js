@@ -133,6 +133,13 @@ export const api = {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ key }),
     }),
+  // batch action on checked rows (action: "requeue" | "skip")
+  libraryBatch: (action, keys) =>
+    jfetch("/api/library/batch", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ action, keys }),
+    }),
   discoveredNodes: () => jfetch("/api/nodes/discovered"),
   // "server finds a node": probe a node's local API (ip:port) and register it.
   searchNode: (ip, port) =>

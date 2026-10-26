@@ -430,6 +430,8 @@ export default function App() {
   });
   // library tab: per-library sheet selection + table sort
   const [libSel, setLibSel] = useState("all");
+  // checked library rows (Set of entry keys) — batch requeue/skip
+  const [libSelKeys, setLibSelKeys] = useState(() => new Set());
   // Clickable summary-chip filter: "remaining" | "done" | "active" |
   // "error" | "failed" (null = no filter).
   const [libFilter, setLibFilter] = useState(null);
@@ -889,6 +891,30 @@ export default function App() {
     }
   }
 
+  // ── library batch (row checkboxes → top-right buttons) ─────
+  function toggleLibKey(key, on) {
+    setLibSelKeys(prev => {
+      const s = new Set(prev);
+      if (on) s.add(key);
+      else s.delete(key);
+      return s;
+    });
+  }
+  async function batchLib(action) {
+    const keys = [...libSelKeys];
+    if (keys.length === 0) return;
+    const label = action === "skip" ? t("스킵") : t("재인코딩");
+    if (!window.confirm(t(label + " — ") + keys.length + t("건을 처리할까요?"))) return;
+    setError("");
+    try {
+      await api.libraryBatch(action, keys);
+      setLibSelKeys(new Set());
+      if (action === "requeue") await doScan(); // re-queue the now-pending entries
+    } catch (err) {
+      setError(err.message);
+    }
+  }
+
   // ── queue control (pause all / pause worker / cancel worker queue) ──
   const isNodePaused = n => pauseState.all || pauseState.nodeIds.includes(n.id);
   async function togglePauseAll() {
@@ -1007,6 +1033,14 @@ export default function App() {
       return String(va).localeCompare(String(vb), "ko") * dir;
     });
   }, [library, folders, folderById, libSel, libFilter, libSort]);
+  // visible row keys (same order as visibleEntries) — checkbox state keys
+  const visKeys = useMemo(() => visibleEntries.map(e => (e.folder ? e.folder + "/" : "") + e.path), [visibleEntries]);
+  const allSel = visKeys.length > 0 && visKeys.every(k => libSelKeys.has(k));
+  const someSel = !allSel && visKeys.some(k => libSelKeys.has(k));
+  // switching sheet/filter deselects (rows are not comparable across them)
+  useEffect(() => {
+    setLibSelKeys(new Set());
+  }, [libSel, libFilter]);
   const toggleLibSort = key => setLibSort(s => s.key === key ? {
     key,
     dir: -s.dir
@@ -2424,7 +2458,21 @@ export default function App() {
           })()}
               </div>}
             {visibleEntries.length > 0 ? <div className="libtable">
+                <div className="libbatch">
+                  {libSelKeys.size > 0 && <span className="jmeta">{t("선택: ") + libSelKeys.size + t("건")}</span>}
+                  <button disabled={libSelKeys.size === 0} onClick={() => batchLib("requeue")}>{t("재인코딩")}</button>
+                  <button disabled={libSelKeys.size === 0} onClick={() => batchLib("skip")}>{t("스킵")}</button>
+                  {libSelKeys.size > 0 && <button className="linkish" onClick={() => setLibSelKeys(new Set())}>{t("선택 해제")}</button>}
+                </div>
                 <div className="libhead row">
+                  <span className="libcheck" title={t("모두 선택")}><input type="checkbox" checked={allSel} ref={el => {
+            if (el) el.indeterminate = someSel;
+          }} onChange={ev => setLibSelKeys(prev => {
+            const s = new Set(prev);
+            if (ev.target.checked) for (const k of visKeys) s.add(k);
+            else for (const k of visKeys) s.delete(k);
+            return s;
+          })} /></span>
                   <Th k="name" className="c-name">
                     File
                   </Th>
@@ -2445,7 +2493,8 @@ export default function App() {
                     Status
                   </Th>
                 </div>
-                {visibleEntries.map(e => <div key={(e.folder ? e.folder + "/" : "") + e.path} className="librow row">
+                {visibleEntries.map((e, i) => <div key={visKeys[i]} className="librow row">
+                    <span className="libcheck"><input type="checkbox" checked={libSelKeys.has(visKeys[i])} onChange={ev => toggleLibKey(visKeys[i], ev.target.checked)} /></span>
                     <span className="c-name" title={e.path}>
                       <span className="jname">{e.name}</span>
                       {e.status === "done" && e.reencoded && <span className="jout">→ {e.reencoded}</span>}

@@ -281,7 +281,10 @@ header h1 {
     row-gap: 4px;
   }
   .libtable .librow .c-name {
-    flex: 1 1 100%;
+    flex: 1 1 calc(100% - 26px); /* shares row 1 with the checkbox */
+  }
+  .libtable .librow .libcheck {
+    flex: 0 0 auto;
   }
   .libtable .librow .c-folder {
     flex: 1 1 46%;
@@ -663,6 +666,38 @@ code {
 .libhead,
 .librow {
   min-width: 780px;
+}
+/* Batch-select column (library table only — the fail quarantine keeps its
+   7-column grid). 18px track in front of the name. */
+.libtable:not(:has(.failhead)) .libhead,
+.libtable:not(:has(.failhead)) .librow {
+  grid-template-columns:
+    18px             /* select */
+    minmax(0, 2.2fr)   /* name */
+    minmax(0, 1fr)     /* folder */
+    minmax(0, 1.5fr)   /* codec */
+    minmax(0, 1.3fr)   /* specs */
+    minmax(96px, 1.1fr)/* size */
+    minmax(64px, 0.7fr)/* duration */
+    minmax(130px, 1.2fr); /* status */
+}
+.libcheck {
+  display: inline-flex;
+  align-items: center;
+}
+.libcheck input {
+  accent-color: var(--accent);
+  cursor: pointer;
+  margin: 0;
+}
+/* top-right batch bar (visible when rows exist; buttons enable on selection) */
+.libbatch {
+  display: flex;
+  justify-content: flex-end;
+  align-items: center;
+  gap: 8px;
+  margin: 0 0 8px;
+  min-height: 26px;
 }
 .libhead {
   background: var(--panel);
