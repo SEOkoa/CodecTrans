@@ -2023,9 +2023,23 @@ export default function App() {
                     {n.enabledBackends.join(" · ")}
                   </span>}
                 {n.allowSoftware === false && <span className="chip c-vp9" title={t("\uC18C\uD504\uD2B8\uC6E8\uC5B4 \uC778\uCF54\uB529 \uD3F4\uBC31 \uBE44\uD65C\uC131 \u2014 \uC774 \uB178\uB4DC\uB294 HW \uC7A1\uB9CC \uBC1B\uC74C")}>{t("HW\uB9CC")}</span>}
-                <button className="gear" title={t("\uB178\uB4DC \uC124\uC815 \u2014 \uC774\uB984 \xB7 \uC6CC\uCEE4 \uC790\uC6D0 \xB7 \uB3D9\uC2DC \uC791\uC5C5")} onClick={() => openNodeCfg(n)}>
+                <button className="gear" title={t("\uB178\uB4DC \uC124\uC815 \u2014 \uC774\uB984 \uB77C \uC6CC\uCEE4 \uC790\uC6D0 \uB77C \uD63D\uC2DC \uC791\uC5C5")} onClick={() => openNodeCfg(n)}>
                   ⚙
                 </button>
+                {n.status !== "online" && <button className="gear" style={{ color: "#c66" }} title={t("오프라인 노드 삭제 — 레지스트리에서 제거 (진행 중이던 잡은 재큐잉)")} onClick={async () => {
+                  if (!window.confirm(t("오프라인 노드 ") + (n.displayName || n.name) + t("를 삭제할까요? 진행 중이던 잡은 다른 노드로 재큐잉됩니다."))) return;
+                  try {
+                    const r = await api.nodeDelete(n.id);
+                    setSearchMsg(t("\uB178\uB4DC \uC0AD\uC81C \uC644\uB8CC: ") + (r.name || n.displayName || n.name) + (r.requeued ? t(" (\uC7AC\uD050\uC774 \uC694 \uC7A5 ") + r.requeued + t(" \uAC74)") : ""));
+                    setTimeout(() => setSearchMsg(""), 4000);
+                    setNodes(await api.nodes("all"));
+                  } catch (e) {
+                    setSearchMsg(e.message);
+                    setTimeout(() => setSearchMsg(""), 5000);
+                  }
+                }}>
+                  🗑
+                </button>}
               </div>
               {(() => {
               const live = jobs.filter(j => j.nodeId === n.id && (j.status === "running" || j.status === "dispatched"));

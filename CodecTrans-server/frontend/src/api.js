@@ -104,6 +104,9 @@ export const api = {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(body),
     }),
+  // manual removal of an OFFLINE node (retired/ghost machines). The server
+  // refuses online nodes and re-queues any orphaned running jobs.
+  nodeDelete: (id) => jfetch(`/api/nodes/${id}`, { method: "DELETE" }),
   discoveredNodes: () => jfetch("/api/nodes/discovered"),
   // "server finds a node": probe a node's local API (ip:port) and register it.
   searchNode: (ip, port) =>

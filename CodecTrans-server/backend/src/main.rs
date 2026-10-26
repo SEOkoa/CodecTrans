@@ -2240,12 +2240,13 @@ async fn decode_health_check(path: &str, duration: Option<f64>, depths: &[(Strin
         // software decode), clamped. Window decodes max out at 15 min; a
         // full-file "all" decode at 1 hour.
         let scaled = (len * 8.0) as u64;
-        let timeout_s = if known && len >= d - 0.5 {
+        let full_check = known && len >= d - 0.5;
+        let timeout_s = if full_check {
             scaled.clamp(30, 3600)
         } else {
             scaled.clamp(30, 900)
         };
-        if !decode_window_ok(path, seek, len, timeout_s).await {
+        if !decode_window_ok(path, seek, len, timeout_s, full_check).await {
             return false;
         }
     }
@@ -2256,8 +2257,9 @@ async fn decode_health_check(path: &str, duration: Option<f64>, depths: &[(Strin
 /// error output — `-v error` makes ffmpeg print only real errors. A
 /// TIMEOUT is not proof of corruption: under CPU load (parallel health
 /// checks, 4K/10-bit material) the realtime budget blows — retry once at
-/// 3x before declaring the source broken.
-async fn decode_window_ok(path: &str, seek: f64, len: f64, timeout_s: u64) -> bool {
+/// 3x before declaring the source broken. `full_check` = explicit
+/// "all"-mode full-file verification (kept uncapped in frames).
+async fn decode_window_ok(path: &str, seek: f64, len: f64, timeout_s: u64, full_check: bool) -> bool {
     // GPU decode when the container carries a bundled NVIDIA userland that
     // matches the host driver (set by init_cuda at startup): the 4K source
     // decode then hits the NVDEC engine instead of the CPU — that is what
@@ -2280,13 +2282,75 @@ async fn decode_window_ok(path: &str, seek: f64, len: f64, timeout_s: u64) -> bo
         }
         c.arg("-i").arg(path);
         c.arg("-t").arg(format!("{len:.3}"));
+        // Memory guard (QNAP wedge 2026-10-26): on a memory-starved host the
+        // hwaccel frame pool can accumulate hundreds of decoded 4K frames
+        // while the consumer stalls — one 15s window ballooned to 4.2GB on
+        // a 32GB box and helped trigger a ZFS ARC reclaim storm that froze
+        // all host I/O (server + sshd wedged for minutes). Cap how many
+        // frames a spot-check window may decode; explicit "all" (full-file)
+        // verification stays uncapped.
+        if !full_check {
+            c.args(["-frames:v", "120"]);
+        }
         c.args(["-f", "null", "-"]);
         c.stdout(std::process::Stdio::piped());
         c.stderr(std::process::Stdio::piped());
         c
     };
-    let r = tokio::time::timeout(std::time::Duration::from_secs(timeout_s), build().output()).await;
-    if let Ok(Ok(o)) = r {
+    // One attempt: spawn, wait with the timeout — and, crucially, KILL the
+    // child when it expires. A bare `timeout(f, cmd.output())` drops the
+    // future and ORPHANS the ffmpeg process: it keeps decoding for minutes
+    // (a stalled consumer under host memory pressure), pinning GBs of
+    // frame memory on an already starved box — the 2026-10-26 QNAP wedge
+    // ran two such orphaned 4GB decodes alongside the live one.
+    async fn run_once(
+        build: &impl Fn() -> tokio::process::Command,
+        timeout_s: u64,
+    ) -> Result<std::process::Output, ()> {
+        let mut child = match build().spawn() {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!("[CodecTrans] health decode spawn error: {e}");
+                return Err(());
+            }
+        };
+        // wait() borrows (&mut self) — the timeout can drop the future and
+        // we still own the child to KILL it. (wait_with_output takes self
+        // BY VALUE: on timeout the future is dropped and the ffmpeg process
+        // is orphaned — the exact wedge seen on the QNAP.)
+        let stderr = child.stderr.take();
+        match tokio::time::timeout(
+            std::time::Duration::from_secs(timeout_s),
+            child.wait(),
+        )
+        .await
+        {
+            Ok(status) => {
+                let status = match status {
+                    Ok(s) => s,
+                    Err(_) => return Err(()),
+                };
+                // Drain the (small, `-v error`) stderr after exit.
+                let mut errbuf = String::new();
+                if let Some(mut se) = stderr {
+                    use tokio::io::AsyncReadExt;
+                    let _ = se.read_to_string(&mut errbuf).await;
+                }
+                Ok(std::process::Output {
+                    status,
+                    stdout: Vec::new(),
+                    stderr: errbuf.into_bytes(),
+                })
+            }
+            Err(_) => {
+                let _ = child.kill().await;
+                let _ = child.wait().await; // reap the killed child
+                Err(())
+            }
+        }
+    }
+    let r = run_once(&build, timeout_s).await;
+    if let Ok(o) = r {
         let err = String::from_utf8_lossy(&o.stderr);
         let (ok, real_err) = decode_stderr_real(&err, o.status.success());
         if !ok {
@@ -2304,9 +2368,8 @@ async fn decode_window_ok(path: &str, seek: f64, len: f64, timeout_s: u64) -> bo
     );
     // Timeout (or a transient spawn hiccup) — retry once, 3x the budget.
     let retry_s = timeout_s.saturating_mul(3).max(60);
-    let r = tokio::time::timeout(std::time::Duration::from_secs(retry_s), build().output()).await;
-    match r {
-        Ok(Ok(o)) => {
+    match run_once(&build, retry_s).await {
+        Ok(o) => {
             let err = String::from_utf8_lossy(&o.stderr);
             let (ok, real_err) = decode_stderr_real(&err, o.status.success());
             if !ok {
@@ -5887,6 +5950,81 @@ async fn list_nodes(State(store): State<Store>, Query(f): Query<NodeFilter>) -> 
     Json(Value::Array(v))
 }
 
+/// DELETE /api/nodes/:id — remove an OFFLINE node from the registry
+/// (retired/ghost machines would otherwise linger forever; there was no
+/// other way to purge them — previously it meant hand-editing Redis).
+/// Refuses while the node is online; "running" jobs pinned to it are
+/// re-queued (same orphan semantics as re-registration) so work isn't lost.
+async fn delete_node(State(store): State<Store>, UrlPath(id): UrlPath<String>) -> Response {
+    let c = store.lock().unwrap_or_else(|p| p.into_inner()).redis();
+    let mut c = c;
+    // Existence + liveness in one round-trip.
+    let (h, ttl) = match {
+        let mut pipe = redis::pipe();
+        pipe.cmd("HGETALL").arg(rk_node(&id));
+        pipe.cmd("TTL").arg(rk_online(&id));
+        pipe.query_async::<Vec<redis::Value>>(&mut c).await
+    } {
+        Ok(v) => match (
+            v.get(0).and_then(|hv| <NodeHash as redis::FromRedisValue>::from_redis_value(hv).ok()),
+            v.get(1).and_then(|tv| <i64 as redis::FromRedisValue>::from_redis_value(tv).ok()),
+        ) {
+            (Some(h), Some(t)) => (h, t),
+            (Some(h), None) => (h, -2i64),
+            _ => {
+                return (StatusCode::NOT_FOUND, Json(json!({"error": "node not found"})))
+                    .into_response()
+            }
+        },
+        Err(e) => {
+            return (StatusCode::BAD_GATEWAY, Json(json!({"error": e.to_string()})))
+                .into_response()
+        }
+    };
+    if ttl > 0 {
+        return (
+            StatusCode::CONFLICT,
+            Json(json!({"error": "node is online — stop it first"})),
+        )
+            .into_response();
+    }
+    let name = h.get("name").cloned().unwrap_or_default();
+    // Re-queue orphaned running jobs — the deleted node will never claim them.
+    let requeued: Vec<String> = {
+        let mut s = store.lock().unwrap_or_else(|p| p.into_inner());
+        let orphaned: Vec<String> = s
+            .jobs
+            .values()
+            .filter(|j| j.node_id.as_deref() == Some(id.as_str()) && j.status == "running")
+            .map(|j| j.id.clone())
+            .collect();
+        for jid in &orphaned {
+            if let Some(j) = s.jobs.get_mut(jid) {
+                j.status = "queued".to_string();
+                j.progress = 0.0;
+                j.started_at = None;
+            }
+        }
+        orphaned
+    };
+    if !requeued.is_empty() {
+        eprintln!(
+            "[CodecTrans] node {} deleted — requeued {} orphaned running job(s)",
+            name,
+            requeued.len()
+        );
+    }
+    let mut pipe = redis::pipe();
+    pipe.cmd("SREM").arg(RK_IDS).arg(&id);
+    pipe.cmd("DEL").arg(rk_node(&id));
+    pipe.cmd("DEL").arg(rk_online(&id));
+    if !name.is_empty() {
+        pipe.cmd("DEL").arg(rk_name(&name));
+    }
+    let _: redis::RedisResult<()> = pipe.query_async(&mut c).await;
+    Json(json!({"ok": true, "name": name, "requeued": requeued.len()})).into_response()
+}
+
 /// GET /api/nodes/discovered — nodes seen on the LAN via mDNS (may not be
 /// registered yet). Each carries its name, ip, port and HW encoders.
 async fn list_discovered_nodes(State(store): State<Store>) -> impl IntoResponse {
@@ -6940,7 +7078,7 @@ async fn main() {
         .route("/api/nodes/discovered", get(list_discovered_nodes))
         .route("/api/nodes/search", post(search_node))
         .route("/api/nodes/register", post(node_register))
-        .route("/api/nodes/:id", get(get_node).patch(node_config_patch))
+        .route("/api/nodes/:id", get(get_node).patch(node_config_patch).delete(delete_node))
         .route("/api/nodes/:id/heartbeat", post(node_heartbeat))
         .route("/api/nodes/:id/poll", get(node_poll))
         .route("/api/nodes/:id/report", post(node_report))
