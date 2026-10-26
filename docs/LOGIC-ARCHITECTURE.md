@@ -63,8 +63,8 @@ auto-scan (5분 주기, CT_AUTO_SCAN)
 | `nameContains` | 파일명 부분 일치 | 프로브 |
 | `srcHealth` | 프레임 디코드 헬스체크 (전체/앞N%/무작위) | `decode_health_check`, `CT_HEALTH_WORKERS` 병렬 상한 |
 | `nodeHasHw` | 온라인 노드 중 코덱+가속기 클래스 HW 인코더 보유 | 노드 registry |
-| **`field`** 🧩 | **임의 프로브 필드 × 연산자** | 14 필드 (size_mb/size/duration_s/width/height/fps/bitrate×3/name/codec/container/pixel_fmt) × 9 연산자 (gt/gte/lt/lte/eq/neq/contains/startsWith/endsWith) — 코덱은 계열 정규화 후 비교 |
-| **`cmd`** 🧩 | **셸 명령 exit 0 = ✓** | 클린 env + `PATH=/usr/local/bin:/usr/bin:/bin:/share/.codectrans/scripts`, env 주입: `CT_FILE CT_NAME CT_SIZE CT_SIZE_MB CT_CODEC CT_CONTAINER CT_PIXEL_FMT CT_DURATION_S CT_WIDTH CT_HEIGHT CT_FPS CT_BITRATE CT_VIDEO_BITRATE CT_AUDIO_BITRATE`, timeout 1~300초 (기본 30, 초과=✗) |
+| **`field`** 🧩 | **임의 프로브 필드 × 연산자** | 11 필드 (size(MB)/duration(s)/width/height/fps/bitrate(영상)/audio_bitrate/name/codec/container/pixFmt; size_mb·duration_s·video_bit_rate·pixel_fmt 별칭도 인식) × 9 연산자 (gt/gte/lt/lte=수치+`value`, eq/neq/contains/startsWith/endsWith=문자+`pattern`) — 코덱은 계열 정규화 후 비교 |
+| **`cmd`** 🧩 | **셸 명령 exit 0 = ✓** | 클린 env + 컨테이너 `PATH`만 주입, env: `CT_FILE CT_NAME CT_DIR CT_SIZE_MB CT_DURATION_S CT_CODEC CT_WIDTH CT_HEIGHT CT_FPS CT_BITRATE_MBPS CT_CONTAINER CT_PIXFMT`, timeout 1~300초 (기본 30, 초과=✗). 스크립트는 **절대경로**로 호출 |
 
 ## 4. 액션 (Action) 카탈로그
 
@@ -98,9 +98,9 @@ auto-scan (5분 주기, CT_AUTO_SCAN)
 
 ## 6. 보안/안전 규칙 (플러그인 실행)
 
-- cmd/postCmd는 **서버 컨테이너의 non-root 사용자**로 실행 — root 권한 없음
-- 스크립트 경로는 `PATH`의 `/share/.codectrans/scripts` (볼륨 마운트) 권장 —
-  절대경로 셸 명령도 가능하지만 컨테이너 내부 경로만 존재
+- cmd/postCmd는 **서버 컨테이너의 root 사용자**로 실행 — 마운트된 볼륨 경로는 그대로 접근 가능
+- 스크립트는 **절대경로**로 호출 (PATH에 사용자 스크립트 디렉터리는 없음 —
+  컨테이너 기본 PATH만 주입됨)
 - env는 **완전 클린** (호스트 환경 변수 유출 없음) + 명시적 CT_* 주입
 - timeout 강제 (kill), 조건 실패/타임아웃 = ✗ 갈래 (파일은 안전 — 처리 안 됨)
 - postCmd 실패는 **경고 로그만** — 인코딩된 파일 운명에 영향을 주지 못함

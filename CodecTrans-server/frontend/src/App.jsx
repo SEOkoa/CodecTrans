@@ -228,16 +228,16 @@ function nodeTitle(n) {
       if (a.kind === "saveHere") return t("\uC6D0\uBCF8 \uC704\uCE58\uC5D0 \uC800\uC7A5");
       if (a.kind === "requeue") return t("\uD050\uB85C \uB418\uB3CC\uB9AC\uAE30");
       if (a.kind === "postCmd") return "⚙️ postCmd";
-      const t = a.target || {};
-      const chs = t.choices || [];
+      const tgt = a.target || {};
+      const chs = tgt.choices || [];
       if (chs.length) {
         const names = chs.map(c => (c.videoCodec ? codec(c.videoCodec) : "?") + (c.accel ? "/" + c.accel : ""));
-        const m0 = chs[0].mode ?? t.mode;
-        const prate = m0 === "crf" ? "CRF " + (chs[0].crf ?? t.crf ?? 23) : (chs[0].bitratePct ?? t.bitratePct ?? 70) + "%";
+        const m0 = chs[0].mode ?? tgt.mode;
+        const prate = m0 === "crf" ? "CRF " + (chs[0].crf ?? tgt.crf ?? 23) : (chs[0].bitratePct ?? tgt.bitratePct ?? 70) + "%";
         return t("\uC778\uCF54\uB529 \u2192 ") + names.join(" → ") + " · " + prate + (a.hwOnly ? t(" \xB7 \u26A1HW \uC804\uC6A9") : "");
       }
-      const rate = t.mode === "crf" ? "CRF " + (t.crf ?? 23) : (t.bitratePct ?? 70) + "%";
-      return t("\uC778\uCF54\uB529 \u2192 ") + (t.videoCodec ? codec(t.videoCodec) : t("\uD3F4\uB354 \uAE30\uBCF8")) + " · " + rate + (a.hwOnly ? t(" \xB7 \u26A1HW \uC804\uC6A9") : "");
+      const rate = tgt.mode === "crf" ? "CRF " + (tgt.crf ?? 23) : (tgt.bitratePct ?? 70) + "%";
+      return t("\uC778\uCF54\uB529 \u2192 ") + (tgt.videoCodec ? codec(tgt.videoCodec) : t("\uD3F4\uB354 \uAE30\uBCF8")) + " · " + rate + (a.hwOnly ? t(" \xB7 \u26A1HW \uC804\uC6A9") : "");
     default:
       return n.kind;
   }
@@ -2587,9 +2587,9 @@ export default function App() {
                             {n.kind === "start" ? t("\uC2DC\uC791") : isCond ? t("\uC870\uAC74") : t("\uC561\uC158")}
                           </span>
                           <span className="gtitle" title={n.label ? t("\uB354\uBE14\uD074\uB9AD: \uC774\uB984 \uBCC0\uACBD") : t("\uB354\uBE14\uD074\uB9AD: \uC774\uB984 \uBD99\uC774\uAE30")} onDoubleClick={() => {
-                      const t = prompt(t("\uB178\uB4DC \uC774\uB984 (\uBE44\uC6B0\uBA74 \uC790\uB3D9 \uC774\uB984)"), n.label || "");
-                      if (t !== null) patchNode(n.id, {
-                        label: t.trim() || undefined
+                      const nm = prompt(t("\uB178\uB4DC \uC774\uB984 (\uBE44\uC6B0\uBA74 \uC790\uB3D9 \uC774\uB984)"), n.label || "");
+                      if (nm !== null) patchNode(n.id, {
+                        label: nm.trim() || undefined
                       });
                     }}>
                             {nodeTitle(n)}
