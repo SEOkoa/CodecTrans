@@ -614,9 +614,8 @@ async fn reg_node(
         .arg("diag").arg(serde_json::to_string(diag).unwrap_or_else(|_| "[]".into()))
         .arg("firstSeen").arg(first_seen)
         .arg("lastHeartbeat").arg(now);
-    if is_new {
-        pipe.cmd("HSET").arg(rk_node(&id)).arg("currentJob").arg("");
-    }
+    // Registration = (re)start: whatever job the old process "had" is gone.
+    pipe.cmd("HSET").arg(rk_node(&id)).arg("currentJob").arg("");
     pipe.cmd("SETEX").arg(rk_online(&id)).arg(ONLINE_TTL_SECS).arg("1");
     // A Redis blip must NOT panic the handler (a panic here would also risk
     // poisoning the shared store mutex that a dozen handlers hold): the node
@@ -5679,6 +5678,35 @@ async fn node_register(State(store): State<Store>, Json(req): Json<RegisterReq>)
         Ok(n) => n,
         Err(e) => return (StatusCode::BAD_GATEWAY, Json(json!({ "error": e }))).into_response(),
     };
+    // Registration = (re)start: the node's in-memory job state is empty. Any
+    // job the server still believes this node is "running" is now orphaned
+    // (without this, a node restart strands the encode forever — the
+    // dead-node self-heal only fires for OFFLINE nodes, and this one is back).
+    // Requeue them: the restarted node re-claims via its poll, or the 10m
+    // dispatched-reset hands them to another node if it never does.
+    {
+        let mut s = store.lock().unwrap_or_else(|p| p.into_inner());
+        let orphaned: Vec<String> = s
+            .jobs
+            .values()
+            .filter(|j| j.node_id.as_deref() == Some(&node.id) && j.status == "running")
+            .map(|j| j.id.clone())
+            .collect();
+        for jid in &orphaned {
+            if let Some(j) = s.jobs.get_mut(jid) {
+                j.status = "queued".to_string();
+                j.progress = 0.0;
+                j.started_at = None;
+            }
+        }
+        if !orphaned.is_empty() {
+            eprintln!(
+                "[CodecTrans] node {} re-registered — requeued {} orphaned running job(s)",
+                node.name,
+                orphaned.len()
+            );
+        }
+    }
     Json(json!({"nodeId": node.id, "new": already.is_none()})).into_response()
 }
 
