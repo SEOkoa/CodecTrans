@@ -5359,7 +5359,6 @@ async fn library_scan(State(store): State<Store>, Json(req): Json<ScanReq>) -> R
     for (fid, rootp, rel) in &plan {
         let full = rootp.join(rel);
         let pstr = full.to_string_lossy().to_string();
-        let size = std::fs::metadata(&full).map(|m| m.len()).unwrap_or(0);
         let ext = full
             .extension()
             .and_then(|x| x.to_str())
@@ -5371,14 +5370,24 @@ async fn library_scan(State(store): State<Store>, Json(req): Json<ScanReq>) -> R
             Some(f) => format!("{f}/{}", rel.to_string_lossy()),
             None => rel.to_string_lossy().to_string(),
         };
-        let reuse = old_map
-            .get(&key)
-            .filter(|o| o.size == size && o.status != "error")
-            .cloned();
+        // In-memory only here: the old catalog entry for the reuse check.
+        // The size comparison needs a FRESH metadata — that disk I/O runs
+        // inside the task, under the probe permit. A synchronous
+        // metadata() in this loop blocks a worker thread for the full
+        // duration of a NAS stall and freezes the whole spawn phase
+        // (2026-10-26: scan wedged mid-loop, 0 child procs, 0 CPU).
+        let old_entry = old_map.get(&key).cloned();
         let sem = sem.clone();
         handles.push(tokio::spawn(async move {
             let _g = sem.acquire_owned().await.expect("probe semaphore");
             let _pf = ProbeInflightGuard(pstr.clone());
+            let size = tokio::task::spawn_blocking({
+                let f = full.clone();
+                move || std::fs::metadata(&f).map(|m| m.len()).unwrap_or(0)
+            })
+            .await
+            .unwrap_or(0);
+            let reuse = old_entry.filter(|o| o.size == size && o.status != "error");
             let info = match reuse {
                 Some(o) => MediaInfo {
                     duration: o.duration,
@@ -5431,6 +5440,7 @@ async fn library_scan(State(store): State<Store>, Json(req): Json<ScanReq>) -> R
             })
         }));
     }
+    eprintln!("[scan] spawned {} probe tasks — collecting", handles.len());
     let mut entries: Vec<LibraryEntry> = Vec::with_capacity(plan.len());
     for h in handles {
         if let Ok(Some(e)) = h.await {
