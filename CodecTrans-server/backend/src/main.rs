@@ -7926,6 +7926,9 @@ async fn dispatch(State(store): State<Store>, Json(req): Json<DispatchReq>) -> R
 #[tokio::main]
 async fn main() {
     let port: u16 = std::env::var("CT_PORT").ok().and_then(|s| s.parse().ok()).unwrap_or(8400);
+    // Arm the boot clock NOW (LazyLock would otherwise initialize on the
+    // first scan, making the gate see "0s since boot" forever).
+    let _ = BOOT_TS.elapsed();
 
     // Wedge forensics (2026-10-27): the server wedges with every thread
     // parked and NOTHING logged — capture panics loudly, keep a plain
