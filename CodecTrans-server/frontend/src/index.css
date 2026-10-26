@@ -264,6 +264,55 @@ header h1 {
   body {
     overflow-x: hidden;
   }
+  /* Library table: the 780px min-width forces a horizontal scroll wall on a
+     phone — instead let the cells WRAP onto clean rows (no squishing). The
+     header loses its meaning once rows wrap, so it goes away too. */
+  .libhead,
+  .librow {
+    min-width: 0;
+  }
+  .libtable .libhead {
+    display: none;
+  }
+  .libtable .librow {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    row-gap: 4px;
+  }
+  .libtable .librow .c-name {
+    flex: 1 1 100%;
+  }
+  .libtable .librow .c-folder {
+    flex: 1 1 46%;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+  .libtable .librow .c-codec {
+    flex: 0 0 auto;
+  }
+  .libtable .librow .c-spec {
+    flex: 1 1 46%;
+    white-space: normal;
+    overflow-wrap: anywhere;
+  }
+  .libtable .librow .c-size,
+  .libtable .librow .c-dur {
+    flex: 0 0 auto;
+  }
+  .libtable .librow .c-status {
+    flex: 1 1 100%;
+    text-align: left;
+  }
+  .statusrow {
+    flex-wrap: wrap;
+    width: 100%;
+  }
+  /* Node tab: the filter row (seg + selects + pause button) wraps */
+  .nodefilters {
+    flex-wrap: wrap;
+  }
 }
 
 .card {

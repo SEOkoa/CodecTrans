@@ -107,6 +107,32 @@ export const api = {
   // manual removal of an OFFLINE node (retired/ghost machines). The server
   // refuses online nodes and re-queues any orphaned running jobs.
   nodeDelete: (id) => jfetch(`/api/nodes/${id}`, { method: "DELETE" }),
+  // queue control — pause/resume ALL workers, or one worker (its running
+  // jobs continue; no new dispatch/claims).
+  pauseState: () => jfetch("/api/queue/pause"),
+  pauseAll: (pause) =>
+    jfetch("/api/queue/pause", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ pause }),
+    }),
+  nodePause: (id, pause) =>
+    jfetch(`/api/nodes/${id}/pause`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ pause }),
+    }),
+  // cancel a worker's QUEUED jobs — they go back to pending and are
+  // re-dispatched to other (non-paused) nodes immediately; exempt from the
+  // requeue cap (user reroute, not a failed encode).
+  nodeQueuedCancel: (id) => jfetch(`/api/nodes/${id}/queued`, { method: "DELETE" }),
+  // manually skip a library file (it will not be encoded; ⟳ re-queues it).
+  librarySkip: (key) =>
+    jfetch("/api/library/skip", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ key }),
+    }),
   discoveredNodes: () => jfetch("/api/nodes/discovered"),
   // "server finds a node": probe a node's local API (ip:port) and register it.
   searchNode: (ip, port) =>

@@ -325,9 +325,18 @@ pub struct LibraryEntry {
     pub requeue_count: u32,
 }
 
-/// Max consecutive post-encode re-queues per entry before it is parked as
-/// "error" for review (see the PostOp::Requeue handling in finish_lib_job).
-const MAX_REQUEUE_ATTEMPTS: u32 = 3;
+/// Default post-encode requeue cap (overridable via the settings tab,
+/// LibraryConfig.requeue_limit).
+const DEFAULT_REQUEUE_LIMIT: u32 = 3;
+
+/// Effective requeue cap from the persisted settings (0/absent → default).
+fn effective_requeue_limit() -> u32 {
+    load_lib_cfg()
+        .requeue_limit
+        .filter(|v| *v > 0)
+        .unwrap_or(DEFAULT_REQUEUE_LIMIT)
+        .max(1)
+}
 
 fn is_zero_u32(v: &u32) -> bool {
     *v == 0
@@ -356,6 +365,44 @@ impl LibraryEntry {
     }
 }
 
+/// Queue pause control (worker pause / pause-all). A paused node keeps its
+/// RUNNING jobs but receives no NEW work: dispatch never targets it and its
+/// poll returns no jobs. Persisted to queue_state.json so a server restart
+/// does not silently resume a paused farm.
+#[derive(Clone, Default, Serialize, Deserialize)]
+pub struct PauseState {
+    #[serde(default)]
+    pub all: bool,
+    #[serde(default)]
+    pub nodes: Vec<String>, // node ids
+}
+
+impl PauseState {
+    pub fn node_paused(&self, id: &str) -> bool {
+        self.all || self.nodes.iter().any(|n| n == id)
+    }
+}
+
+fn pause_path() -> PathBuf {
+    base_dir().join("queue_state.json")
+}
+fn load_pause_state() -> PauseState {
+    std::fs::read_to_string(pause_path())
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default()
+}
+fn save_pause_state(p: &PauseState) {
+    let _ = std::fs::write(pause_path(), serde_json::to_string(p).unwrap_or_default());
+}
+
+/// Drop paused nodes from a candidate list (dispatch gates). Paused nodes
+/// stay ONLINE in the registry/UI — they simply take no new work.
+fn pause_filter(online: Vec<Node>, store: &Store) -> Vec<Node> {
+    let p = store.lock().unwrap_or_else(|p2| p2.into_inner()).pause.clone();
+    online.into_iter().filter(|n| !p.node_paused(&n.id)).collect()
+}
+
 pub struct JobStore {
     jobs: HashMap<String, Job>,
     discovered: HashMap<String, Discovered>,
@@ -364,6 +411,8 @@ pub struct JobStore {
     /// Node registry lives in Redis (persistent identity + liveness); this is
     /// the shared connection handle.
     redis: RConn,
+    /// Worker pause state (persisted — see PauseState).
+    pub pause: PauseState,
 }
 
 impl JobStore {
@@ -374,6 +423,7 @@ impl JobStore {
             library: HashMap::new(),
             storage_root: String::new(),
             redis,
+            pause: load_pause_state(),
         }
     }
     /// Clone the Redis handle out (drop any store guard before awaiting on it).
@@ -1933,6 +1983,13 @@ pub struct LibraryConfig {
     /// here (server-level) and is picked up by GET /api/settings.
     #[serde(default)]
     pub language: Option<String>,
+    /// Post-encode requeue cap (settings tab): max CONSECUTIVE re-queues per
+    /// entry before it is parked as "error" for review. A deterministic
+    /// post-encode failure (e.g. the srcHealth gate on a corrupted source)
+    /// would otherwise re-encode the same file forever. None = default
+    /// DEFAULT_REQUEUE_LIMIT.
+    #[serde(default)]
+    pub requeue_limit: Option<u32>,
     /// Bumped on EVERY settings save (logic / graph / folders / …). Saved
     /// encode decisions carry the version they were made with; a scan
     /// re-evaluates any decision whose version is older than this, so an
@@ -3005,6 +3062,40 @@ struct RequeueReq {
     key: String,
 }
 
+/// POST /api/library/skip — manually skip a file (it will not be encoded).
+/// ⟳ re-queue undoes it (fresh evaluation). Queued jobs for the file are
+/// cancelled first (cap-exempt, like a worker queue cancel).
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct LibrarySkipReq {
+    key: String,
+}
+async fn library_skip(State(store): State<Store>, Json(req): Json<LibrarySkipReq>) -> Response {
+    // Cancel any queued job for this exact source (cap-exempt requeue path
+    // semantics: the entry just goes to skipped — no requeue at all).
+    {
+        let mut s = store.lock().unwrap_or_else(|p| p.into_inner());
+        for j in s.jobs.values_mut() {
+            if j.status == "queued" && j.input_file == req.key {
+                j.status = "cancelled".into();
+                j.error = Some("user skipped the file".into());
+                j.finished_at = Some(now_ms());
+            }
+        }
+        let found = s.update_library_entry(&req.key, |e| {
+            e.status = "skipped".into();
+            e.error = Some("수동 스킵 — ⟳으로 재큐잉 가능".into());
+            e.decision = None;
+            e.requeue_count = 0;
+        });
+        if found.is_none() {
+            return (StatusCode::NOT_FOUND, Json(json!({ "error": "entry not found" }))).into_response();
+        }
+    }
+    persist_catalog(&store);
+    Json(json!({ "ok": true })).into_response()
+}
+
 /// POST /api/library/requeue — reset a catalog entry to "pending" so the
 /// next scan re-queues it (the per-file ⟳ re-encode button).
 async fn library_requeue(State(store): State<Store>, Json(req): Json<RequeueReq>) -> Response {
@@ -3148,6 +3239,9 @@ struct SettingsBody {
     auto_scan_minutes: Option<u32>,
     /// UI language: "ko" | "en" (missing = leave as-is, null = default ko).
     language: Option<Option<String>>,
+    /// Post-encode requeue cap (missing = leave as-is, 0 = default 3,
+    /// N = clamp 1..=100).
+    requeue_limit: Option<u32>,
 }
 
 /// GET /api/settings — server-level settings (fail folder, auto-rescan).
@@ -3162,6 +3256,7 @@ async fn settings_get(State(_store): State<Store>) -> impl IntoResponse {
         "failDir": c.fail_dir,
         "autoScanMinutes": c.auto_scan_minutes,
         "language": lang,
+        "requeueLimit": c.requeue_limit.filter(|v| *v > 0).unwrap_or(DEFAULT_REQUEUE_LIMIT),
     }))
 }
 
@@ -3195,6 +3290,92 @@ async fn settings_post(State(_store): State<Store>, Json(b): Json<SettingsBody>)
         )
             .into_response(),
     }
+}
+
+// ── queue control (pause all / pause worker / cancel worker queue) ──
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct QueuePauseBody {
+    pause: bool,
+}
+
+/// GET /api/queue/pause — current pause state (UI: nodes tab + jobs header).
+async fn queue_pause_get(State(store): State<Store>) -> impl IntoResponse {
+    let p = store.lock().unwrap_or_else(|p2| p2.into_inner()).pause.clone();
+    Json(json!({ "all": p.all, "nodeIds": p.nodes }))
+}
+
+/// POST /api/queue/pause — pause/resume ALL workers. Unpausing-all also
+/// clears per-worker pauses (one visible switch, one meaning).
+async fn queue_pause_all(State(store): State<Store>, Json(b): Json<QueuePauseBody>) -> Response {
+    let mut s = store.lock().unwrap_or_else(|p| p.into_inner());
+    s.pause.all = b.pause;
+    if !b.pause {
+        s.pause.nodes.clear();
+    }
+    let p = s.pause.clone();
+    save_pause_state(&p);
+    eprintln!("[queue] pause-all → {}", p.all);
+    Json(json!({ "ok": true, "all": p.all, "nodeIds": p.nodes })).into_response()
+}
+
+/// POST /api/nodes/:id/pause — pause/resume ONE worker (its running jobs
+/// continue; no new dispatch, no new claims).
+async fn node_pause(State(store): State<Store>, UrlPath(id): UrlPath<String>, Json(b): Json<QueuePauseBody>) -> Response {
+    let mut s = store.lock().unwrap_or_else(|p| p.into_inner());
+    if b.pause {
+        if !s.pause.nodes.contains(&id) {
+            s.pause.nodes.push(id.clone());
+        }
+    } else {
+        s.pause.nodes.retain(|n| n != &id);
+    }
+    let p = s.pause.clone();
+    save_pause_state(&p);
+    eprintln!("[queue] node {} paused → {}", id, b.pause);
+    Json(json!({ "ok": true, "all": p.all, "nodeIds": p.nodes })).into_response()
+}
+
+/// DELETE /api/nodes/:id/queued — cancel that node's QUEUED (not running)
+/// jobs. CAP-EXEMPT requeue by design: the entries go back to pending with
+/// their saved decision INTACT (fast-path re-dispatch to another node) and
+/// requeue_count untouched — this is a user reroute, not a failed encode.
+async fn node_cancel_queued(State(store): State<Store>, UrlPath(id): UrlPath<String>) -> Response {
+    let queued: Vec<(String, Option<String>)> = {
+        let s = store.lock().unwrap_or_else(|p| p.into_inner());
+        s.jobs
+            .values()
+            .filter(|j| j.status == "queued" && j.node_id.as_deref() == Some(&id))
+            .map(|j| (j.id.clone(), j.lib_path.clone()))
+            .collect()
+    };
+    if queued.is_empty() {
+        return Json(json!({ "ok": true, "cancelled": 0 })).into_response();
+    }
+    {
+        let mut s = store.lock().unwrap_or_else(|p| p.into_inner());
+        for (jid, lib_path) in &queued {
+            if let Some(j) = s.jobs.get_mut(jid) {
+                j.status = "cancelled".into();
+                j.error = Some("user cancel — worker queue cleared".into());
+                j.finished_at = Some(now_ms());
+            }
+            if let Some(lp) = lib_path {
+                s.update_library_entry(lp, |e| {
+                    if e.status == "queued" {
+                        e.status = "pending".into();
+                        // decision + requeue_count untouched on purpose.
+                    }
+                });
+            }
+        }
+    }
+    persist_catalog(&store);
+    // Re-dispatch the freed entries to other (non-paused) workers NOW —
+    // don't make the user wait for the next auto-scan.
+    sweep_redispatch(&store, queued.len().max(1)).await;
+    eprintln!("[queue] cancelled {} queued jobs of node {}", queued.len(), id);
+    Json(json!({ "ok": true, "cancelled": queued.len() })).into_response()
 }
 
 // ── fail quarantine (보관함 tab) ────────────────────────────────
@@ -3667,7 +3848,7 @@ async fn resolve_choice_dispatch(
     hw_only: bool,
 ) -> Option<(String, String, String, bool, Option<u32>, TargetCfg)> {
     let c = store.lock().unwrap_or_else(|p| p.into_inner()).redis();
-    let online = list_nodes_redis(c, "online", None, None).await;
+    let online = pause_filter(list_nodes_redis(c, "online", None, None).await, store);
     if online.is_empty() {
         return None;
     }
@@ -3827,7 +4008,7 @@ async fn dispatch_lib_job(
             let family = codec_family(&vcodec);
             let node = {
                 let c = store.lock().unwrap_or_else(|p| p.into_inner()).redis();
-                let online = list_nodes_redis(c, "online", None, None).await;
+                let online = pause_filter(list_nodes_redis(c, "online", None, None).await, store);
                 let counts = active_jobs_by_node(store, None);
                 let idx = if hw_only {
                     // HW-only: prefer a FREE node with the family in
@@ -3893,7 +4074,7 @@ async fn dispatch_lib_job(
             // error (a capable-but-busy pool still waits: Ok(false)).
             if hw_only {
                 let c = store.lock().unwrap_or_else(|p| p.into_inner()).redis();
-                let online = list_nodes_redis(c, "online", None, None).await;
+                let online = pause_filter(list_nodes_redis(c, "online", None, None).await, store);
                 let any_hw = online.iter().any(|n| {
                     t.choices.iter().any(|ch| {
                         let fam = codec_family(ch.video_codec.as_deref().unwrap_or("h264"));
@@ -6276,6 +6457,11 @@ async fn get_node(State(store): State<Store>, UrlPath(id): UrlPath<String>) -> R
     }
 }
 
+/// Is this node currently paused (pause-all or per-worker)?
+fn is_node_paused(store: &Store, id: &str) -> bool {
+    store.lock().unwrap_or_else(|p| p.into_inner()).pause.node_paused(id)
+}
+
 /// GET /api/nodes/:id/poll — long-poll (up to 20s) for the next dispatched
 /// job. The response also carries the node's worker settings so the node can
 /// adapt (e.g. raise/lower its concurrent-job pool).
@@ -6294,6 +6480,15 @@ async fn node_poll(State(store): State<Store>, UrlPath(id): UrlPath<String>) -> 
     });
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
     loop {
+        // Paused worker: keep the long-poll alive but hand out nothing —
+        // it resumes instantly when unpaused (300ms check cadence).
+        if is_node_paused(&store, &id) {
+            if std::time::Instant::now() >= deadline {
+                return Json(json!({"job": null, "config": cfg})).into_response();
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+            continue;
+        }
         let claimed = store.lock().unwrap_or_else(|p| p.into_inner()).claim_for_node(&id);
         if let Some(job) = claimed {
             let c = store.lock().unwrap_or_else(|p| p.into_inner()).redis();
@@ -7070,6 +7265,11 @@ async fn finish_lib_job(store: &Store, job_id: String, out_name: String, size: u
         }
     }
     if requeue {
+        // Configurable cap (settings tab): a DETERMINISTIC post-encode
+        // failure (e.g. the srcHealth gate on a corrupted source) would
+        // otherwise re-encode the same file forever — the saved decision
+        // replays encode+requeue on every scan.
+        let limit = effective_requeue_limit();
         let mut s = store.lock().unwrap_or_else(|p| p.into_inner());
         // A LATE result can land on an entry the user (or the cap below)
         // already parked — never drag it back into the queue.
@@ -7081,7 +7281,7 @@ async fn finish_lib_job(store: &Store, job_id: String, out_name: String, size: u
         let parked = s
             .library
             .get(&lp)
-            .map(|e| e.requeue_count + 1 >= MAX_REQUEUE_ATTEMPTS)
+            .map(|e| e.requeue_count + 1 >= limit)
             .unwrap_or(false);
         s.update_library_entry(&lp, |e| {
             if e.status != "done" {
@@ -7089,14 +7289,12 @@ async fn finish_lib_job(store: &Store, job_id: String, out_name: String, size: u
                 return;
             }
             e.requeue_count += 1;
-            if e.requeue_count >= MAX_REQUEUE_ATTEMPTS {
-                // Deterministic post-encode failure (e.g. the srcHealth gate
-                // on a corrupted source) — re-queuing would re-encode the
-                // same file forever. Park it as error for review; keep the
-                // latest staged artifact next to the source.
+            if e.requeue_count >= limit {
+                // Park it as error for review; keep the latest staged
+                // artifact next to the source.
                 e.status = "error".into();
                 e.error = Some(format!(
-                    "재큐잉 제한({MAX_REQUEUE_ATTEMPTS}회) — 인코딩 후 헬스 재검사가 계속 실패해 재인코딩이 반복됩니다. 원본 손상 가능성, 파일을 확인하세요. (마지막 산출물: {out_name})"
+                    "재큐잉 제한({limit}회) — 인코딩 후 헬스 재검사가 계속 실패해 재인코딩이 반복됩니다. 원본 손상 가능성, 파일을 확인하세요. (마지막 산출물: {out_name})"
                 ));
                 e.decision = None;
                 e.requeue_count = 0;
@@ -7107,7 +7305,7 @@ async fn finish_lib_job(store: &Store, job_id: String, out_name: String, size: u
             }
         });
         if parked && parkable {
-            eprintln!("[finish] requeue limit reached for {lp} — parked as error (artifact kept: {out_name})");
+            eprintln!("[finish] requeue limit ({limit}) reached for {lp} — parked as error (artifact kept: {out_name})");
         }
     }
     // (lock dropped — persist_catalog re-acquires it)
@@ -7318,6 +7516,8 @@ async fn main() {
             get(folder_blocks_get).post(folder_blocks_post),
         )
         .route("/api/library/requeue", post(library_requeue))
+        .route("/api/library/skip", post(library_skip))
+        .route("/api/queue/pause", get(queue_pause_get).post(queue_pause_all))
         // server-level settings + the fail (quarantine) folder 보관함
         .route("/api/settings", get(settings_get).post(settings_post))
         .route("/api/failures", get(failures_get))
@@ -7337,6 +7537,8 @@ async fn main() {
         .route("/api/nodes/search", post(search_node))
         .route("/api/nodes/register", post(node_register))
         .route("/api/nodes/:id", get(get_node).patch(node_config_patch).delete(delete_node))
+        .route("/api/nodes/:id/pause", post(node_pause))
+        .route("/api/nodes/:id/queued", delete(node_cancel_queued))
         .route("/api/nodes/:id/heartbeat", post(node_heartbeat))
         .route("/api/nodes/:id/poll", get(node_poll))
         .route("/api/nodes/:id/report", post(node_report))

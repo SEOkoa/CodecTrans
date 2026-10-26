@@ -412,6 +412,8 @@ export default function App() {
   // server settings (settings tab) + fail quarantine (보관함 tab)
   const [failDirDraft, setFailDirDraft] = useState(null); // null = not loaded yet
   const [autoScanDraft, setAutoScanDraft] = useState(null); // null = not loaded yet
+  const [requeueDraft, setRequeueDraft] = useState(null); // null = not loaded yet (default 3)
+  const [pauseState, setPauseState] = useState({ all: false, nodeIds: [] }); // queue pause
   const [settingsMsg, setSettingsMsg] = useState("");
   const [lang, setLangState] = useState("ko"); // "ko" | "en" — server setting
   useEffect(() => {
@@ -467,6 +469,7 @@ export default function App() {
     api.settingsGet().then(s => {
       setFailDirDraft(s.failDir ?? "");
       setAutoScanDraft(s.autoScanMinutes ?? 0);
+      setRequeueDraft(s.requeueLimit ?? 3);
       // setLang BEFORE setLangState: the re-render reads the module var,
       // and a bare module mutation (useEffect) would never re-render.
       const l = s.language === "en" ? "en" : "ko";
@@ -487,6 +490,7 @@ export default function App() {
     const t = setInterval(() => {
       api.jobs().then(setJobs).catch(() => {});
       api.nodes().then(setNodes).catch(() => {});
+      api.pauseState().then(setPauseState).catch(() => {});
       api.discoveredNodes().then(setDiscovered).catch(() => {});
       if (tab === "dashboard") api.serverStats().then(setStats).catch(() => {});
       // keep the active job's progress bar live until it's terminal
@@ -874,16 +878,84 @@ export default function App() {
     }
   }
 
+  // ── library manual skip (⏭ button) ────────────────────────
+  async function doSkip(e) {
+    setError("");
+    if (!window.confirm(t("이 파일을 스킵할까요? 인코딩되지 않으며, ⟳ 버튼으로 다시 큐에 넣을 수 있습니다."))) return;
+    try {
+      await api.librarySkip(libKey(e));
+    } catch (err) {
+      setError(err.message);
+    }
+  }
+
+  // ── queue control (pause all / pause worker / cancel worker queue) ──
+  const isNodePaused = n => pauseState.all || pauseState.nodeIds.includes(n.id);
+  async function togglePauseAll() {
+    try {
+      setPauseState(await api.pauseAll(!pauseState.all));
+    } catch (err) {
+      setError(err.message);
+    }
+  }
+  async function toggleNodePause(n) {
+    try {
+      setPauseState(await api.nodePause(n.id, !isNodePaused(n)));
+    } catch (err) {
+      setError(err.message);
+    }
+  }
+  async function cancelNodeQueued(n) {
+    const cnt = jobs.filter(j => j.nodeId === n.id && j.status === "queued").length;
+    if (cnt === 0) return;
+    if (!window.confirm(t("이 노드의 대기 큐 ") + cnt + t("건을 취소할까요?\n다른 노드로 즉시 재배정됩니다 (리큐 제한 적용 안 됨)."))) return;
+    try {
+      const r = await api.nodeQueuedCancel(n.id);
+      setSearchMsg(t("대기 큐 ") + (r.cancelled || 0) + t("건 취소 — 다른 노드로 재배정됨"));
+      setTimeout(() => setSearchMsg(""), 5000);
+    } catch (err) {
+      setSearchMsg(err.message);
+      setTimeout(() => setSearchMsg(""), 5000);
+    }
+  }
+  function saveRequeueLimit() {
+    const v = Math.max(1, Math.min(100, Number(requeueDraft) || 3));
+    api.settingsPost({ requeueLimit: v }).then(r => {
+      setRequeueDraft(r.requeueLimit ?? 3);
+      flashBlock(t("리큐 제한 ") + (r.requeueLimit ?? 3) + t("회 저장됨 ✓"));
+    }).catch(() => {});
+  }
+
   // ── library tab: per-library sheets + sortable table ──────────
   const libName = f => (f.path || "").split("/").filter(Boolean).pop() || f.path;
-  const libEntries = f => library.entries.filter(e => e.folder === f.id);
+  // per-folder entry buckets (one pass over 4k): libEntries()/sheetBase used
+  // to linear-filter the WHOLE catalog per folder / per render (2s ticks).
+  const entriesByFolder = useMemo(() => {
+    const m = new Map();
+    for (const e of library.entries) {
+      const fid = e.folder || "";
+      const arr = m.get(fid);
+      if (arr) arr.push(e);
+      else m.set(fid, [e]);
+    }
+    return m;
+  }, [library]);
+  const libEntries = f => entriesByFolder.get(f.id) || [];
   // Sheet count = ENCODING TARGETS: files that are neither skipped by the
   // logic/folder settings nor non-video (those can never be queued).
   const libEntriesTarget = es => es.filter(e => e.status !== "skipped" && e.status !== "notvideo").length;
   const selFolder = libSel === "all" ? null : folders.find(f => f.id === libSel);
   // Entries of the selected sheet (chip filter NOT applied) — the summary
   // chip counts come from this, so filtering the table doesn't change them.
-  const sheetBase = libSel === "skipped" ? library.entries.filter(e => e.status === "skipped") : libSel === "notvideo" ? library.entries.filter(e => e.status === "notvideo") : libSel === "all" || !selFolder ? library.entries : library.entries.filter(e => e.folder === libSel);
+  // folder id → folder Map (one pass): folderPath() runs PER LIBRARY ROW
+  // PER RENDER (4k rows) — a linear folders.find there is O(rows × folders)
+  // on every 2s tick.
+  const folderById = useMemo(() => {
+    const m = new Map();
+    for (const f of folders) m.set(f.id, f);
+    return m;
+  }, [folders]);
+  const sheetBase = libSel === "skipped" ? library.entries.filter(e => e.status === "skipped") : libSel === "notvideo" ? library.entries.filter(e => e.status === "notvideo") : libSel === "all" || !selFolder ? library.entries : entriesByFolder.get(libSel) || [];
   // Clickable summary-chip filter (state: libFilter).
   const libFilterMatch = e => {
     if (!libFilter) return true;
@@ -915,7 +987,7 @@ export default function App() {
         case "name":
           return e.name || "";
         case "folder":
-          return libSel === "all" ? e.folder ? libName(folders.find(f => f.id === e.folder) || {}) : t("(임시)") : "";
+          return libSel === "all" ? e.folder ? libName(folderById.get(e.folder) || {}) : t("(임시)") : "";
         case "codec":
           return e.videoCodec || "";
         case "size":
@@ -934,7 +1006,7 @@ export default function App() {
       if (typeof va === "number" && typeof vb === "number") return (va - vb) * dir;
       return String(va).localeCompare(String(vb), "ko") * dir;
     });
-  }, [library, folders, libSel, libFilter, libSort]);
+  }, [library, folders, folderById, libSel, libFilter, libSort]);
   const toggleLibSort = key => setLibSort(s => s.key === key ? {
     key,
     dir: -s.dir
@@ -1068,7 +1140,7 @@ export default function App() {
   const removeFolder = id => saveFolders(folders.filter(f => f.id !== id));
   const folderPath = id => {
     if (!id) return t("(\uC784\uC2DC \uB8E8\uD2B8)");
-    const f = folders.find(x => x.id === id);
+    const f = folderById.get(id);
     return f ? f.path : t("\uC81C\uAC70\uB428");
   };
   const shortPath = p => {
@@ -1973,6 +2045,9 @@ export default function App() {
                 {f}
               </option>)}
           </select>
+          <button className={pauseState.all ? "on" : ""} onClick={togglePauseAll} title={pauseState.all ? t("모든 노드의 큐를 재개합니다") : t("모든 노드의 새 잡 배분을 일시중지합니다 (진행 중 잡은 계속)")}>
+            {pauseState.all ? t("▶ 전체 재개") : t("⏸ 전체 일시중지")}
+          </button>
         </div>
 
         {/* server finds a node: enter the IP:port it printed in its terminal */}
@@ -2023,9 +2098,20 @@ export default function App() {
                     {n.enabledBackends.join(" · ")}
                   </span>}
                 {n.allowSoftware === false && <span className="chip c-vp9" title={t("\uC18C\uD504\uD2B8\uC6E8\uC5B4 \uC778\uCF54\uB529 \uD3F4\uBC31 \uBE44\uD65C\uC131 \u2014 \uC774 \uB178\uB4DC\uB294 HW \uC7A1\uB9CC \uBC1B\uC74C")}>{t("HW\uB9CC")}</span>}
-                <button className="gear" title={t("\uB178\uB4DC \uC124\uC815 \u2014 \uC774\uB984 \uB77C \uC6CC\uCEE4 \uC790\uC6D0 \uB77C \uD63D\uC2DC \uC791\uC5C5")} onClick={() => openNodeCfg(n)}>
+                {isNodePaused(n) && <span className="chip c-vp8" title={t("큐 일시중지 중 — 새 잡은 배분되지 않음 (진행 중 잡은 완료)")}>{t("일시중지")}</span>}
+                <button className="gear" title={t("\uB178\uB4DC \uC124\uC815 \u2014 \uC774\uB984 \uB77C \uC6CC\uD050 \uC790\uC6D0 \uB77C \uD63D\uC2DC \uC791\uC5C5")} onClick={() => openNodeCfg(n)}>
                   ⚙
                 </button>
+                <button className={`gear${isNodePaused(n) ? " on" : ""}`} style={isNodePaused(n) ? { color: "#c96" } : undefined} title={isNodePaused(n) ? t("재개 — 이 노드에 새 잡을 다시 배분합니다") : t("일시중지 — 이 노드만 새 잡 배분 중단 (진행 중 잡은 계속)")} onClick={() => toggleNodePause(n)}>
+                  {isNodePaused(n) ? "▶" : "⏸"}
+                </button>
+                {(() => {
+                  const qc = jobs.filter(j => j.nodeId === n.id && j.status === "queued").length;
+                  if (qc === 0) return null;
+                  return <button className="gear" style={{ color: "#c96" }} title={t("이 노드의 대기 큐 ") + qc + t("건 취소 — 다른 노드로 즉시 재배정 (리큐 제한 적용 안 됨)")} onClick={() => cancelNodeQueued(n)}>
+                      ⏹
+                    </button>;
+                })()}
                 {n.status !== "online" && <button className="gear" style={{ color: "#c66" }} title={t("오프라인 노드 삭제 — 레지스트리에서 제거 (진행 중이던 잡은 재큐잉)")} onClick={async () => {
                   if (!window.confirm(t("오프라인 노드 ") + (n.displayName || n.name) + t("를 삭제할까요? 진행 중이던 잡은 다른 노드로 재큐잉됩니다."))) return;
                   try {
@@ -2409,6 +2495,9 @@ export default function App() {
                           <span className={`status ${e.status === "done" ? "done" : e.status === "error" ? "error" : e.status === "failed" ? "failed" : e.status === "queued" ? "running" : e.status === "notvideo" ? "notvideo" : e.status === "skipped" ? "skipped" : ""}`} title={e.status === "done" ? t("\uC6D0\uBCF8: ") + fmtSize(e.size) + " " + [e.videoCodec, e.audioCodec].filter(Boolean).join("/") + t(" \u2192 \uACB0\uACFC: ") + (e.newSize != null ? fmtSize(e.newSize) : "?") + " " + (e.newCodec || "") + " (" + (e.reencoded || "?") + ")" : e.status === "error" || e.status === "failed" || e.status === "skipped" || e.status === "notvideo" ? e.error : undefined}>
                             {e.status === "notvideo" ? t("\uBE44\uC601\uC0C1") : e.status}
                           </span>
+                          {["pending", "queued", "error", "failed"].includes(e.status) && <button className="mini" title={t("스킵 — 인코딩하지 않음 (⟳으로 다시 큐에 넣기)")} onClick={() => doSkip(e)}>
+                              ⏭
+                            </button>}
                           {(e.status === "done" || e.status === "error" || e.status === "skipped") && <button className="mini" title={t("\uC7AC\uC778\uCF54\uB529 \u2014 \uB2E4\uC2DC \uD050\uC5D0 \uB123\uAE30")} onClick={() => doRequeue(e)}>
                               ⟳
                             </button>}
@@ -3129,6 +3218,14 @@ export default function App() {
             setAutoScanDraft(r.autoScanMinutes ?? 0);
             flashBlock(t("\uC790\uB3D9 \uAC10\uC9C0 \uC8FC\uAE30 \uC800\uC7A5\uB428 \u2713"));
           })}>{t("\uC800\uC7A5")}</button>
+            </div>
+          </div>
+          <div className="setblock">
+            <h3>{t("리큐 제한")}</h3>
+            <div className="hint">{t("인코딩 완료 후 출력 파일의 헬스체크(재검증)가 반복해서 실패하면 자동으로 다시 인코딩합니다. 이 횟수까지 재인코딩을 시도하고, 초과하면 파일을")}<b>{t("오류")}</b>{t("상태로 보관합니다. 스캔 또는 ⟳ 버튼으로 다시 큐에 넣을 수 있습니다.")}</div>
+            <div className="search">
+              <input type="number" min="1" max="100" value={requeueDraft ?? 3} onChange={e => setRequeueDraft(e.target.value)} />
+              <button onClick={saveRequeueLimit}>{t("저장")}</button>
             </div>
           </div>
           <div className="setblock">
