@@ -660,8 +660,6 @@ code {
   border: 1px solid var(--border);
   border-radius: 10px;
   overflow-x: auto;
-  max-height: 420px;
-  overflow-y: auto;
 }
 .libhead,
 .librow {
@@ -693,11 +691,56 @@ code {
 /* top-right batch bar (visible when rows exist; buttons enable on selection) */
 .libbatch {
   display: flex;
-  justify-content: flex-end;
   align-items: center;
   gap: 8px;
-  margin: 0 0 8px;
-  min-height: 26px;
+  margin-left: auto;
+  padding: 2px 6px 2px 10px;
+  background: var(--panel2);
+  border: 1px solid var(--border);
+  border-radius: 999px;
+}
+.libbatch .jmeta {
+  font-size: 12px;
+  white-space: nowrap;
+}
+.libbatch button {
+  border: 1px solid var(--border);
+  background: var(--panel);
+  color: var(--foreground);
+  border-radius: 999px;
+  padding: 3px 12px;
+  font-size: 12.5px;
+  cursor: pointer;
+}
+.libbatch button:hover {
+  border-color: var(--accent);
+  color: var(--accent);
+}
+.libbatch .linkish {
+  border: none;
+  background: none;
+  color: var(--muted);
+  padding: 3px 4px;
+}
+.libbatch .linkish:hover {
+  color: var(--foreground);
+}
+.libmore {
+  display: block;
+  width: calc(100% - 24px);
+  margin: 8px 12px 12px;
+  padding: 8px;
+  text-align: center;
+  border: 1px dashed var(--border);
+  background: var(--panel2);
+  color: var(--muted-foreground);
+  border-radius: 8px;
+  font-size: 12.5px;
+  cursor: pointer;
+}
+.libmore:hover {
+  color: var(--foreground);
+  border-color: var(--accent);
 }
 .libhead {
   background: var(--panel);
@@ -2122,8 +2165,19 @@ button:disabled {
 .libth:hover { color: var(--text); }
 
 /* settings tab blocks */
+/* settings: two blocks per row (was one — the tab was a very long column) */
+.setgrid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 0 24px;
+  align-items: start;
+}
+@media (max-width: 760px) {
+  .setgrid { grid-template-columns: 1fr; }
+  .libbatch { margin-left: 0; width: 100%; justify-content: flex-start; }
+}
 .setblock { margin-top: 18px; }
-.setblock:first-of-type { margin-top: 8px; }
+.setgrid > .setblock:first-child { margin-top: 8px; }
 .setblock h3 { margin: 0 0 4px; font-size: 14px; color: var(--text); }
 .setblock .hint { margin: 4px 0 0; }
 

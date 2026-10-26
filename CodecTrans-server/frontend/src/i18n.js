@@ -5,6 +5,11 @@
 // lang === "en", else the original. Unknown keys fall back to Korean.
 export const STR_EN = {
   "새 영상 발견": "New video found",
+  "선택한 파일 일괄 처리 — 체크박스로 고르면 여기에 표시됩니다": "Batch process the selected files — check rows to use this",
+  "렌더링을 위해 일부만 표시 중 — 클릭하면 300행씩 더 보입니다 (모두 선택은 전체 대상)": "Showing a subset for rendering — click to show 300 more rows (select-all covers everything)",
+  "개 더 보기": "more to show",
+  "이 인코딩 취소 — 노드가 10초 안에 ffmpeg를 종료하고, 라이브러리는 대기 상태로 돌아갑니다": "Cancel this encode — the node kills ffmpeg within 10s and the library entry goes back to pending",
+  "ffmpeg 버전 — 노드 로컬": "ffmpeg version — node local",
   "코덱 = ": "Codec = ",
   "코덱 = 어떤 것이든": "Codec = any",
   "크기 > ": "Size > ",

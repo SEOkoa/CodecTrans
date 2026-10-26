@@ -438,11 +438,15 @@ export default function App() {
   const pickLib = sel => {
     setLibSel(sel);
     setLibFilter(null);
+    setLibRowsN(300);
   };
   const [libSort, setLibSort] = useState({
     key: "name",
     dir: 1
   });
+  // row cap — a 4k-entry sheet rendering every row on every 2s poll tick
+  // was the library tab's lag. Render 300 at a time, grow on demand.
+  const [libRowsN, setLibRowsN] = useState(300);
 
   // jobs
   const [jobs, setJobs] = useState([]);
@@ -1040,6 +1044,7 @@ export default function App() {
   // switching sheet/filter deselects (rows are not comparable across them)
   useEffect(() => {
     setLibSelKeys(new Set());
+    setLibRowsN(300);
   }, [libSel, libFilter]);
   const toggleLibSort = key => setLibSort(s => s.key === key ? {
     key,
@@ -2126,16 +2131,13 @@ export default function App() {
                   {n.displayName || n.name}
                 </span>
                 {n.currentJob && <span className="jmeta">busy: {n.currentJob.slice(0, 8)}…</span>}
-                <span className="jmeta">{n.ffmpegVersion.split(" ").slice(0, 3).join(" ")}</span>
-                {n.maxJobs > 1 && <span className="chip c-vp8" title={t("\uB3D9\uC2DC \uC778\uCF54\uB529 \uC218 (\uB178\uB4DC \uC124\uC815)")}>×{n.maxJobs}</span>}
+                {n.maxJobs > 1 && <span className="chip c-vp8" title={t("\uB3D9\uC2DC \uC778\uCF54\uB529 \uC218 (\uB178\uB4DC \uC124\uC815)")} >×{n.maxJobs}</span>}
                 {(n.enabledBackends || []).length > 0 && <span className="chip c-h264" title={t("\uC6CC\uCEE4\uB85C \uD5C8\uC6A9\uB41C \uAC00\uC18D \uBC31\uC5D4\uB4DC (\uCCB4\uD06C \uC548 \uD55C \uBC31\uC5D4\uB4DC\uB294 \uBC30\uC815\uB418\uC9C0 \uC54A\uC74C)")}>
                     {n.enabledBackends.join(" · ")}
                   </span>}
                 {n.allowSoftware === false && <span className="chip c-vp9" title={t("\uC18C\uD504\uD2B8\uC6E8\uC5B4 \uC778\uCF54\uB529 \uD3F4\uBC31 \uBE44\uD65C\uC131 \u2014 \uC774 \uB178\uB4DC\uB294 HW \uC7A1\uB9CC \uBC1B\uC74C")}>{t("HW\uB9CC")}</span>}
                 {isNodePaused(n) && <span className="chip c-vp8" title={t("큐 일시중지 중 — 새 잡은 배분되지 않음 (진행 중 잡은 완료)")}>{t("일시중지")}</span>}
-                <button className="gear" title={t("\uB178\uB4DC \uC124\uC815 \u2014 \uC774\uB984 \uB77C \uC6CC\uD050 \uC790\uC6D0 \uB77C \uD63D\uC2DC \uC791\uC5C5")} onClick={() => openNodeCfg(n)}>
-                  ⚙
-                </button>
+                <span className="jmeta" title={t("ffmpeg 버전 — 노드 로컬")}>{n.ffmpegVersion.split(" ").slice(0, 3).join(" ")}</span>
                 <button className={`gear${isNodePaused(n) ? " on" : ""}`} style={isNodePaused(n) ? { color: "#c96" } : undefined} title={isNodePaused(n) ? t("재개 — 이 노드에 새 잡을 다시 배분합니다") : t("일시중지 — 이 노드만 새 잡 배분 중단 (진행 중 잡은 계속)")} onClick={() => toggleNodePause(n)}>
                   {isNodePaused(n) ? "▶" : "⏸"}
                 </button>
@@ -2160,6 +2162,9 @@ export default function App() {
                 }}>
                   🗑
                 </button>}
+                <button className="gear" title={t("노드 설정 — 이름 및 워크 자원 및 일시 작업")} onClick={() => openNodeCfg(n)}>
+                  ⚙
+                </button>
               </div>
               {(() => {
               const live = jobs.filter(j => j.nodeId === n.id && (j.status === "running" || j.status === "dispatched"));
@@ -2181,12 +2186,21 @@ export default function App() {
                             </span>
                             <span className="prog-pct">{pct}%</span>
                           </div>
-                          <div className="bar" style={{
-                      height: 5
+                          <div className="row" style={{
+                      gap: 6,
+                      alignItems: "center"
                     }}>
-                            <div className="fill" style={{
-                        width: pct + "%"
-                      }} />
+                            <div className="bar" style={{
+                        height: 5,
+                        flex: 1
+                      }}>
+                                <div className="fill" style={{
+                            width: pct + "%"
+                          }} />
+                            </div>
+                            <button className="mini" title={t("이 인코딩 취소 — 노드가 10초 안에 ffmpeg를 종료하고, 라이브러리는 대기 상태로 돌아갑니다")} onClick={() => api.jobCancel(j.id).catch(() => {})}>
+                              ✕
+                            </button>
                           </div>
                         </div>;
                 })}
@@ -2454,16 +2468,16 @@ export default function App() {
                       {saved > 0 && <span className="ls-item save" title={shrunk.length + t("\uAC1C \uD30C\uC77C \uC6D0\uBCF8 \uB300\uBE44 \uC6A9\uB7C9 \uAC10\uC18C\uBD84")}>
                           💾 <b>{fmtSize(saved)}</b>{t("\uC808\uC57D")}</span>}
                       {libFilter && <span className="ls-item filterhint">{t("\uD544\uD130 \uC911 \u2014 \uB2E4\uC2DC \uD074\uB9AD\uD558\uBA74 \uD574\uC81C")}</span>}
+                      {libSelKeys.size > 0 && <div className="libbatch" title={t("\uC120\uD0DD\uD55C \uD30C\uC77C \uC77C\uBC31 \uCC98\uB9AC \u2014 \uCCB4\uD06C\uBC84\uC2A4\uB85C \uACE0\uB974\uB2E4 \uD639\uC5B4\uB9AC \uC774\uC5EC\uB124 \uD45C\uC2DC")}>
+                          <span className="jmeta">{t("\uC120\uD0DD: ") + libSelKeys.size + t("\uAC74")}</span>
+                          <button onClick={() => batchLib("requeue")}>{t("\uC7AC\uC778\uCF54\uB529")}</button>
+                          <button onClick={() => batchLib("skip")}>{t("\uC2A4\uD0A4\uD504")}</button>
+                          <button className="linkish" onClick={() => setLibSelKeys(new Set())}>{t("\uC120\uD0DD \uD574\uC81C")}</button>
+                        </div>}
                     </>;
           })()}
               </div>}
             {visibleEntries.length > 0 ? <div className="libtable">
-                <div className="libbatch">
-                  {libSelKeys.size > 0 && <span className="jmeta">{t("선택: ") + libSelKeys.size + t("건")}</span>}
-                  <button disabled={libSelKeys.size === 0} onClick={() => batchLib("requeue")}>{t("재인코딩")}</button>
-                  <button disabled={libSelKeys.size === 0} onClick={() => batchLib("skip")}>{t("스킵")}</button>
-                  {libSelKeys.size > 0 && <button className="linkish" onClick={() => setLibSelKeys(new Set())}>{t("선택 해제")}</button>}
-                </div>
                 <div className="libhead row">
                   <span className="libcheck" title={t("모두 선택")}><input type="checkbox" checked={allSel} ref={el => {
             if (el) el.indeterminate = someSel;
@@ -2493,7 +2507,7 @@ export default function App() {
                     Status
                   </Th>
                 </div>
-                {visibleEntries.map((e, i) => <div key={visKeys[i]} className="librow row">
+                {visibleEntries.slice(0, libRowsN).map((e, i) => <div key={visKeys[i]} className="librow row">
                     <span className="libcheck"><input type="checkbox" checked={libSelKeys.has(visKeys[i])} onChange={ev => toggleLibKey(visKeys[i], ev.target.checked)} /></span>
                     <span className="c-name" title={e.path}>
                       <span className="jname">{e.name}</span>
@@ -2556,6 +2570,9 @@ export default function App() {
                         </div>}
                     </span>
                   </div>)}
+                {visibleEntries.length > libRowsN && <button className="libmore" onClick={() => setLibRowsN(n => n + 300)} title={t("렌더링을 위해 일부만 표시 중 — 클릭하면 300행씩 더 보입니다 (모두 선택은 전체 대상)")}>
+                    … {visibleEntries.length - libRowsN} {t("개 더 보기")} ({libRowsN}/{visibleEntries.length})
+                </button>}
               </div> : <div className="empty">
                 {libFilter ? t("\uD604\uC7AC \uD544\uD130\uC5D0 \uD574\uB2F9\uD558\uB294 \uD30C\uC77C\uC774 \uC5C6\uC2B5\uB2C8\uB2E4 \u2014 \uCE69\uC744 \uB2E4\uC2DC \uD074\uB9AD\uD574 \uD574\uC81C\uD558\uC138\uC694.") : folders.some(f => f.enabled) ? t("\uC120\uD0DD\uD55C \uC2DC\uD2B8\uC5D0 \uC601\uC0C1\uC774 \uC5C6\uAC70\uB098 \uC544\uC9C1 \uC2A4\uCE94\uD558\uC9C0 \uC54A\uC558\uC2B5\uB2C8\uB2E4.") : t("\uD65C\uC131\uD654\uB41C \uD3F4\uB354\uAC00 \uC5C6\uC2B5\uB2C8\uB2E4 \u2014 \uC544\uB798 \uD3F4\uB354 \uAD00\uB9AC\uC5D0\uC11C \uCD94\uAC00\uD558\uACE0 [\uD65C\uC131\uD654]\uD558\uC138\uC694.")}
               </div>}
@@ -3231,6 +3248,7 @@ export default function App() {
       {/* ═══ 세팅 — server settings + fail (quarantine) folder ═══ */}
       {tab === "settings" && <section className="card settings">
           <h2>{t("\uC138\uD305")}</h2>
+          <div className="setgrid">
           <div className="setblock">
             <h3>{t("\uC2E4\uD328 \uCC98\uB9AC")}</h3>
             <div className="hint">
@@ -3314,6 +3332,7 @@ export default function App() {
                 </div>
               </div>
             </div>
+          </div>
           </div>
         </section>}
 

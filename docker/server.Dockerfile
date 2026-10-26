@@ -50,7 +50,7 @@ RUN set -x; \
     done
 FROM ubuntu:24.04
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends ffmpeg ca-certificates \
+    && apt-get install -y --no-install-recommends ffmpeg ca-certificates curl \
     && rm -rf /var/lib/apt/lists/*
 # Bundled driver userland for the GPU health decode (see stage above).
 COPY --from=nvidia-userland /opt/nvidia-userland /opt/nvidia-userland

@@ -2522,13 +2522,24 @@ async fn decode_window_ok(path: &str, seek: f64, len: f64, timeout_s: u64, full_
 /// itself is fine. Treating that as corruption false-quarantined healthy
 /// 4K/10-bit HEVC sources.
 fn decode_stderr_real(err: &str, exit_ok: bool) -> (bool, String) {
+    // Benign h264 decoder messages that do NOT indicate real corruption.
+    // They appear on valid captures/streaming files around random-access
+    // points, edits and stream discontinuities — ffmpeg still exits 0 and
+    // the content plays fine. Treating them as failures quarantined good
+    // files (observed: whole "정태현 덤벼" set, exit=0).
+    let is_benign = |l: &str| {
+        l.contains("non monotonically increasing dts")
+            || l.contains("monotonically increasing dts")
+            || l.contains("Application provided invalid")
+            || l.contains("co located POCs unavailable")
+            || l.contains("mmco: unref short failure")
+            || l.contains("mmco: unref long failure")
+            || l.contains("estimating timebase from")
+            || l.contains("dts is unset in packet")
+    };
     let filtered: String = err
         .lines()
-        .filter(|l| {
-            !l.contains("non monotonically increasing dts")
-                && !l.contains("Application provided invalid")
-                && !l.contains("monotonically increasing dts")
-        })
+        .filter(|l| !is_benign(l))
         .collect::<Vec<_>>()
         .join("\n");
     (exit_ok && filtered.trim().is_empty(), filtered)
@@ -3346,6 +3357,11 @@ async fn settings_post(State(_store): State<Store>, Json(b): Json<SettingsBody>)
     if let Some(m) = b.auto_scan_minutes {
         c.auto_scan_minutes = m.min(1440);
     }
+    // Bug D fix: the field was received but never applied — the setting
+    // always fell back to DEFAULT_REQUEUE_LIMIT (3). 0 = reset to default.
+    if let Some(r) = b.requeue_limit {
+        c.requeue_limit = if r == 0 { None } else { Some(r.min(100)) };
+    }
     match b.language {
         Some(None) => c.language = None,
         Some(Some(l)) => c.language = Some(if l == "en" { "en" } else { "ko" }.to_string()),
@@ -3475,8 +3491,16 @@ fn confined_fail_file(rel: &str) -> Option<(PathBuf, PathBuf)> {
 async fn failures_get(State(_store): State<Store>) -> impl IntoResponse {
     let cfg = load_lib_cfg();
     let base = cfg.fail_dir.clone().filter(|p| !p.trim().is_empty());
-    let mut items: Vec<FailItem> = Vec::new();
-    fn walk(dir: &std::path::Path, rel: &std::path::Path, items: &mut Vec<FailItem>) {
+    // The walk runs on a blocking thread: the fail dir lives on a NAS share
+    // and under a disk stall the sync read_dir pinned tokio worker threads —
+    // with a 4-CPU cgroup, a few such requests wedged the whole HTTP server
+    // (observed 2026-10-26: all 4 workers parked, listener silent).
+    let mut items: Vec<FailItem> = match &base {
+        Some(b) => {
+            let root = PathBuf::from(b.clone());
+            let items = tokio::task::spawn_blocking(move || {
+                let mut items: Vec<FailItem> = Vec::new();
+                fn walk(dir: &std::path::Path, rel: &std::path::Path, items: &mut Vec<FailItem>) {
         let rd = match std::fs::read_dir(dir) {
             Ok(r) => r,
             Err(_) => return,
@@ -3527,12 +3551,17 @@ async fn failures_get(State(_store): State<Store>) -> impl IntoResponse {
             }
         }
     }
-    if let Some(b) = &base {
-        let root = PathBuf::from(b);
-        if root.is_dir() {
-            walk(&root, std::path::Path::new(""), &mut items);
+                if root.is_dir() {
+                    walk(&root, std::path::Path::new(""), &mut items);
+                }
+                items
+            })
+            .await
+            .unwrap_or_default();
+            items
         }
-    }
+        None => Vec::new(),
+    };
     items.sort_by(|a, b| a.path.cmp(&b.path));
     Json(json!({ "failDir": base, "items": items }))
 }
@@ -6065,24 +6094,43 @@ async fn get_job(State(store): State<Store>, UrlPath(id): UrlPath<String>) -> Re
 /// cancelled immediately; the executing node picks the flag on its next
 /// progress report (≤10s heartbeat) and kills ffmpeg.
 async fn cancel_job(State(store): State<Store>, UrlPath(id): UrlPath<String>) -> Response {
-    let (st, node_id) = {
+    let (st, node_id, lib_path) = {
         let s = store.lock().unwrap_or_else(|p| p.into_inner());
         let j = s.jobs.get(&id);
         (
             j.map(|j| j.status.clone()),
             j.map(|j| j.executed_by.clone()),
+            j.and_then(|j| j.lib_path.clone()),
         )
     };
     match st {
         None => (StatusCode::NOT_FOUND, Json(json!({"error": "job not found"}))).into_response(),
         Some(s) if s == "queued" => {
-            store.lock().unwrap_or_else(|p| p.into_inner()).remove(&id);
+            // Re-arm the entry NOW: a removed queued job used to leave the
+            // library row stuck on "queued" until the next scan (the user's
+            // "큐 취소했는데 라이브러리에 반영 안됨").
+            {
+                let mut s = store.lock().unwrap_or_else(|p| p.into_inner());
+                if let Some(lp) = &lib_path {
+                    s.update_library_entry(lp, |e| {
+                        if e.status == "queued" || e.status == "dispatched" {
+                            e.status = "pending".into();
+                        }
+                    });
+                }
+                s.remove(&id);
+            }
+            if lib_path.is_some() {
+                persist_catalog(&store);
+            }
             Json(json!({"ok": true, "cancelled": id})).into_response()
         }
         Some(s) if s == "dispatched" || s == "running" => {
             // Mark cancelled NOW; the node picks the flag on its next
-            // progress report (≤10s heartbeat) and kills ffmpeg. The entry
-            // is re-armed to pending when the node confirms the stop.
+            // progress report (≤10s heartbeat) and kills ffmpeg. Re-arm the
+            // entry to pending immediately — the node's final error report
+            // keeps the job "cancelled" (kill confirmation) and
+            // sweep_redispatch refills the freed slot from pending.
             {
                 let mut s = store.lock().unwrap_or_else(|p| p.into_inner());
                 if let Some(j) = s.jobs.get_mut(&id) {
@@ -6090,6 +6138,17 @@ async fn cancel_job(State(store): State<Store>, UrlPath(id): UrlPath<String>) ->
                     j.error = Some("사용자 취소 — 중지됨".into());
                     j.finished_at = Some(now_ms());
                 }
+                if let Some(lp) = &lib_path {
+                    s.update_library_entry(lp, |e| {
+                        if matches!(e.status.as_str(), "queued" | "running" | "dispatched") {
+                            e.status = "pending".into();
+                            e.error = None;
+                        }
+                    });
+                }
+            }
+            if lib_path.is_some() {
+                persist_catalog(&store);
             }
             if let Some(nid) = node_id {
                 let c = store.lock().unwrap_or_else(|p| p.into_inner()).redis();
