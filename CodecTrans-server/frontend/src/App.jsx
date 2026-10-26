@@ -55,6 +55,22 @@ function fmtFps(f) {
   return String(r);
 }
 
+// Page number list for a pager: always show first/last, the current page
+// and its neighbors, ellipses for gaps. e.g. 1 … 4 5 6 … 137
+function pageList(cur, total) {
+  if (total <= 7) return Array.from({ length: total }, (_, i) => i);
+  const keep = new Set([0, 1, total - 2, total - 1, cur - 1, cur, cur + 1]);
+  const ids = [...keep].filter(i => i >= 0 && i < total).sort((a, b) => a - b);
+  const out = [];
+  let prev = -1;
+  for (const p of ids) {
+    if (prev >= 0 && p - prev > 1) out.push("…");
+    out.push(p);
+    prev = p;
+  }
+  return out;
+}
+
 // Legacy ordered block list → node graph (same meaning): start → c1 →(✓) a1,
 // c1(✗) → c2 →(✓) a2, … so old settings keep working on the canvas.
 function migrateBlocksToGraph(blocks) {
@@ -444,9 +460,10 @@ export default function App() {
     key: "name",
     dir: 1
   });
-  // row cap — a 4k-entry sheet rendering every row on every 2s poll tick
-  // was the library tab's lag. Render 300 at a time, grow on demand.
-  const [libRowsN, setLibRowsN] = useState(300);
+  // pagination — a 4k-entry sheet rendering every row on every 2s poll tick
+  // was the library tab's lag. Page it: 10/30/50 rows per page, user picks.
+  const [libPage, setLibPage] = useState(0);
+  const [libPageSize, setLibPageSize] = useState(30);
 
   // jobs
   const [jobs, setJobs] = useState([]);
@@ -1041,10 +1058,16 @@ export default function App() {
   const visKeys = useMemo(() => visibleEntries.map(e => (e.folder ? e.folder + "/" : "") + e.path), [visibleEntries]);
   const allSel = visKeys.length > 0 && visKeys.every(k => libSelKeys.has(k));
   const someSel = !allSel && visKeys.some(k => libSelKeys.has(k));
-  // switching sheet/filter deselects (rows are not comparable across them)
+  // pagination window over visibleEntries
+  const pageCount = Math.max(1, Math.ceil(visibleEntries.length / libPageSize));
+  const page = Math.min(libPage, pageCount - 1);
+  const pageRows = visibleEntries.slice(page * libPageSize, (page + 1) * libPageSize);
+  const pageKeys = pageRows.map(e => (e.folder ? e.folder + "/" : "") + e.path);
+  // switching sheet/filter deselects + back to first page (rows are not
+  // comparable across them)
   useEffect(() => {
     setLibSelKeys(new Set());
-    setLibRowsN(300);
+    setLibPage(0);
   }, [libSel, libFilter]);
   const toggleLibSort = key => setLibSort(s => s.key === key ? {
     key,
@@ -2313,8 +2336,43 @@ export default function App() {
         </div>}
         </>}
 
+
       {/* ═══ 라이브러리 — per-library sheets + integrated layout ═══ */}
       {tab === "library" && <>
+          <section className="card auto">
+            <h2>{t("\uD3F4\uB354 \uAD00\uB9AC")}</h2>
+            <div className="hint">{t("\uAC10\uC2DC\uD560 \uD3F4\uB354(\uB77C\uC774\uBE0C\uB7EC\uB9AC)\uB97C \uCD94\uAC00/\uC81C\uAC70\uD569\uB2C8\uB2E4. \uC0C8 \uD3F4\uB354\uB294")}<b>{t("\uBE44\uD65C\uC131 \uC0C1\uD0DC\uB85C \uCD94\uAC00")}</b>{t("\uB429\uB2C8\uB2E4 \u2014 \uB85C\uC9C1/\uC778\uCF54\uB529 \uC124\uC815(\uC544\uB798 \uB77C\uC774\uBE0C\uB7EC\uB9AC \uC2DC\uD2B8)\uC744 \uB9C8\uCE58\uACE0")}<b>{t("[\uD65C\uC131\uD654]")}</b>{t("\uB97C \uB20C\uB7EC\uC57C \uD050\uC789\uC774 \uC2DC\uC791\uB429\uB2C8\uB2E4.")}</div>
+            <div className="search">
+              <input value={newFolder} onChange={e => setNewFolder(e.target.value)} onKeyDown={e => e.key === "Enter" && addFolder()} placeholder={t("\uD3F4\uB354 \uACBD\uB85C (\uC608: /mnt/nas/Videos)")} />
+              <button onClick={addFolder} disabled={!newFolder.trim()}>{t("\uCD94\uAC00")}</button>
+              <button onClick={openTree} title={t("\uD30C\uC77C\uC2DC\uC2A4\uD15C \uD2B8\uB9AC\uB85C \uD3F4\uB354 \uCC3E\uAE30")}>{t("\uD83D\uDD0D \uD3F4\uB354 \uCC3E\uC544\uBCF4\uAE30")}</button>
+            </div>
+            {folders.length === 0 && <div className="empty">{t("\uB4F1\uB85D\uB41C \uD3F4\uB354\uAC00 \uC5C6\uC2B5\uB2C8\uB2E4. \uC704 \uC785\uB825\uCC3D\uC5D0 \uD3F4\uB354 \uACBD\uB85C\uB97C \uB123\uACE0 \uCD94\uAC00\uD558\uC138\uC694.")}</div>}
+            {folders.map(f => <div key={f.id} className={"folder" + (f.enabled ? "" : " off")}>
+                <div className="row">
+                  <button className={`enablebtn mini${f.enabled ? " on" : ""}`} onClick={() => patchFolder(f.id, x => ({
+              ...x,
+              enabled: !x.enabled
+            }))} title={f.enabled ? t("\uBE44\uD65C\uC131\uD654 \u2014 \uD050\uC789 \uC911\uC9C0") : t("\uD65C\uC131\uD654 \u2014 \uC2A4\uCE94 \uC2DC \uC790\uB3D9 \uD050\uC789")}>
+                    {f.enabled ? t("\u23F8 \uBE44\uD65C\uC131\uD654") : t("\u25B6 \uD65C\uC131\uD654")}
+                  </button>
+                  <code className="fpath" title={f.path}>
+                    {f.path}
+                  </code>
+                  {f.logicId && <span className="logic-badge" title={t("\uB85C\uC9C1 \uC801\uC6A9 \uC911")}>
+                      {logics.find(l => l.id === f.logicId)?.name || t("\uB85C\uC9C1")}
+                    </span>}
+                  <button className="mini" title={f.enabled ? t("\uC774 \uD3F4\uB354\uB9CC \uC2A4\uCE94 \u2014 \uC0C8 \uC601\uC0C1\uC740 \uB85C\uC9C1/\uC778\uCF54\uB529 \uC124\uC815\uB300\uB85C \uD050\uC789") : t("\uC774 \uD3F4\uB354\uB9CC \uC2A4\uCE94 \u2014 \uBE44\uD65C\uC131 \uD3F4\uB354\uB77C \uBAA9\uB85D\uC5D0\uB9CC \uB4E4\uC5B4\uAC00\uACE0 \uD050\uC5D0\uB294 \uC548 \uB4E4\uC5B4\uAC10")} disabled={scanning} onClick={() => doScan(f.id)}>
+                    {scanning && scanFolder === f.id ? t("\uC2A4\uCE94 \uC911\u2026") : t("\uC2A4\uCE94")}
+                  </button>
+                  <button className="rm-del" title={t("\uD3F4\uB354 \uC81C\uAC70")} onClick={() => removeFolder(f.id)}>
+                    ✕
+                  </button>
+                </div>
+              </div>)}
+            {folderMsg && <div className="meta ok-text">{folderMsg}</div>}
+          </section>
+
           <section className="card lib2">
             <h2>Library</h2>
             <div className="hint">{t("\uB4F1\uB85D\uB41C \uD3F4\uB354 \uC804\uCCB4\uB97C")}<b>read-only</b>{t("\uB85C \uC2A4\uCE94\uD569\uB2C8\uB2E4 \u2014 \uD30C\uC77C\uC740 \uC808\uB300 \uAC74\uB4DC\uB9AC\uC9C0 \uC54A\uC2B5\uB2C8\uB2E4.")}<b>{t("\uBE44\uD65C\uC131 \uD3F4\uB354")}</b>{t("\uC758 \uC601\uC0C1\uC740 \uBAA9\uB85D\uC5D0 \uD45C\uC2DC\uB418\uC9C0\uB9CC \uC790\uB3D9 \uD050\uC5D0 \uB4E4\uC5B4\uAC00\uC9C0 \uC54A\uC2B5\uB2C8\uB2E4. \uC544\uB798")}<b>{t("\uC2DC\uD2B8")}</b>{t("\uC5D0\uC11C \uB77C\uC774\uBE0C\uB7EC\uB9AC\uBCC4\uB85C \uB300\uC0C1 \uC601\uC0C1\uC744 \uD655\uC778\uD558\uACE0, \uAC01 \uB77C\uC774\uBE0C\uB7EC\uB9AC\uC758 \uCC98\uB9AC \uBC29\uC2DD\uC744 \uBC14\uB85C \uC870\uC815\uD558\uC138\uC694.")}</div>
@@ -2507,8 +2565,8 @@ export default function App() {
                     Status
                   </Th>
                 </div>
-                {visibleEntries.slice(0, libRowsN).map((e, i) => <div key={visKeys[i]} className="librow row">
-                    <span className="libcheck"><input type="checkbox" checked={libSelKeys.has(visKeys[i])} onChange={ev => toggleLibKey(visKeys[i], ev.target.checked)} /></span>
+                {pageRows.map((e, i) => <div key={pageKeys[i]} className="librow row">
+                    <span className="libcheck"><input type="checkbox" checked={libSelKeys.has(pageKeys[i])} onChange={ev => toggleLibKey(pageKeys[i], ev.target.checked)} /></span>
                     <span className="c-name" title={e.path}>
                       <span className="jname">{e.name}</span>
                       {e.status === "done" && e.reencoded && <span className="jout">→ {e.reencoded}</span>}
@@ -2570,47 +2628,23 @@ export default function App() {
                         </div>}
                     </span>
                   </div>)}
-                {visibleEntries.length > libRowsN && <button className="libmore" onClick={() => setLibRowsN(n => n + 300)} title={t("렌더링을 위해 일부만 표시 중 — 클릭하면 300행씩 더 보입니다 (모두 선택은 전체 대상)")}>
-                    … {visibleEntries.length - libRowsN} {t("개 더 보기")} ({libRowsN}/{visibleEntries.length})
-                </button>}
+                {pageCount > 1 && <div className="libpager">
+                    <span className="pg-size" title={t("페이지당 보기 개수")}>
+                      {[10, 30, 50].map(n => <button key={n} type="button" className={`pg-opt${libPageSize === n ? " on" : ""}`} onClick={() => {
+            setLibPageSize(n);
+            setLibPage(0);
+          }}>{n}</button>)}
+                    </span>
+                    <button type="button" className="pg-nav" disabled={page === 0} onClick={() => setLibPage(page - 1)}>‹</button>
+                    {pageList(page, pageCount).map((p, i) => p === "…" ? <span key={"el" + i} className="pg-ell">…</span> : <button key={p} type="button" className={`pg-num${p === page ? " on" : ""}`} onClick={() => setLibPage(p)}>{p + 1}</button>)}
+                    <button type="button" className="pg-nav" disabled={page >= pageCount - 1} onClick={() => setLibPage(page + 1)}>›</button>
+                    <span className="pg-info">{t("페이지")} {page + 1}/{pageCount} · {visibleEntries.length}{t("개")}</span>
+                  </div>}
               </div> : <div className="empty">
                 {libFilter ? t("\uD604\uC7AC \uD544\uD130\uC5D0 \uD574\uB2F9\uD558\uB294 \uD30C\uC77C\uC774 \uC5C6\uC2B5\uB2C8\uB2E4 \u2014 \uCE69\uC744 \uB2E4\uC2DC \uD074\uB9AD\uD574 \uD574\uC81C\uD558\uC138\uC694.") : folders.some(f => f.enabled) ? t("\uC120\uD0DD\uD55C \uC2DC\uD2B8\uC5D0 \uC601\uC0C1\uC774 \uC5C6\uAC70\uB098 \uC544\uC9C1 \uC2A4\uCE94\uD558\uC9C0 \uC54A\uC558\uC2B5\uB2C8\uB2E4.") : t("\uD65C\uC131\uD654\uB41C \uD3F4\uB354\uAC00 \uC5C6\uC2B5\uB2C8\uB2E4 \u2014 \uC544\uB798 \uD3F4\uB354 \uAD00\uB9AC\uC5D0\uC11C \uCD94\uAC00\uD558\uACE0 [\uD65C\uC131\uD654]\uD558\uC138\uC694.")}
               </div>}
           </section>
 
-          <section className="card auto">
-            <h2>{t("\uD3F4\uB354 \uAD00\uB9AC")}</h2>
-            <div className="hint">{t("\uAC10\uC2DC\uD560 \uD3F4\uB354(\uB77C\uC774\uBE0C\uB7EC\uB9AC)\uB97C \uCD94\uAC00/\uC81C\uAC70\uD569\uB2C8\uB2E4. \uC0C8 \uD3F4\uB354\uB294")}<b>{t("\uBE44\uD65C\uC131 \uC0C1\uD0DC\uB85C \uCD94\uAC00")}</b>{t("\uB429\uB2C8\uB2E4 \u2014 \uB85C\uC9C1/\uC778\uCF54\uB529 \uC124\uC815(\uC704 \uC2DC\uD2B8\uC5D0\uC11C)\uC744 \uB9C8\uCE58\uACE0")}<b>{t("[\uD65C\uC131\uD654]")}</b>{t("\uB97C \uB20C\uB7EC\uC57C \uD050\uC789\uC774 \uC2DC\uC791\uB429\uB2C8\uB2E4.")}</div>
-            <div className="search">
-              <input value={newFolder} onChange={e => setNewFolder(e.target.value)} onKeyDown={e => e.key === "Enter" && addFolder()} placeholder={t("\uD3F4\uB354 \uACBD\uB85C (\uC608: /mnt/nas/Videos)")} />
-              <button onClick={addFolder} disabled={!newFolder.trim()}>{t("\uCD94\uAC00")}</button>
-              <button onClick={openTree} title={t("\uD30C\uC77C\uC2DC\uC2A4\uD15C \uD2B8\uB9AC\uB85C \uD3F4\uB354 \uCC3E\uAE30")}>{t("\uD83D\uDD0D \uD3F4\uB354 \uCC3E\uC544\uBCF4\uAE30")}</button>
-            </div>
-            {folders.length === 0 && <div className="empty">{t("\uB4F1\uB85D\uB41C \uD3F4\uB354\uAC00 \uC5C6\uC2B5\uB2C8\uB2E4. \uC704 \uC785\uB825\uCC3D\uC5D0 \uD3F4\uB354 \uACBD\uB85C\uB97C \uB123\uACE0 \uCD94\uAC00\uD558\uC138\uC694.")}</div>}
-            {folders.map(f => <div key={f.id} className={"folder" + (f.enabled ? "" : " off")}>
-                <div className="row">
-                  <button className={`enablebtn mini${f.enabled ? " on" : ""}`} onClick={() => patchFolder(f.id, x => ({
-              ...x,
-              enabled: !x.enabled
-            }))} title={f.enabled ? t("\uBE44\uD65C\uC131\uD654 \u2014 \uD050\uC789 \uC911\uC9C0") : t("\uD65C\uC131\uD654 \u2014 \uC2A4\uCE94 \uC2DC \uC790\uB3D9 \uD050\uC789")}>
-                    {f.enabled ? t("\u23F8 \uBE44\uD65C\uC131\uD654") : t("\u25B6 \uD65C\uC131\uD654")}
-                  </button>
-                  <code className="fpath" title={f.path}>
-                    {f.path}
-                  </code>
-                  {f.logicId && <span className="logic-badge" title={t("\uB85C\uC9C1 \uC801\uC6A9 \uC911")}>
-                      {logics.find(l => l.id === f.logicId)?.name || t("\uB85C\uC9C1")}
-                    </span>}
-                  <button className="mini" title={f.enabled ? t("\uC774 \uD3F4\uB354\uB9CC \uC2A4\uCE94 \u2014 \uC0C8 \uC601\uC0C1\uC740 \uB85C\uC9C1/\uC778\uCF54\uB529 \uC124\uC815\uB300\uB85C \uD050\uC789") : t("\uC774 \uD3F4\uB354\uB9CC \uC2A4\uCE94 \u2014 \uBE44\uD65C\uC131 \uD3F4\uB354\uB77C \uBAA9\uB85D\uC5D0\uB9CC \uB4E4\uC5B4\uAC00\uACE0 \uD050\uC5D0\uB294 \uC548 \uB4E4\uC5B4\uAC10")} disabled={scanning} onClick={() => doScan(f.id)}>
-                    {scanning && scanFolder === f.id ? t("\uC2A4\uCE94 \uC911\u2026") : t("\uC2A4\uCE94")}
-                  </button>
-                  <button className="rm-del" title={t("\uD3F4\uB354 \uC81C\uAC70")} onClick={() => removeFolder(f.id)}>
-                    ✕
-                  </button>
-                </div>
-              </div>)}
-            {folderMsg && <div className="meta ok-text">{folderMsg}</div>}
-          </section>
         </>}
 
                   {/* ═══ 로직 — ComfyUI-style node graph automation ═══ */}

@@ -725,22 +725,65 @@ code {
 .libbatch .linkish:hover {
   color: var(--foreground);
 }
-.libmore {
-  display: block;
-  width: calc(100% - 24px);
-  margin: 8px 12px 12px;
-  padding: 8px;
-  text-align: center;
-  border: 1px dashed var(--border);
+.libpager {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+  margin: 10px 12px 12px;
+}
+.pg-size {
+  display: inline-flex;
+  gap: 4px;
+  margin-right: 6px;
+}
+.pg-opt,
+.pg-num,
+.pg-nav {
+  min-width: 28px;
+  padding: 4px 8px;
+  border: 1px solid var(--border);
   background: var(--panel2);
   color: var(--muted-foreground);
-  border-radius: 8px;
-  font-size: 12.5px;
+  border-radius: 6px;
+  font-size: 12px;
   cursor: pointer;
+  font-family: inherit;
 }
-.libmore:hover {
+.pg-opt:hover,
+.pg-num:hover,
+.pg-nav:hover:not(:disabled) {
   color: var(--foreground);
   border-color: var(--accent);
+}
+.pg-opt.on,
+.pg-num.on {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: #fff;
+  font-weight: 600;
+}
+.pg-nav:disabled {
+  opacity: .4;
+  cursor: default;
+}
+.pg-ell {
+  color: var(--muted-foreground);
+  padding: 0 2px;
+  user-select: none;
+}
+.pg-info {
+  margin-left: auto;
+  font-size: 12px;
+  color: var(--muted-foreground);
+  white-space: nowrap;
+}
+@media (max-width: 720px) {
+  .pg-info {
+    margin-left: 0;
+    flex-basis: 100%;
+    text-align: center;
+  }
 }
 .libhead {
   background: var(--panel);
