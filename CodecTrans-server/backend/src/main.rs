@@ -2771,6 +2771,33 @@ static BOOT_TS: std::sync::LazyLock<std::time::Instant> =
     std::sync::LazyLock::new(std::time::Instant::now);
 const BOOT_SCAN_GRACE_S: u64 = 120;
 
+/// The runtime handle, captured at startup so the wedge-watch std thread
+/// can inject a task into a wedged runtime. tokio #8342: a host-side
+/// freeze/thaw (a QNAP ZFS ARC stall freezes every container thread in
+/// the kernel at once) can land in the multi_thread scheduler's
+/// park/driver-handoff window, leaving the IO/timer driver UNOWNED —
+/// every worker parked, no timers, no I/O, accept loop dead, no panic.
+/// A remote wake (an external thread injecting a task and unparking a
+/// worker) was observed to re-run the park protocol and re-elect a
+/// driver owner, reviving the runtime without a restart. This is that
+/// remote wake, on demand.
+static RUNTIME_HANDLE: std::sync::LazyLock<std::sync::Mutex<Option<tokio::runtime::Handle>>> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(None));
+
+/// Inject a no-op task into the runtime (from the wedge-watch thread).
+/// Returns Ok(()) when the runtime accepted the task (= at least one
+/// worker will be woken and re-park, re-running the driver handoff).
+fn nudge_runtime() -> Result<(), String> {
+    let guard = RUNTIME_HANDLE.lock().unwrap_or_else(|x| x.into_inner());
+    let h = guard
+        .as_ref()
+        .ok_or_else(|| "no runtime handle captured".to_string())?;
+    h.spawn(async {
+        // Intentionally a no-op. Its existence is the nudge.
+    });
+    Ok(())
+}
+
 /// Full-process state dump for the wedge forensics. Runs on a dedicated
 /// std::thread (NOT the tokio runtime — a wedged runtime would never poll
 /// a tokio watchdog). Called when 3 consecutive 10s listener probes fail.
@@ -7901,9 +7928,17 @@ async fn main() {
     let port: u16 = std::env::var("CT_PORT").ok().and_then(|s| s.parse().ok()).unwrap_or(8400);
 
     // Wedge forensics (2026-10-27): the server wedges with every thread
-    // parked and NOTHING logged — capture panics loudly and keep a plain
-    // std thread that probes the listener and dumps full state when it
-    // goes silent (a tokio task would never run if the runtime wedges).
+    // parked and NOTHING logged — capture panics loudly, keep a plain
+    // std thread that probes the listener (real HTTP, not a bare connect)
+    // and, on silence, first tries to REVIVE the runtime via task
+    // injection (tokio #8342), then dumps full state.
+    {
+        let h = tokio::runtime::Handle::current();
+        RUNTIME_HANDLE
+            .lock()
+            .unwrap_or_else(|x| x.into_inner())
+            .replace(h);
+    }
     std::panic::set_hook(Box::new(|info| {
         let msg = if let Some(s) = info.payload().downcast_ref::<&str>() {
             (*s).to_string()
@@ -7941,7 +7976,27 @@ async fn main() {
                     }
                     fails += 1;
                     if fails >= 3 {
-                        eprintln!("[wedge-watch] listener :{port} failed 3 HTTP probes in a row — dumping state");
+                        eprintln!("[wedge-watch] listener :{port} failed 3 HTTP probes in a row — nudging the runtime (tokio #8342 driver-handoff loss)");
+                        if let Err(e) = nudge_runtime() {
+                            eprintln!("[wedge-watch] nudge failed: {e}");
+                        }
+                        // Give the runtime a moment: the injected task wakes
+                        // a worker, which re-parks and re-runs the driver
+                        // handoff. Re-probe for ~20s.
+                        let mut revived = false;
+                        for _ in 0..4 {
+                            std::thread::sleep(std::time::Duration::from_secs(5));
+                            if http_probe(&target, std::time::Duration::from_secs(5)) {
+                                revived = true;
+                                break;
+                            }
+                        }
+                        if revived {
+                            eprintln!("[wedge-watch] RECOVERED — runtime revived by external task injection, no restart needed");
+                            fails = 0;
+                            continue;
+                        }
+                        eprintln!("[wedge-watch] nudge did not revive the runtime — dumping state (external watchdog will restart the container)");
                         wedge_dump(port);
                         fails = 0;
                     }
