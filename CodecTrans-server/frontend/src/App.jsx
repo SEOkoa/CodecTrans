@@ -328,6 +328,13 @@ export default function App() {
   const [failSort, setFailSort] = useState({ key: "movedAt", dir: -1 });
   // library tab: per-library sheet selection + table sort
   const [libSel, setLibSel] = useState("all");
+  // Clickable summary-chip filter: "remaining" | "done" | "active" |
+  // "error" | "failed" (null = no filter).
+  const [libFilter, setLibFilter] = useState(null);
+  const pickLib = (sel) => {
+    setLibSel(sel);
+    setLibFilter(null);
+  };
   const [libSort, setLibSort] = useState({ key: "name", dir: 1 });
 
   // jobs
@@ -772,17 +779,47 @@ export default function App() {
   // ── library tab: per-library sheets + sortable table ──────────
   const libName = (f) => (f.path || "").split("/").filter(Boolean).pop() || f.path;
   const libEntries = (f) => library.entries.filter((e) => e.folder === f.id);
+  // Sheet count = ENCODING TARGETS: files that are neither skipped by the
+  // logic/folder settings nor non-video (those can never be queued).
+  const libEntriesTarget = (es) =>
+    es.filter((e) => e.status !== "skipped" && e.status !== "notvideo").length;
   const selFolder = libSel === "all" ? null : folders.find((f) => f.id === libSel);
+  // Entries of the selected sheet (chip filter NOT applied) — the summary
+  // chip counts come from this, so filtering the table doesn't change them.
+  const sheetBase =
+    libSel === "skipped"
+      ? library.entries.filter((e) => e.status === "skipped")
+      : libSel === "notvideo"
+      ? library.entries.filter((e) => e.status === "notvideo")
+      : libSel === "all" || !selFolder
+      ? library.entries
+      : library.entries.filter((e) => e.folder === libSel);
+  // Clickable summary-chip filter (state: libFilter).
+  const libFilterMatch = (e) => {
+    if (!libFilter) return true;
+    switch (libFilter) {
+      case "remaining":
+        // not finished, and not in a never-queued state
+        return (
+          e.status !== "done" &&
+          e.status !== "skipped" &&
+          e.status !== "notvideo"
+        );
+      case "done":
+        return e.status === "done";
+      case "active":
+        return !!libJob(e);
+      case "error":
+        return e.status === "error";
+      case "failed":
+        return e.status === "failed";
+      default:
+        return true;
+    }
+  };
   const visibleEntries = (() => {
     // a sheet for a removed folder falls back to "all"
-    const base =
-      libSel === "skipped"
-        ? library.entries.filter((e) => e.status === "skipped")
-        : libSel === "notvideo"
-        ? library.entries.filter((e) => e.status === "notvideo")
-        : libSel === "all" || !selFolder
-        ? library.entries
-        : library.entries.filter((e) => e.folder === libSel);
+    const base = libFilter ? sheetBase.filter(libFilterMatch) : sheetBase;
     const { key, dir } = libSort;
     const val = (e) => {
       switch (key) {
@@ -2214,21 +2251,21 @@ export default function App() {
             <div className="libsheets">
               <button
                 className={`libsheet${libSel === "all" ? " on" : ""}`}
-                onClick={() => setLibSel("all")}
-                title="모든 라이브러리"
+                onClick={() => pickLib("all")}
+                title={`인코딩 대상 (스킵·비영상 제외) ${libEntriesTarget(library.entries)} / 전체 ${library.entries.length}`}
               >
                 전체
-                <span className="cnt">{library.entries.length}</span>
+                <span className="cnt">{libEntriesTarget(library.entries)}</span>
               </button>
               {folders.map((f) => (
                 <button
                   key={f.id}
                   className={`libsheet${libSel === f.id ? " on" : ""}${f.enabled ? "" : " off"}`}
-                  onClick={() => setLibSel(f.id)}
+                  onClick={() => pickLib(f.id)}
                   title={`${f.path}${f.enabled ? "" : " — 비활성"}`}
                 >
                   {libName(f)}
-                  <span className="cnt">{libEntries(f).length}</span>
+                  <span className="cnt">{libEntriesTarget(libEntries(f))}</span>
                   {!f.enabled && (
                     <span className="offdot" title="비활성 — 폴더 관리에서 활성화">
                       ·
@@ -2239,7 +2276,7 @@ export default function App() {
               <span className="libsheets-sep" />
               <button
                 className={`libsheet${libSel === "skipped" ? " on" : ""}`}
-                onClick={() => setLibSel("skipped")}
+                onClick={() => pickLib("skipped")}
                 title="스킵 목록 — 로직/폴더 설정에 따라 처리하지 않고 건너뜀 (재스캔에도 유지, ⟳으로 재큐잉)"
               >
                 ⏭ 스킵
@@ -2249,7 +2286,7 @@ export default function App() {
               </button>
               <button
                 className={`libsheet${libSel === "notvideo" ? " on" : ""}`}
-                onClick={() => setLibSel("notvideo")}
+                onClick={() => pickLib("notvideo")}
                 title="비영상 목록 — 영상 스트림이 없거나 길이가 없는 파일 (썸네일 mjpeg 등). 절대 큐에 들어가지 않음"
               >
                 🖼 비영상
@@ -2440,51 +2477,71 @@ export default function App() {
                 )}
               </div>
             )}
-            {visibleEntries.length > 0 && (
+            {sheetBase.length > 0 && (
               <div className="libsummary">
                 {(() => {
-                  const es = visibleEntries;
+                  const es = sheetBase;
                   const done = es.filter((e) => e.status === "done");
                   const err = es.filter((e) => e.status === "error");
                   const faild = es.filter((e) => e.status === "failed");
                   const act = es.filter((e) => libJob(e));
+                  const remaining = libEntriesTarget(es) - done.length;
                   const saved = done.reduce(
                     (a, e) => a + Math.max(0, (e.size || 0) - (e.newSize || 0)),
                     0
                   );
                   const shrunk = done.filter((e) => (e.newSize || 0) < (e.size || 0));
+                  const chip = (key, cls, label, count, title) => (
+                    <button
+                      type="button"
+                      className={`ls-item ls-btn${cls ? " " + cls : ""}${
+                        libFilter === key ? " on" : ""
+                      }`}
+                      onClick={() => setLibFilter(libFilter === key ? null : key)}
+                      title={
+                        (title || label) +
+                        (libFilter === key
+                          ? " — 해제하려면 다시 클릭"
+                          : " — 클릭하면 이 목록만 표시")
+                      }
+                    >
+                      <b>{count}</b> {label}
+                    </button>
+                  );
                   return (
                     <>
-                      <span className="ls-item">
-                        <b>{es.length}</b> 파일
-                      </span>
-                      <span className="ls-item ok">
-                        <b>{done.length}</b> 완료
-                      </span>
-                      {act.length > 0 && (
-                        <span className="ls-item run">
-                          <b>{act.length}</b> 진행 중
-                        </span>
-                      )}
-                      {err.length > 0 && (
-                        <span className="ls-item bad">
-                          <b>{err.length}</b> 오류
-                        </span>
-                      )}
-                      {faild.length > 0 && (
-                        <span
-                          className="ls-item faild"
-                          title="실패 보관함으로 이동된 파일 — 실패 보관함 탭에서 복원/삭제"
-                        >
-                          <b>{faild.length}</b> 보관함
-                        </span>
-                      )}
+                      {remaining > 0 &&
+                        chip(
+                          "remaining",
+                          "",
+                          "남은 파일",
+                          remaining,
+                          "완료·스킵·비영상 제외 — 아직 처리 대기/진행/오류"
+                        )}
+                      {chip("done", "ok", "완료", done.length)}
+                      {act.length > 0 &&
+                        chip("active", "run", "진행 중", act.length)}
+                      {err.length > 0 &&
+                        chip("error", "bad", "오류", err.length)}
+                      {faild.length > 0 &&
+                        chip(
+                          "failed",
+                          "faild",
+                          "보관함",
+                          faild.length,
+                          "실패 보관함으로 이동된 파일 — 실패 보관함 탭에서 복원/삭제"
+                        )}
                       {saved > 0 && (
                         <span
                           className="ls-item save"
                           title={`${shrunk.length}개 파일 원본 대비 용량 감소분`}
                         >
                           💾 <b>{fmtSize(saved)}</b> 절약
+                        </span>
+                      )}
+                      {libFilter && (
+                        <span className="ls-item filterhint">
+                          필터 중 — 다시 클릭하면 해제
                         </span>
                       )}
                     </>
@@ -2655,7 +2712,9 @@ export default function App() {
               </div>
             ) : (
               <div className="empty">
-                {folders.some((f) => f.enabled)
+                {libFilter
+                  ? "현재 필터에 해당하는 파일이 없습니다 — 칩을 다시 클릭해 해제하세요."
+                  : folders.some((f) => f.enabled)
                   ? "선택한 시트에 영상이 없거나 아직 스캔하지 않았습니다."
                   : "활성화된 폴더가 없습니다 — 아래 폴더 관리에서 추가하고 [활성화]하세요."}
               </div>
