@@ -466,7 +466,11 @@ export default function App() {
     api.settingsGet().then(s => {
       setFailDirDraft(s.failDir ?? "");
       setAutoScanDraft(s.autoScanMinutes ?? 0);
-      setLangState(s.language === "en" ? "en" : "ko");
+      // setLang BEFORE setLangState: the re-render reads the module var,
+      // and a bare module mutation (useEffect) would never re-render.
+      const l = s.language === "en" ? "en" : "ko";
+      setLang(l);
+      setLangState(l);
     }).catch(() => {});
     api.failuresGet().then(setFailures).catch(() => {});
     api.codecs().then(c => {
@@ -3097,10 +3101,13 @@ export default function App() {
             <div className="search">
               <select value={lang} onChange={e => {
             const v = e.target.value;
+            setLang(v);
             setLangState(v);
-            api.settingsPost({ language: v }).then(r =>
-              setLangState(r.language === "en" ? "en" : "ko")
-            ).catch(() => {});
+            api.settingsPost({ language: v }).then(r => {
+              const l2 = r.language === "en" ? "en" : "ko";
+              setLang(l2);
+              setLangState(l2);
+            }).catch(() => {});
           }}>
                 <option value="ko">한국어</option>
                 <option value="en">English</option>
