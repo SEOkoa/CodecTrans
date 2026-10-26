@@ -1,4 +1,4 @@
-import React, { useEffect, useRef, useState } from "react";
+import React, { useEffect, useMemo, useRef, useState } from "react";
 import { api, fmtSize, fmtDur, fmtRate, setAuthToken } from "./api.js";
 import { t, setLang } from "./i18n.js";
 const STATUS_LABEL = {
@@ -459,7 +459,8 @@ export default function App() {
       // and selectLogic's default arg would take the blank-canvas branch.
       selectLogic(ls.length ? ls[0].id : "", ls);
     }).catch(() => {});
-    api.library().then(l => {
+    api.library(true).then(l => {
+      if (!l) return;
       setLibrary(l);
       if (l.root) setLibRoot(l.root);
     }).catch(() => {});
@@ -481,13 +482,34 @@ export default function App() {
     }).catch(() => {});
   }, []);
 
-  // refresh jobs + nodes periodically
+  // refresh jobs + nodes periodically (fast loop — small payloads)
   useEffect(() => {
     const t = setInterval(() => {
       api.jobs().then(setJobs).catch(() => {});
       api.nodes().then(setNodes).catch(() => {});
       api.discoveredNodes().then(setDiscovered).catch(() => {});
-      api.library().then(setLibrary).catch(() => {});
+      if (tab === "dashboard") api.serverStats().then(setStats).catch(() => {});
+      // keep the active job's progress bar live until it's terminal
+      const aj = activeJobRef.current;
+      if (aj && ![ "done", "error"].includes(aj.status)) {
+        api.job(aj.id).then(latest => {
+          activeJobRef.current = latest;
+          setActiveJob(latest);
+        }).catch(() => {});
+      }
+    }, 2000);
+    return () => clearInterval(t);
+  }, [tab]);
+
+  // slow loop: the library catalog + folder list. These are the BIG payloads
+  // (a 4k-entry library is ~1MB of JSON) — the server answers 304 (empty)
+  // when unchanged (ETag), so this is cheap; still, 5s is plenty for a
+  // status refresh and keeps the NAS idle between real changes.
+  useEffect(() => {
+    const t = setInterval(() => {
+      api.library().then(l => {
+        if (l) setLibrary(l); // null = 304 Not Modified — keep current state
+      }).catch(() => {});
       // Keep the folder list in sync when it changes in ANOTHER window or
       // session (a deleted folder must disappear from the sheets). Compare
       // signatures so an in-flight local edit is never clobbered: if local
@@ -498,18 +520,9 @@ export default function App() {
         setFolders(cur => sig(f) === sig(cur) ? cur : f);
         setLibSel(cur => cur === "all" || cur === "skipped" || cur === "notvideo" || f.some(y => y.id === cur) ? cur : "all");
       }).catch(() => {});
-      if (tab === "dashboard") api.serverStats().then(setStats).catch(() => {});
-      // keep the active job's progress bar live until it's terminal
-      const aj = activeJobRef.current;
-      if (aj && !["done", "error"].includes(aj.status)) {
-        api.job(aj.id).then(latest => {
-          activeJobRef.current = latest;
-          setActiveJob(latest);
-        }).catch(() => {});
-      }
-    }, 2000);
+    }, 5000);
     return () => clearInterval(t);
-  }, [tab]);
+  }, []);
 
   // poll the active job for a smooth progress bar (500ms). Depend only on the
   // job id so the interval isn't torn down on every progress tick.
@@ -841,7 +854,16 @@ export default function App() {
 
   // ── library re-encode (per-file ⟳ button) ──────────────────────
   const libKey = e => (e.folder ? e.folder + "/" : "") + e.path;
-  const libJob = e => jobs.find(j => j.libPath === libKey(e) && !["done", "error"].includes(j.status));
+  // libJob lookup table: one Map per jobs change (was: a linear jobs.find
+  // PER ENTRY PER RENDER — 4k entries x ~600 jobs = 2.4M comparisons/render).
+  const jobByPath = useMemo(() => {
+    const m = new Map();
+    for (const j of jobs) {
+      if (j.libPath && !["done", "error"].includes(j.status)) m.set(j.libPath, j);
+    }
+    return m;
+  }, [jobs]);
+  const libJob = e => jobByPath.get(libKey(e));
   async function doRequeue(e) {
     setError("");
     try {
@@ -881,7 +903,7 @@ export default function App() {
         return true;
     }
   };
-  const visibleEntries = (() => {
+  const visibleEntries = useMemo(() => {
     // a sheet for a removed folder falls back to "all"
     const base = libFilter ? sheetBase.filter(libFilterMatch) : sheetBase;
     const {
@@ -893,7 +915,7 @@ export default function App() {
         case "name":
           return e.name || "";
         case "folder":
-          return libSel === "all" ? e.folder ? libName(folders.find(f => f.id === e.folder) || {}) : t("(\uC784\uC2DC)") : "";
+          return libSel === "all" ? e.folder ? libName(folders.find(f => f.id === e.folder) || {}) : t("(임시)") : "";
         case "codec":
           return e.videoCodec || "";
         case "size":
@@ -912,7 +934,7 @@ export default function App() {
       if (typeof va === "number" && typeof vb === "number") return (va - vb) * dir;
       return String(va).localeCompare(String(vb), "ko") * dir;
     });
-  })();
+  }, [library, folders, libSel, libFilter, libSort]);
   const toggleLibSort = key => setLibSort(s => s.key === key ? {
     key,
     dir: -s.dir
@@ -941,9 +963,11 @@ export default function App() {
       await api.foldersPost(next);
       // The server deletes removed folders' catalog entries with the
       // folder — refetch so the sheet list drops them immediately.
-      const l = await api.library();
-      setLibrary(l);
-      if (l.root) setLibRoot(l.root);
+      const l = await api.library(true); // force: the catalog just changed
+      if (l) {
+        setLibrary(l);
+        if (l.root) setLibRoot(l.root);
+      }
       if (libSel !== "all" && libSel !== "skipped" && libSel !== "notvideo" && !next.some(f => f.id === libSel)) setLibSel("all");
       flashFolder(t("\uD3F4\uB354 \uC800\uC7A5\uB428 \u2713"));
     } catch (err) {
@@ -1816,7 +1840,7 @@ export default function App() {
 
           <div className="history">
             {jobs.filter(j => !j.libPath).length === 0 && <div className="empty">No jobs yet.</div>}
-            {jobs.filter(j => !j.libPath).map(j => <div key={j.id} className="job">
+            {jobs.filter(j => !j.libPath).slice(0, 100).map(j => <div key={j.id} className="job">
                 <div className="row">
                   <span className={`status ${j.status}`}>{STATUS_LABEL[j.status] || j.status}</span>
                   {j.accelerated && <span className="accel" title={`HW: ${j.effectiveVideoCodec}`}>⚡</span>}

@@ -376,22 +376,46 @@ impl JobStore {
         v
     }
 
+    /// Terminal-state jobs (done/error/cancelled) accumulate forever — the UI
+    /// history is fed from them and the 2s /api/jobs poll serializes the whole
+    /// map. Keep only the most recent `keep`; the rest are dropped so memory
+    /// and poll cost stay flat no matter how long the server runs.
+    pub fn prune_terminal(&mut self, keep: usize) -> usize {
+        let done: Vec<(i64, String)> = self
+            .jobs
+            .values()
+            .filter(|j| matches!(j.status.as_str(), "done" | "error" | "cancelled"))
+            .map(|j| (j.finished_at.unwrap_or(j.created_at), j.id.clone()))
+            .collect();
+        if done.len() <= keep {
+            return 0;
+        }
+        let mut done = done;
+        done.sort_by_key(|(t, _)| *t);
+        let drop = done.len() - keep;
+        for (_, id) in done.into_iter().take(drop) {
+            self.jobs.remove(&id);
+        }
+        drop
+    }
+
     // ---- nodes: see the Redis node registry section below ----
     /// Atomically claim the oldest queued job destined for `node_id`.
+    /// Finds the best id first, clones ONLY that job (not every candidate —
+    /// this runs per poll per node, and Job is a fat struct).
     pub fn claim_for_node(&mut self, node_id: &str) -> Option<Job> {
-        let best: Option<Job> = self
+        let best_id: Option<String> = self
             .jobs
             .values()
             .filter(|j| j.status == "queued" && j.node_id.as_deref() == Some(node_id))
-            .cloned()
-            .min_by_key(|j| j.created_at);
-        if let Some(mut j) = best {
-            j.status = "dispatched".into();
-            self.jobs.insert(j.id.clone(), j.clone());
-            Some(j)
-        } else {
-            None
-        }
+            .map(|j| (&j.created_at, &j.id))
+            .min()
+            .map(|(_, id)| id.clone());
+        let Some(id) = best_id else { return None };
+        let mut j = self.jobs.get(&id)?.clone();
+        j.status = "dispatched".into();
+        self.jobs.insert(j.id.clone(), j.clone());
+        Some(j)
     }
 
     // ---- discovered (mDNS LAN discovery) ----
@@ -556,7 +580,7 @@ async fn reg_node(
     hw_encoders: &[String],
     accels: &[Accel],
     diag: &[String],
-) -> Node {
+) -> Result<Node, String> {
     let mut c = c;
     let now = now_ms();
     let existing: Option<String> = redis::cmd("GET")
@@ -594,8 +618,14 @@ async fn reg_node(
         pipe.cmd("HSET").arg(rk_node(&id)).arg("currentJob").arg("");
     }
     pipe.cmd("SETEX").arg(rk_online(&id)).arg(ONLINE_TTL_SECS).arg("1");
-    let _: () = pipe.query_async(&mut c).await.expect("redis register");
-    hgetall_node(c.clone(), &id).await.unwrap_or(Node {
+    // A Redis blip must NOT panic the handler (a panic here would also risk
+    // poisoning the shared store mutex that a dozen handlers hold): the node
+    // re-registers on its next heartbeat, so just report 502 upstream.
+    let r: Result<(), redis::RedisError> = pipe.query_async(&mut c).await;
+    if let Err(e) = r {
+        return Err(format!("redis register failed: {e}"));
+    }
+    Ok(hgetall_node(c.clone(), &id).await.unwrap_or(Node {
         id,
         name: name.to_string(),
         display_name: None,
@@ -616,7 +646,7 @@ async fn reg_node(
         ram_total_mb: None,
         gpu_temp: None,
         gpu_util: None,
-    })
+    }))
 }
 
 /// Heartbeat: refresh liveness + last_heartbeat + optional live stats
@@ -677,6 +707,9 @@ async fn set_current_job(c: RConn, id: &str, job: Option<&str>) {
 /// backend: only nodes exposing that HW acceleration (nvenc/qsv/…);
 /// family: only nodes with an HW encoder for that codec family.
 async fn list_nodes_redis(c: RConn, status: &str, backend: Option<&str>, family: Option<&str>) -> Vec<Node> {
+    // ONE round-trip for all node state (was: SMEMBERS + HGETALL+TTL per
+    // node, serialized — 3 nodes = 7 RTT, and this runs on every 2s UI poll
+    // and every dispatch).
     let mut c = c;
     let ids: Vec<String> = redis::cmd("SMEMBERS")
         .arg(RK_IDS)
@@ -684,8 +717,28 @@ async fn list_nodes_redis(c: RConn, status: &str, backend: Option<&str>, family:
         .await
         .unwrap_or_default();
     let mut out = Vec::new();
-    for id in ids {
-        if let Some(n) = hgetall_node(c.clone(), &id).await {
+    if ids.is_empty() {
+        return out;
+    }
+    let mut pipe = redis::pipe();
+    for id in &ids {
+        pipe.cmd("HGETALL").arg(rk_node(id));
+        pipe.cmd("TTL").arg(rk_online(id));
+    }
+    let res: Vec<redis::Value> = match pipe.query_async(&mut c).await {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("[CodecTrans] list_nodes pipeline failed: {e}");
+            return out;
+        }
+    };
+    for (i, id) in ids.iter().enumerate() {
+        let (Some(hv), Some(tv)) = (res.get(i * 2), res.get(i * 2 + 1)) else {
+            break;
+        };
+        let Ok(h) = <NodeHash as redis::FromRedisValue>::from_redis_value(hv) else { continue };
+        let ttl: i64 = <i64 as redis::FromRedisValue>::from_redis_value(tv).unwrap_or(-2);
+        if let Some(n) = parse_node(id, &h, ttl > 0) {
             let on = n.status == "online";
             match status {
                 "online" if !on => continue,
@@ -756,35 +809,58 @@ fn pick_node_encoder_idx(online: &[Node], counts: &std::collections::HashMap<Str
 //  ffmpeg helpers
 // ============================================================
 
+/// ffprobe with a hard timeout — a stalled NFS handle or a corrupt file must
+/// never wedge the scan pipeline (the collector awaits every probe task while
+/// holding SCAN_LOCK; one stuck probe would freeze ALL scanning until restart,
+/// exactly the decode_window_ok failure mode that already has a timeout).
+async fn ffprobe_out(args: &[&str], path: &str) -> Option<String> {
+    let r = tokio::time::timeout(
+        std::time::Duration::from_secs(60),
+        Command::new("ffprobe").args(args).arg(path).output(),
+    )
+    .await;
+    match r {
+        Ok(Ok(o)) => Some(String::from_utf8_lossy(&o.stdout).into_owned()),
+        Ok(Err(e)) => {
+            eprintln!("[CodecTrans] ffprobe failed {path}: {e}");
+            None
+        }
+        Err(_) => {
+            eprintln!("[CodecTrans] ffprobe TIMEOUT(60s) {path} — treated as unreadable");
+            None
+        }
+    }
+}
+
 /// Duration of a media file in seconds (ffprobe), or 0.0 on failure.
 async fn probe_duration(path: &str) -> f64 {
-    let out = Command::new("ffprobe")
-        .args(["-v", "error", "-show_entries", "format=duration", "-of", "default=nw=1:nk=1", path])
-        .output()
-        .await
-        .ok()
-        .and_then(|o| String::from_utf8(o.stdout).ok())
-        .and_then(|s| s.trim().parse::<f64>().ok())
-        .unwrap_or(0.0);
-    out
+    let Some(s) = ffprobe_out(
+        &["-v", "error", "-show_entries", "format=duration", "-of", "default=nw=1:nk=1"],
+        path,
+    )
+    .await
+    else {
+        return 0.0
+    };
+    s.trim().parse::<f64>().unwrap_or(0.0)
 }
 
 /// ffprobe a file -> (video_codec, audio_codec, duration_seconds).
 async fn probe_media(path: &str) -> (Option<String>, Option<String>, f64) {
-    let out = Command::new("ffprobe")
-        .args([
+    let Some(out) = ffprobe_out(
+        &[
             "-v", "error",
             "-show_entries", "stream=codec_type,codec_name",
             "-show_entries", "format=duration",
             "-of", "json",
-            path,
-        ])
-        .output()
-        .await
-        .ok()
-        .and_then(|o| String::from_utf8(o.stdout).ok());
-    let Some(s) = out else { return (None, None, 0.0) };
-    let Ok(v) = serde_json::from_str::<Value>(&s) else { return (None, None, 0.0) };
+        ],
+        path,
+    )
+    .await
+    else {
+        return (None, None, 0.0)
+    };
+    let Ok(v) = serde_json::from_str::<Value>(&out) else { return (None, None, 0.0) };
     let mut vc: Option<String> = None;
     let mut ac: Option<String> = None;
     if let Some(streams) = v.get("streams").and_then(|s| s.as_array()) {
@@ -832,21 +908,21 @@ pub struct MediaInfo {
 /// ffprobe a file into full MediaInfo (best-effort: fields are None on failure).
 async fn probe_full(path: &str) -> MediaInfo {
     let mut info = MediaInfo::default();
-    let out = Command::new("ffprobe")
-        .args([
+    let Some(out) = ffprobe_out(
+        &[
             "-v", "error",
             "-show_entries",
             "stream=codec_type,codec_name,profile,width,height,pix_fmt,avg_frame_rate,sample_rate,channels,bit_rate,duration",
             "-show_entries", "format=duration,size,bit_rate,format_name",
             "-of", "json",
-            path,
-        ])
-        .output()
-        .await
-        .ok()
-        .and_then(|o| String::from_utf8(o.stdout).ok());
-    let Some(s) = out else { return info };
-    let Ok(v) = serde_json::from_str::<Value>(&s) else { return info };
+        ],
+        path,
+    )
+    .await
+    else {
+        return info
+    };
+    let Ok(v) = serde_json::from_str::<Value>(&out) else { return info };
 
     let u32f = |st: &Value, k: &str| st.get(k).and_then(|x| x.as_u64()).map(|n| n as u32);
     let f64f = |st: &Value, k: &str| st.get(k).and_then(|x| x.as_f64());
@@ -910,18 +986,16 @@ async fn probe_full(path: &str) -> MediaInfo {
 
 /// ffprobe the first video stream's pix_fmt (None on failure / no video).
 async fn probe_video_pix_fmt(path: &str) -> Option<String> {
-    let out = Command::new("ffprobe")
-        .args([
+    let out = ffprobe_out(
+        &[
             "-v", "error",
             "-select_streams", "v:0",
             "-show_entries", "stream=pix_fmt",
             "-of", "default=nw=1:nk=1",
-            path,
-        ])
-        .output()
-        .await
-        .ok()
-        .and_then(|o| String::from_utf8(o.stdout).ok())?;
+        ],
+        path,
+    )
+    .await?;
     out.trim().lines().next().filter(|s| !s.is_empty() && *s != "N/A").map(|s| s.to_string())
 }
 
@@ -1017,15 +1091,7 @@ fn parse_time(s: &str) -> Option<f64> {
 
 /// Validate a requested video encoder exists in this ffmpeg build.
 fn encoder_exists(name: &str) -> bool {
-    std::process::Command::new("ffmpeg")
-        .args(["-hide_banner", "-encoders"])
-        .output()
-        .map(|o| {
-            String::from_utf8_lossy(&o.stdout)
-                .lines()
-                .any(|l| l.split_whitespace().nth(1) == Some(name))
-        })
-        .unwrap_or(false)
+    ffmpeg_encoders().contains(name)
 }
 
 // ============================================================
@@ -1189,7 +1255,7 @@ const CRF_ENCODERS: [&str; 6] = [
 async fn run_transcode(store: Store, job: Job) {
     // mark running
     {
-        let mut s = store.lock().unwrap();
+        let mut s = store.lock().unwrap_or_else(|p| p.into_inner());
         let _ = s.update(&job.id, |j| {
             j.status = "running".into();
             j.started_at = Some(now_ms());
@@ -1275,10 +1341,10 @@ async fn run_transcode(store: Store, job: Job) {
     // total duration for progress
     let total = probe_duration(&input_path.to_string_lossy()).await;
 
-    let mut child = match Command::new("ffmpeg").args(&args).stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::piped()).spawn() {
+    let mut child = match Command::new("ffmpeg").args(&args).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::piped()).spawn() {
         Ok(c) => c,
         Err(e) => {
-            let _ = store.lock().unwrap().update(&job.id, |j| { j.status = "error".into(); j.error = Some(format!("spawn ffmpeg failed: {e}")); j.finished_at = Some(now_ms()); });
+            let _ = store.lock().unwrap_or_else(|p| p.into_inner()).update(&job.id, |j| { j.status = "error".into(); j.error = Some(format!("spawn ffmpeg failed: {e}")); j.finished_at = Some(now_ms()); });
             return;
         }
     };
@@ -1300,12 +1366,34 @@ async fn run_transcode(store: Store, job: Job) {
     let mut buf = [0u8; 8192];
     let mut pending = String::new();
     let mut last_err_line: Option<String> = None;
+    // Watchdog: kill ffmpeg when it goes silent — a stalled NFS read or a
+    // wedged muxer must not occupy a worker slot forever. stderr is ffmpeg's
+    // only live signal here, so budget = max(10min, 8x source duration).
+    let silent_budget =
+        std::time::Duration::from_secs((total.max(60.0) * 8.0) as u64).max(std::time::Duration::from_secs(600));
+    let mut last_activity = tokio::time::Instant::now();
     loop {
-        let n = match stderr.read(&mut buf).await {
-            Ok(0) => break,
-            Ok(n) => n,
-            Err(_) => break,
+        let n = tokio::select! {
+            r = stderr.read(&mut buf) => match r {
+                Ok(0) => break,
+                Ok(n) => n,
+                Err(_) => break,
+            },
+            _ = tokio::time::sleep_until(last_activity + silent_budget) => {
+                eprintln!("[CodecTrans] ffmpeg SILENT {} on {} — killing (stalled input or muxer)", silent_budget.as_secs(), input_path.display());
+                let _ = child.kill().await;
+                let _ = child.wait().await;
+                let _ = store
+                    .lock().unwrap_or_else(|p| p.into_inner())
+                    .update(&job.id, |j| {
+                        j.status = "error".into();
+                        j.error = Some("ffmpeg went silent (stalled input?) — killed by watchdog".into());
+                        j.finished_at = Some(now_ms());
+                    });
+                return;
+            }
         };
+        last_activity = tokio::time::Instant::now();
         pending.push_str(&String::from_utf8_lossy(&buf[..n]));
         while let Some(pos) = pending.find(|c| c == '\r' || c == '\n') {
             let seg = pending[..pos].to_string();
@@ -1320,8 +1408,7 @@ async fn run_transcode(store: Store, job: Job) {
                     0.0
                 };
                 let _ = store
-                    .lock()
-                    .unwrap()
+                    .lock().unwrap_or_else(|p| p.into_inner())
                     .update(&job.id, |j| {
                         j.progress = prog;
                     });
@@ -1343,8 +1430,7 @@ async fn run_transcode(store: Store, job: Job) {
                 0.0
             };
             let _ = store
-                .lock()
-                .unwrap()
+                .lock().unwrap_or_else(|p| p.into_inner())
                 .update(&job.id, |j| {
                     j.progress = prog;
                 });
@@ -1363,7 +1449,7 @@ async fn run_transcode(store: Store, job: Job) {
     let out_size = std::fs::metadata(&output_path).map(|m| m.len()).ok();
     let in_size = std::fs::metadata(&input_path).map(|m| m.len()).ok();
     {
-        let mut s = store.lock().unwrap();
+        let mut s = store.lock().unwrap_or_else(|p| p.into_inner());
         let _ = s.update(&job.id, |j| {
             j.finished_at = Some(now_ms());
             j.input_size = in_size;
@@ -1944,7 +2030,7 @@ fn src_health_depths(graphs: &[&WorkflowGraph]) -> Vec<(String, u32)> {
 static CUDA_LIBDIR: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
 
 fn cuda_libdir() -> Option<String> {
-    CUDA_LIBDIR.lock().unwrap().clone()
+    CUDA_LIBDIR.lock().unwrap_or_else(|p| p.into_inner()).clone()
 }
 
 /// Read the host NVIDIA kernel driver version. /sys/module/nvidia/version
@@ -2050,7 +2136,7 @@ fn init_cuda() {
                 "[CodecTrans] CUDA userland series {v} OK — scan health decode runs on the GPU ({})",
                 lib.display()
             );
-            *CUDA_LIBDIR.lock().unwrap() = Some(lib.to_string_lossy().to_string());
+            *CUDA_LIBDIR.lock().unwrap_or_else(|p| p.into_inner()) = Some(lib.to_string_lossy().to_string());
             return;
         }
         eprintln!("[CodecTrans] CUDA userland series {v}: probe failed (driver mismatch?)");
@@ -2292,11 +2378,36 @@ fn lib_cfg_path() -> PathBuf {
     base_dir().join("library.json")
 }
 
+/// In-memory cache of library.json — handlers (folders/logics/settings)
+/// re-read the NAS file on EVERY call, and the UI polls several of them per
+/// second. Writers go through save_lib_cfg (in-process only), which drops
+/// the cache, so readers never see stale data.
+static LIB_CFG_CACHE: std::sync::Mutex<Option<LibraryConfig>> = std::sync::Mutex::new(None);
+
 fn load_lib_cfg() -> LibraryConfig {
-    std::fs::read_to_string(lib_cfg_path())
+    {
+        let c = LIB_CFG_CACHE.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(cfg) = c.as_ref() {
+            return cfg.clone();
+        }
+    }
+    let parsed = match std::fs::read_to_string(lib_cfg_path())
         .ok()
-        .and_then(|s| serde_json::from_str(&s).ok())
-        .unwrap_or_default()
+        .and_then(|s| serde_json::from_str::<LibraryConfig>(&s).ok())
+    {
+        Some(c) => c,
+        None => {
+            if std::fs::metadata(lib_cfg_path()).is_ok() {
+                eprintln!("[CodecTrans] library.json is corrupt — falling back to library.json.bak");
+            }
+            std::fs::read_to_string(lib_cfg_path().with_extension("json.bak"))
+                .ok()
+                .and_then(|s| serde_json::from_str::<LibraryConfig>(&s).ok())
+                .unwrap_or_default()
+        }
+    };
+    *LIB_CFG_CACHE.lock().unwrap_or_else(|p| p.into_inner()) = Some(parsed.clone());
+    parsed
 }
 
 /// Process-wide lock for library.json read-modify-write cycles. The file is
@@ -2335,6 +2446,12 @@ static SCAN_STATE: std::sync::Mutex<ScanState> = std::sync::Mutex::new(ScanState
     finished_skipped: 0,
 });
 
+/// Monotonic catalog revision — bumped every time the catalog hits disk.
+/// Lets GET /api/library answer 304 Not Modified to the UI's 2s poll (the
+/// full 4k-entry JSON body is ~1MB; 304 is 0 bytes) without any content
+/// hashing on the hot path.
+static CATALOG_VERSION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 /// One library scan at a time — a second request gets a visible
 /// "already running" reply (with the live progress) instead of silently
 /// overwriting SCAN_STATE and making the first scan's progress vanish.
@@ -2358,7 +2475,23 @@ fn scan_scope_label(roots: &[(Option<String>, PathBuf)], libcfg: &LibraryConfig)
 }
 
 fn save_lib_cfg(c: &LibraryConfig) -> std::io::Result<()> {
-    std::fs::write(lib_cfg_path(), serde_json::to_string_pretty(c)?)
+    // Atomic (mirrors persist_catalog_locked): serialize first, keep the
+    // previous generation as .bak, stage to a temp file, rename over. A power
+    // loss mid-write must never corrupt the folders/logics/settings file.
+    let json = serde_json::to_string_pretty(c)?;
+    let p = lib_cfg_path();
+    let bak = p.with_extension("json.bak");
+    if let Ok(old) = std::fs::read(&p) {
+        if !old.is_empty() {
+            let _ = std::fs::write(&bak, old);
+        }
+    }
+    let tmp = p.with_extension("json.tmp");
+    std::fs::write(&tmp, json)?;
+    std::fs::rename(&tmp, &p)?;
+    // Drop the in-memory cache so the next read sees the new generation.
+    *LIB_CFG_CACHE.lock().unwrap_or_else(|p| p.into_inner()) = None;
+    Ok(())
 }
 
 fn catalog_path() -> PathBuf {
@@ -2414,7 +2547,7 @@ fn persist_catalog(store: &Store) {
     persist_catalog_locked(store);
 }
 fn persist_catalog_locked(store: &Store) {
-    let entries = store.lock().unwrap().list_library();
+    let entries = store.lock().unwrap_or_else(|p| p.into_inner()).list_library();
     let json = match serde_json::to_string(&entries) {
         Ok(j) => j,
         Err(e) => {
@@ -2454,6 +2587,7 @@ fn persist_catalog_locked(store: &Store) {
     c.tombstone = seen.into_iter().collect();
     c.tombstone.sort();
     let _ = save_lib_cfg(&c);
+    CATALOG_VERSION.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 }
 
 #[derive(Deserialize)]
@@ -2634,7 +2768,7 @@ async fn folders_post(State(store): State<Store>, Json(mut b): Json<FoldersBody>
     }
     // Drop catalog entries that belonged to removed folders.
     {
-        let mut s = store.lock().unwrap();
+        let mut s = store.lock().unwrap_or_else(|p| p.into_inner());
         let kept: Vec<String> = b
             .folders
             .iter()
@@ -2666,7 +2800,7 @@ struct RequeueReq {
 /// next scan re-queues it (the per-file ⟳ re-encode button).
 async fn library_requeue(State(store): State<Store>, Json(req): Json<RequeueReq>) -> Response {
     let found = {
-        let mut s = store.lock().unwrap();
+        let mut s = store.lock().unwrap_or_else(|p| p.into_inner());
         s.update_library_entry(&req.key, |e| {
             e.status = "pending".into();
             e.error = None;
@@ -2716,7 +2850,7 @@ fn resolve_lib_source(lp: &str, store: &Store) -> Option<PathBuf> {
             }
         }
     }
-    let root = store.lock().unwrap().storage_root().to_string();
+    let root = store.lock().unwrap_or_else(|p| p.into_inner()).storage_root().to_string();
     let p = PathBuf::from(root).join(lp);
     if p.is_file() {
         Some(p)
@@ -3006,7 +3140,7 @@ async fn failure_restore(State(store): State<Store>, Json(req): Json<FailReq>) -
     // (inline the path resolution — resolve_lib_source would re-lock the
     // store we already hold.)
     {
-        let mut s = store.lock().unwrap();
+        let mut s = store.lock().unwrap_or_else(|p| p.into_inner());
         let cfg = load_lib_cfg();
         let root = s.storage_root().to_string();
         let resolve = |key: &str| -> Option<PathBuf> {
@@ -3226,7 +3360,7 @@ fn active_jobs_by_node_dev(
     prefix: Option<&str>,
     node_id: &str,
 ) -> std::collections::HashMap<u32, u32> {
-    let s = store.lock().unwrap();
+    let s = store.lock().unwrap_or_else(|p| p.into_inner());
     let mut m: std::collections::HashMap<u32, u32> = std::collections::HashMap::new();
     for j in s.jobs.values() {
         if matches!(j.status.as_str(), "queued" | "dispatched" | "running")
@@ -3285,7 +3419,7 @@ fn resolve_choices_on_node(
 /// key), only that folder's jobs count — one folder's batch must not crowd
 /// the others off a node.
 fn active_jobs_by_node(store: &Store, prefix: Option<&str>) -> std::collections::HashMap<String, u32> {
-    let s = store.lock().unwrap();
+    let s = store.lock().unwrap_or_else(|p| p.into_inner());
     let mut m: std::collections::HashMap<String, u32> = std::collections::HashMap::new();
     for j in s.jobs.values() {
         if matches!(j.status.as_str(), "queued" | "dispatched" | "running") {
@@ -3316,7 +3450,7 @@ async fn resolve_choice_dispatch(
     folder_key: Option<&str>,
     hw_only: bool,
 ) -> Option<(String, String, String, bool, Option<u32>, TargetCfg)> {
-    let c = store.lock().unwrap().redis();
+    let c = store.lock().unwrap_or_else(|p| p.into_inner()).redis();
     let online = list_nodes_redis(c, "online", None, None).await;
     if online.is_empty() {
         return None;
@@ -3418,11 +3552,13 @@ fn max_queued() -> usize {
 
 /// Jobs currently occupying the queue (not finished, not cancelled).
 fn active_job_count(store: &Store) -> usize {
+    // No-clone count (list() clones+sorts the whole map — this runs on every
+    // job completion, a few times per sweep on a busy node).
     store
         .lock()
-        .unwrap()
-        .list()
-        .iter()
+        .unwrap_or_else(|p| p.into_inner())
+        .jobs
+        .values()
         .filter(|j| matches!(j.status.as_str(), "queued" | "dispatched" | "running"))
         .count()
 }
@@ -3454,10 +3590,9 @@ async fn dispatch_lib_job(
     // same deterministic output path twice and muddle results — treat it as
     // "busy" so the entry stays pending and a later rescan retries it.
     if store
-        .lock()
-        .unwrap()
-        .list()
-        .iter()
+        .lock().unwrap_or_else(|p| p.into_inner())
+        .jobs
+        .values()
         .any(|j| j.input_file == key && (j.status == "queued" || j.status == "running"))
     {
         return Ok(false);
@@ -3475,7 +3610,7 @@ async fn dispatch_lib_job(
                 .unwrap_or_else(|| "h264".into());
             let family = codec_family(&vcodec);
             let node = {
-                let c = store.lock().unwrap().redis();
+                let c = store.lock().unwrap_or_else(|p| p.into_inner()).redis();
                 let online = list_nodes_redis(c, "online", None, None).await;
                 let counts = active_jobs_by_node(store, None);
                 let idx = if hw_only {
@@ -3541,7 +3676,7 @@ async fn dispatch_lib_job(
             // hwOnly + no online node with HW for ANY choice -> a visible
             // error (a capable-but-busy pool still waits: Ok(false)).
             if hw_only {
-                let c = store.lock().unwrap().redis();
+                let c = store.lock().unwrap_or_else(|p| p.into_inner()).redis();
                 let online = list_nodes_redis(c, "online", None, None).await;
                 let any_hw = online.iter().any(|n| {
                     t.choices.iter().any(|ch| {
@@ -3648,7 +3783,7 @@ async fn dispatch_lib_job(
         local_input,
         local_output: Some(outputs_dir().to_string_lossy().to_string()),
     };
-    store.lock().unwrap().insert(job);
+    store.lock().unwrap_or_else(|p| p.into_inner()).insert(job);
     Ok(true)
 }
 
@@ -4203,27 +4338,63 @@ async fn eval_graph(
 //  Handlers
 // ============================================================
 
+/// First line of `ffmpeg -version`, cached for the server's lifetime — the
+/// /api/health poll used to spawn a process on EVERY call.
+static FFMPEG_VERSION: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+
+fn ffmpeg_version_line() -> String {
+    FFMPEG_VERSION
+        .get_or_init(|| {
+            std::process::Command::new("ffmpeg")
+                .arg("-version")
+                .output()
+                .ok()
+                .and_then(|o| String::from_utf8(o.stdout).ok())
+                .and_then(|s| s.lines().next().map(|l| l.to_string()))
+        })
+        .clone()
+        .unwrap_or_else(|| "ffmpeg not found".into())
+}
+
+/// The set of encoder names this ffmpeg build actually provides — parsed from
+/// ONE `ffmpeg -encoders` run at first use (the /api/codecs handler used to
+/// spawn one process PER codec in the catalog).
+static FFMPEG_ENCODERS: std::sync::OnceLock<std::collections::HashSet<String>> =
+    std::sync::OnceLock::new();
+
+fn ffmpeg_encoders() -> &'static std::collections::HashSet<String> {
+    FFMPEG_ENCODERS.get_or_init(|| {
+        std::process::Command::new("ffmpeg")
+            .args(["-hide_banner", "-encoders"])
+            .output()
+            .map(|o| {
+                String::from_utf8_lossy(&o.stdout)
+                    .lines()
+                    .filter_map(|l| l.split_whitespace().nth(1).map(|s| s.to_string()))
+                    .collect()
+            })
+            .unwrap_or_default()
+    })
+}
+
 async fn health() -> impl IntoResponse {
     Json(json!({
         "status": "ok",
         "service": "codectrans",
-        "ffmpeg": std::process::Command::new("ffmpeg").arg("-version").output()
-            .ok()
-            .and_then(|o| String::from_utf8(o.stdout).ok())
-            .and_then(|s| s.lines().next().map(|l| l.to_string()))
-            .unwrap_or_else(|| "ffmpeg not found".into()),
+        "ffmpeg": ffmpeg_version_line(),
         "time": now_ms()
     }))
 }
 
 async fn codecs() -> impl IntoResponse {
     // filter video codecs to those actually present in this ffmpeg build
+    let encoders = ffmpeg_encoders();
     let catalog = codec_catalog();
     let mut vc = vec![];
     if let Some(arr) = catalog.get("videoCodecs").and_then(|v| v.as_array()) {
         for c in arr {
             let id = c.get("id").and_then(|x| x.as_str()).unwrap_or("");
-            if encoder_exists(id) {
+            if encoders.contains(id) {
                 vc.push(c.clone());
             }
         }
@@ -4320,11 +4491,29 @@ struct ScanReq {
 }
 
 /// GET /api/library -> {root, count, entries}
-async fn library_get(State(store): State<Store>) -> Response {
-    let s = store.lock().unwrap();
+async fn library_get(State(store): State<Store>, headers: axum::http::HeaderMap) -> Response {
+    // Conditional request: the UI polls every few seconds — when the catalog
+    // is unchanged, answer 304 with an empty body instead of ~1MB of JSON.
+    let etag = format!("\"{}\"", CATALOG_VERSION.load(std::sync::atomic::Ordering::Relaxed));
+    if let Some(inm) = headers.get(axum::http::header::IF_NONE_MATCH) {
+        if inm.to_str().ok() == Some(etag.as_str()) {
+            return (
+                StatusCode::NOT_MODIFIED,
+                [(axum::http::header::ETAG.to_string(), etag)],
+                axum::body::Body::empty(),
+            )
+                .into_response();
+        }
+    }
+    let s = store.lock().unwrap_or_else(|p| p.into_inner());
     let root = s.storage_root().to_string();
     let entries = s.list_library();
-    Json(json!({"root": root, "count": entries.len(), "entries": entries})).into_response()
+    (
+        StatusCode::OK,
+        [(axum::http::header::ETAG.to_string(), etag)],
+        Json(json!({"root": root, "count": entries.len(), "entries": entries})),
+    )
+        .into_response()
 }
 
 #[derive(Deserialize)]
@@ -4481,7 +4670,7 @@ async fn library_scan(State(store): State<Store>, Json(req): Json<ScanReq>) -> R
     let _scan_guard = match SCAN_LOCK.try_lock() {
         Ok(g) => g,
         Err(_) => {
-            let st = SCAN_STATE.lock().unwrap().clone();
+            let st = SCAN_STATE.lock().unwrap_or_else(|p| p.into_inner()).clone();
             return Json(json!({
                 "ok": true,
                 "alreadyRunning": true,
@@ -4497,8 +4686,7 @@ async fn library_scan(State(store): State<Store>, Json(req): Json<ScanReq>) -> R
     // output of the current catalog.
     let out_names: std::collections::HashSet<String> = {
         let mut n: std::collections::HashSet<String> = store
-            .lock()
-            .unwrap()
+            .lock().unwrap_or_else(|p| p.into_inner())
             .list_library()
             .into_iter()
             .filter_map(|e| e.reencoded)
@@ -4532,7 +4720,7 @@ async fn library_scan(State(store): State<Store>, Json(req): Json<ScanReq>) -> R
                         Some(f) => format!("{f}/{}", rel.to_string_lossy()),
                         None => rel.to_string_lossy().to_string(),
                     };
-                    if !store.lock().unwrap().library.contains_key(&key) {
+                    if !store.lock().unwrap_or_else(|p| p.into_inner()).library.contains_key(&key) {
                         continue;
                     }
                 }
@@ -4541,7 +4729,7 @@ async fn library_scan(State(store): State<Store>, Json(req): Json<ScanReq>) -> R
         }
         v
     };
-    *SCAN_STATE.lock().unwrap() = ScanState {
+    *SCAN_STATE.lock().unwrap_or_else(|p| p.into_inner()) = ScanState {
         active: true,
         scanned: 0,
         total: plan.len(),
@@ -4553,7 +4741,7 @@ async fn library_scan(State(store): State<Store>, Json(req): Json<ScanReq>) -> R
     // Carry-forward + probe-reuse both need the previous catalog — fetch
     // it once (the queue phase below reuses the live-job set too).
     let (old_entries, live) = {
-        let s = store.lock().unwrap();
+        let s = store.lock().unwrap_or_else(|p| p.into_inner());
         let live: std::collections::HashSet<String> = s
             .list()
             .into_iter()
@@ -4649,7 +4837,7 @@ async fn library_scan(State(store): State<Store>, Json(req): Json<ScanReq>) -> R
     for h in handles {
         if let Ok(Some(e)) = h.await {
             entries.push(e);
-            SCAN_STATE.lock().unwrap().scanned += 1;
+            SCAN_STATE.lock().unwrap_or_else(|p| p.into_inner()).scanned += 1;
         }
     }
 
@@ -4676,7 +4864,7 @@ async fn library_scan(State(store): State<Store>, Json(req): Json<ScanReq>) -> R
     };
     for e in entries.iter_mut() {
         let key = e.key();
-        if let Some(o) = old.iter().find(|o| o.key() == key) {
+        if let Some(o) = old_map.get(&key) {
             let keep = match o.status.as_str() {
                 "done" => true,
                 // Skipped files stay skipped across rescans (the skip list) —
@@ -4721,7 +4909,7 @@ async fn library_scan(State(store): State<Store>, Json(req): Json<ScanReq>) -> R
     // blocks top-down (first match wins); fall back to the folder's default
     // target (or the legacy auto.json for ad-hoc roots).
     let online: Vec<Node> = {
-        let c = store.lock().unwrap().redis();
+        let c = store.lock().unwrap_or_else(|p| p.into_inner()).redis();
         list_nodes_redis(c, "online", None, None).await
     };
     let has_blocks = libcfg.blocks.iter().any(|b| b.enabled);
@@ -4780,9 +4968,8 @@ async fn library_scan(State(store): State<Store>, Json(req): Json<ScanReq>) -> R
         // auto-scan cheap: a long queue merely waiting for a free node gets
         // re-queued, not re-decoded (that re-decode storm pegged the CPU).
         if entries[i].decision.as_ref().is_some_and(|d| !d.is_empty()) {
-            let size_changed = old
-                .iter()
-                .find(|o| o.key() == entries[i].key())
+            let size_changed = old_map
+                .get(&entries[i].key())
                 .is_some_and(|o| o.size != entries[i].size);
             if !size_changed {
                 redispatch.push(i);
@@ -4829,7 +5016,7 @@ async fn library_scan(State(store): State<Store>, Json(req): Json<ScanReq>) -> R
             {
                 let key = entries[i].key();
                 let e3 = entries[i].clone();
-                let mut s = store.lock().unwrap();
+                let mut s = store.lock().unwrap_or_else(|p| p.into_inner());
                 if s.library.contains_key(&key) {
                     if let Some(e2) = s.library.get_mut(&key) {
                         *e2 = e3;
@@ -4873,12 +5060,12 @@ async fn library_scan(State(store): State<Store>, Json(req): Json<ScanReq>) -> R
         };
         if let Ok(true) = dispatch_lib_job(&store, &e, &d.target, &d.post, d.hw_only).await {
             let key = e.key();
-            let mut s = store.lock().unwrap();
+            let mut s = store.lock().unwrap_or_else(|p| p.into_inner());
             s.update_library_entry(&key, |en| {
                 en.status = "queued".into();
             });
             drop(s);
-            SCAN_STATE.lock().unwrap().finished_queued += 1;
+            SCAN_STATE.lock().unwrap_or_else(|p| p.into_inner()).finished_queued += 1;
         }
     }
     // Pass 2 — one streaming task per surviving file.
@@ -5062,7 +5249,7 @@ async fn library_scan(State(store): State<Store>, Json(req): Json<ScanReq>) -> R
                     }
                 }
                 {
-                    let mut s = store_t.lock().unwrap();
+                    let mut s = store_t.lock().unwrap_or_else(|p| p.into_inner());
                     if s.library.contains_key(&key) {
                         if let Some(e2) = s.library.get_mut(&key) {
                             *e2 = e3;
@@ -5074,10 +5261,10 @@ async fn library_scan(State(store): State<Store>, Json(req): Json<ScanReq>) -> R
                 if let Some(mark) = &outcome {
                     match mark.as_str() {
                         "queued" => {
-                            SCAN_STATE.lock().unwrap().finished_queued += 1;
+                            SCAN_STATE.lock().unwrap_or_else(|p| p.into_inner()).finished_queued += 1;
                         }
                         "skip" => {
-                            SCAN_STATE.lock().unwrap().finished_skipped += 1;
+                            SCAN_STATE.lock().unwrap_or_else(|p| p.into_inner()).finished_skipped += 1;
                         }
                         _ => {}
                     }
@@ -5088,12 +5275,17 @@ async fn library_scan(State(store): State<Store>, Json(req): Json<ScanReq>) -> R
     }
     // Collect outcomes as each file's task finishes (streaming: the queue
     // is already filling while this loop is still waiting on the tail).
+    // Key -> index map so the per-file status update is O(1) (a linear
+    // find per file made a 4k scan O(N^2) = ~16M key comparisons).
+    let entry_idx: std::collections::HashMap<String, usize> =
+        entries.iter().enumerate().map(|(i, e)| (e.key(), i)).collect();
     let mut queued: Vec<String> = Vec::new();
     let mut skipped: Vec<String> = Vec::new();
     for h in handles {
         if let Ok((key, outcome)) = h.await {
             let mark = outcome.unwrap_or_default();
-            if let Some(e2) = entries.iter_mut().find(|x| x.key() == key) {
+            if let Some(&idx) = entry_idx.get(&key) {
+                let e2 = &mut entries[idx];
                 match mark.as_str() {
                     "skip" => {
                         e2.status = "skipped".into();
@@ -5123,14 +5315,14 @@ async fn library_scan(State(store): State<Store>, Json(req): Json<ScanReq>) -> R
     let all = {
         let mut v = entries.clone();
         v.extend(carried);
-        let mut s = store.lock().unwrap();
+        let mut s = store.lock().unwrap_or_else(|p| p.into_inner());
         s.set_library(v.clone());
         v
     };
     let scanned = entries.len();
     // Mark the scan finished (the UI keeps showing the last-run summary).
     {
-        let mut st = SCAN_STATE.lock().unwrap();
+        let mut st = SCAN_STATE.lock().unwrap_or_else(|p| p.into_inner());
         st.active = false;
         st.scanned = scanned;
         st.total = scanned;
@@ -5150,7 +5342,7 @@ async fn library_scan(State(store): State<Store>, Json(req): Json<ScanReq>) -> R
 
 /// GET /api/library/scan/progress — live (or last-run) scan progress.
 async fn scan_progress(State(_store): State<Store>) -> impl IntoResponse {
-    let st = SCAN_STATE.lock().unwrap().clone();
+    let st = SCAN_STATE.lock().unwrap_or_else(|p| p.into_inner()).clone();
     Json(serde_json::to_value(st).unwrap())
 }
 
@@ -5324,7 +5516,7 @@ async fn transcode(State(store): State<Store>, Json(req): Json<TranscodeReq>) ->
     };
     let job_for_worker = job.clone();
     {
-        let mut s = store.lock().unwrap();
+        let mut s = store.lock().unwrap_or_else(|p| p.into_inner());
         s.insert(job);
     }
     let store2 = store.clone();
@@ -5334,8 +5526,7 @@ async fn transcode(State(store): State<Store>, Json(req): Json<TranscodeReq>) ->
 
 async fn list_jobs(State(store): State<Store>) -> impl IntoResponse {
     let v: Vec<Value> = store
-        .lock()
-        .unwrap()
+        .lock().unwrap_or_else(|p| p.into_inner())
         .list()
         .into_iter()
         .map(serde_json::to_value)
@@ -5345,7 +5536,7 @@ async fn list_jobs(State(store): State<Store>) -> impl IntoResponse {
 }
 
 async fn get_job(State(store): State<Store>, UrlPath(id): UrlPath<String>) -> Response {
-    match store.lock().unwrap().get(&id) {
+    match store.lock().unwrap_or_else(|p| p.into_inner()).get(&id) {
         Some(j) => match serde_json::to_value(j) {
             Ok(v) => Json(v).into_response(),
             Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e.to_string()}))).into_response(),
@@ -5360,7 +5551,7 @@ async fn get_job(State(store): State<Store>, UrlPath(id): UrlPath<String>) -> Re
 /// progress report (≤10s heartbeat) and kills ffmpeg.
 async fn cancel_job(State(store): State<Store>, UrlPath(id): UrlPath<String>) -> Response {
     let (st, node_id) = {
-        let s = store.lock().unwrap();
+        let s = store.lock().unwrap_or_else(|p| p.into_inner());
         let j = s.jobs.get(&id);
         (
             j.map(|j| j.status.clone()),
@@ -5370,7 +5561,7 @@ async fn cancel_job(State(store): State<Store>, UrlPath(id): UrlPath<String>) ->
     match st {
         None => (StatusCode::NOT_FOUND, Json(json!({"error": "job not found"}))).into_response(),
         Some(s) if s == "queued" => {
-            store.lock().unwrap().remove(&id);
+            store.lock().unwrap_or_else(|p| p.into_inner()).remove(&id);
             Json(json!({"ok": true, "cancelled": id})).into_response()
         }
         Some(s) if s == "dispatched" || s == "running" => {
@@ -5378,7 +5569,7 @@ async fn cancel_job(State(store): State<Store>, UrlPath(id): UrlPath<String>) ->
             // progress report (≤10s heartbeat) and kills ffmpeg. The entry
             // is re-armed to pending when the node confirms the stop.
             {
-                let mut s = store.lock().unwrap();
+                let mut s = store.lock().unwrap_or_else(|p| p.into_inner());
                 if let Some(j) = s.jobs.get_mut(&id) {
                     j.status = "cancelled".into();
                     j.error = Some("사용자 취소 — 중지됨".into());
@@ -5386,7 +5577,7 @@ async fn cancel_job(State(store): State<Store>, UrlPath(id): UrlPath<String>) ->
                 }
             }
             if let Some(nid) = node_id {
-                let c = store.lock().unwrap().redis();
+                let c = store.lock().unwrap_or_else(|p| p.into_inner()).redis();
                 let _ = set_current_job(c, &nid, None).await;
             }
             Json(json!({"ok": true, "cancelled": id})).into_response()
@@ -5406,7 +5597,7 @@ async fn cancel_job(State(store): State<Store>, UrlPath(id): UrlPath<String>) ->
 /// kept (a worker may be mid-encode; history stays intact).
 async fn clear_jobs(State(store): State<Store>) -> Response {
     let gone = {
-        let mut s = store.lock().unwrap();
+        let mut s = store.lock().unwrap_or_else(|p| p.into_inner());
         let queued: Vec<String> = s
             .jobs
             .iter()
@@ -5430,15 +5621,16 @@ async fn download(UrlPath(name): UrlPath<String>) -> Response {
     if !path.exists() {
         return (StatusCode::NOT_FOUND, Json(json!({"error": "file not found"}))).into_response();
     }
-    let bytes = match std::fs::read(&path) {
-        Ok(b) => b,
-        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e.to_string()}))).into_response(),
-    };
-    let headers = [
-        ("content-type".to_string(), "application/octet-stream".to_string()),
-        ("content-disposition".to_string(), format!("attachment; filename={name}")),
-    ];
-    (StatusCode::OK, headers, bytes).into_response()
+    // Stream to the client (chunked) — never buffer a multi-GB output in RAM.
+    let mut resp = file_response(&path).await;
+    {
+        let h = resp.headers_mut();
+        h.insert(
+            axum::http::header::CONTENT_DISPOSITION,
+            format!("attachment; filename={name}").parse().unwrap(),
+        );
+    }
+    resp
 }
 
 // ============================================================
@@ -5476,14 +5668,17 @@ async fn node_register(State(store): State<Store>, Json(req): Json<RegisterReq>)
     );
     // idempotent re-register by name — the id is looked up in Redis, so a
     // node keeps its identity across server (and its own) restarts.
-    let mut c = store.lock().unwrap().redis();
+    let mut c = store.lock().unwrap_or_else(|p| p.into_inner()).redis();
     let already: Option<String> = redis::cmd("GET")
         .arg(rk_name(&req.name))
         .query_async(&mut c)
         .await
         .ok()
         .flatten();
-    let node = reg_node(c, &req.name, &ffmpeg_version, &haccels, &hw_encoders, &accels, &diag).await;
+    let node = match reg_node(c, &req.name, &ffmpeg_version, &haccels, &hw_encoders, &accels, &diag).await {
+        Ok(n) => n,
+        Err(e) => return (StatusCode::BAD_GATEWAY, Json(json!({ "error": e }))).into_response(),
+    };
     Json(json!({"nodeId": node.id, "new": already.is_none()})).into_response()
 }
 
@@ -5495,7 +5690,7 @@ async fn node_heartbeat(
     body: Option<Json<HeartbeatStats>>,
 ) -> Response {
     let stats = body.map(|b| b.0).unwrap_or_default();
-    let c = store.lock().unwrap().redis();
+    let c = store.lock().unwrap_or_else(|p| p.into_inner()).redis();
     match beat_node(c, &id, &stats).await {
         Some(n) => match serde_json::to_value(n) {
             Ok(v) => Json(json!({"ok": true, "node": v})).into_response(),
@@ -5528,7 +5723,7 @@ async fn node_config_patch(
     UrlPath(id): UrlPath<String>,
     Json(body): Json<NodeConfigBody>,
 ) -> Response {
-    let mut c = store.lock().unwrap().redis();
+    let mut c = store.lock().unwrap_or_else(|p| p.into_inner()).redis();
     // Read current so we can validate + return the merged node.
     let before: NodeHash = match redis::cmd("HGETALL")
         .arg(rk_node(&id))
@@ -5600,7 +5795,7 @@ struct NodeFilter {
 }
 
 async fn list_nodes(State(store): State<Store>, Query(f): Query<NodeFilter>) -> impl IntoResponse {
-    let c = store.lock().unwrap().redis();
+    let c = store.lock().unwrap_or_else(|p| p.into_inner()).redis();
     let status = f.status.as_deref().unwrap_or("online");
     let v: Vec<Value> = list_nodes_redis(c, status, f.backend.as_deref(), f.family.as_deref())
         .await
@@ -5615,8 +5810,7 @@ async fn list_nodes(State(store): State<Store>, Query(f): Query<NodeFilter>) -> 
 /// registered yet). Each carries its name, ip, port and HW encoders.
 async fn list_discovered_nodes(State(store): State<Store>) -> impl IntoResponse {
     let v: Vec<Value> = store
-        .lock()
-        .unwrap()
+        .lock().unwrap_or_else(|p| p.into_inner())
         .list_discovered()
         .into_iter()
         .map(serde_json::to_value)
@@ -5697,15 +5891,18 @@ async fn search_node(State(store): State<Store>, Json(req): Json<SearchReq>) -> 
     };
 
     // 3. Upsert into the Redis registry (idempotent by name).
-    let c = store.lock().unwrap().redis();
-    let node = reg_node(c, &name, &ffmpeg_version, &haccels, &hw_encoders, &accels, &[]).await;
+    let c = store.lock().unwrap_or_else(|p| p.into_inner()).redis();
+    let node = match reg_node(c, &name, &ffmpeg_version, &haccels, &hw_encoders, &accels, &[]).await {
+        Ok(n) => n,
+        Err(e) => return (StatusCode::BAD_GATEWAY, Json(json!({ "error": e }))).into_response(),
+    };
 
     Json(serde_json::to_value(node).unwrap_or(Value::Null)).into_response()
 }
 
 /// GET /api/nodes/:id — one node.
 async fn get_node(State(store): State<Store>, UrlPath(id): UrlPath<String>) -> Response {
-    let c = store.lock().unwrap().redis();
+    let c = store.lock().unwrap_or_else(|p| p.into_inner()).redis();
     match hgetall_node(c, &id).await {
         Some(n) => match serde_json::to_value(n) {
             Ok(v) => Json(v).into_response(),
@@ -5720,7 +5917,7 @@ async fn get_node(State(store): State<Store>, UrlPath(id): UrlPath<String>) -> R
 /// adapt (e.g. raise/lower its concurrent-job pool).
 async fn node_poll(State(store): State<Store>, UrlPath(id): UrlPath<String>) -> Response {
     let node = {
-        let c = store.lock().unwrap().redis();
+        let c = store.lock().unwrap_or_else(|p| p.into_inner()).redis();
         match hgetall_node(c, &id).await {
             Some(n) => n,
             None => return (StatusCode::NOT_FOUND, Json(json!({"error": "unknown node"}))).into_response(),
@@ -5733,9 +5930,9 @@ async fn node_poll(State(store): State<Store>, UrlPath(id): UrlPath<String>) -> 
     });
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
     loop {
-        let claimed = store.lock().unwrap().claim_for_node(&id);
+        let claimed = store.lock().unwrap_or_else(|p| p.into_inner()).claim_for_node(&id);
         if let Some(job) = claimed {
-            let c = store.lock().unwrap().redis();
+            let c = store.lock().unwrap_or_else(|p| p.into_inner()).redis();
             let _ = set_current_job(c, &id, Some(&job.id)).await;
             return match serde_json::to_value(job) {
                 Ok(v) => Json(json!({"job": v, "config": cfg})).into_response(),
@@ -5755,7 +5952,7 @@ async fn node_poll(State(store): State<Store>, UrlPath(id): UrlPath<String>) -> 
 /// queue drains continuously instead of in bursts per auto-scan.
 async fn sweep_redispatch(store: &Store, limit: usize) {
     let candidates: Vec<LibraryEntry> = {
-        let s = store.lock().unwrap();
+        let s = store.lock().unwrap_or_else(|p| p.into_inner());
         s.library
             .values()
             .filter(|e| {
@@ -5780,7 +5977,7 @@ async fn sweep_redispatch(store: &Store, limit: usize) {
         };
         if let Ok(true) = dispatch_lib_job(store, &e, &d.target, &d.post, d.hw_only).await {
             let key = e.key();
-            let mut s = store.lock().unwrap();
+            let mut s = store.lock().unwrap_or_else(|p| p.into_inner());
             s.update_library_entry(&key, |en| {
                 en.status = "queued".into();
             });
@@ -5814,14 +6011,13 @@ struct ReportReq {
 async fn node_report(State(store): State<Store>, UrlPath(id): UrlPath<String>, Json(req): Json<ReportReq>) -> Response {
     let req_error = req.error.clone();
     let was_cancelled = store
-        .lock()
-        .unwrap()
+        .lock().unwrap_or_else(|p| p.into_inner())
         .jobs
         .get(&req.job_id)
         .map(|j| j.status == "cancelled")
         .unwrap_or(false);
     {
-        let mut s = store.lock().unwrap();
+        let mut s = store.lock().unwrap_or_else(|p| p.into_inner());
         if let Some(j) = s.jobs.get_mut(&req.job_id) {
             if !was_cancelled {
                 // A cancelled job keeps its status — the node's final
@@ -5849,7 +6045,7 @@ async fn node_report(State(store): State<Store>, UrlPath(id): UrlPath<String>, J
         }
     }
     if req.status == "done" || req.status == "error" {
-        let c = store.lock().unwrap().redis();
+        let c = store.lock().unwrap_or_else(|p| p.into_inner()).redis();
         let _ = set_current_job(c, &id, None).await;
     }
     // Keep the nodes fed: a worker slot just freed up — re-dispatch
@@ -5866,7 +6062,7 @@ async fn node_report(State(store): State<Store>, UrlPath(id): UrlPath<String>, J
         if let Some(oon) = &req.output_file {
             let p = outputs_dir().join(oon);
             let expected = req.output_size.unwrap_or(0);
-            let sz = wait_file_size(&p, expected);
+            let sz = wait_file_size(&p, expected).await;
             if expected == 0 || sz != expected {
                 let _ = std::fs::remove_file(&p);
                 return (
@@ -5882,7 +6078,7 @@ async fn node_report(State(store): State<Store>, UrlPath(id): UrlPath<String>, J
     // A user-cancelling stop re-arms the entry as plain pending instead.
     if req.status == "error" {
         let (lp, cancelled) = {
-            let s = store.lock().unwrap();
+            let s = store.lock().unwrap_or_else(|p| p.into_inner());
             let j = s.jobs.get(&req.job_id);
             (
                 j.and_then(|j| j.lib_path.clone()),
@@ -5891,7 +6087,7 @@ async fn node_report(State(store): State<Store>, UrlPath(id): UrlPath<String>, J
         };
         if let Some(lp) = lp {
             {
-                let mut s = store.lock().unwrap();
+                let mut s = store.lock().unwrap_or_else(|p| p.into_inner());
                 s.update_library_entry(&lp, |e| {
                     if cancelled {
                         e.status = "pending".into();
@@ -5908,8 +6104,7 @@ async fn node_report(State(store): State<Store>, UrlPath(id): UrlPath<String>, J
     }
     let cancel = was_cancelled
         || store
-            .lock()
-            .unwrap()
+            .lock().unwrap_or_else(|p| p.into_inner())
             .jobs
             .get(&req.job_id)
             .map(|j| j.status == "cancelled")
@@ -5943,7 +6138,7 @@ async fn node_fetch_file(State(store): State<Store>, UrlPath((_id, name)): UrlPa
                 .filter(|p| p.is_file())
                 .or_else(|| {
                     // 3) legacy: relative to the storage root
-                    let root = store.lock().unwrap().storage_root().to_string();
+                    let root = store.lock().unwrap_or_else(|p| p.into_inner()).storage_root().to_string();
                     let rp = PathBuf::from(root).join(&name);
                     rp.is_file().then_some(rp)
                 })
@@ -6004,16 +6199,19 @@ async fn file_response(path: &std::path::Path) -> Response {
 /// write-size metadata lag after buffered writes (write() returns Ok before
 /// the size catches up — reproducible with `examples/fstest`), so stat once
 /// more for up to ~2s after rename/copy before trusting the size.
-fn wait_file_size(path: &std::path::Path, expected: u64) -> u64 {
+/// Wait (non-blocking) until the file reports `expected` bytes — on some NAS
+/// filesystems the size metadata lags the final write. Async: a job-completion
+/// burst must not park tokio worker threads on std::thread::sleep.
+async fn wait_file_size(path: &std::path::Path, expected: u64) -> u64 {
     for _ in 0..40 {
-        if let Some(len) = std::fs::metadata(path).map(|m| m.len()).ok() {
+        if let Ok(len) = tokio::fs::metadata(path).await.map(|m| m.len()) {
             if len == expected {
                 return len;
             }
         }
-        std::thread::sleep(std::time::Duration::from_millis(50));
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     }
-    std::fs::metadata(path).map(|m| m.len()).unwrap_or(0)
+    tokio::fs::metadata(path).await.map(|m| m.len()).unwrap_or(0)
 }
 
 /// POST /api/nodes/:id/result — a node uploads a finished output (multipart:
@@ -6109,7 +6307,7 @@ async fn node_result(State(store): State<Store>, UrlPath(id): UrlPath<String>, m
     // A cancelled job's upload must not materialize: the user stopped this
     // attempt — discard the staged artifact and leave the catalog untouched.
     {
-        let st = store.lock().unwrap().jobs.get(&job_id).map(|j| j.status.clone());
+        let st = store.lock().unwrap_or_else(|p| p.into_inner()).jobs.get(&job_id).map(|j| j.status.clone());
         if st.as_deref() == Some("cancelled") {
             let _ = std::fs::remove_file(&tmp_path);
             return Json(json!({ "ok": true, "ignored": "cancelled" })).into_response();
@@ -6122,7 +6320,7 @@ async fn node_result(State(store): State<Store>, UrlPath(id): UrlPath<String>, m
     }
     // Verify the on-disk size actually reached tmp_size before trusting the
     // artifact (write-size metadata lag on this host — see wait_file_size).
-    let sz_on_disk = wait_file_size(&path, tmp_size);
+    let sz_on_disk = wait_file_size(&path, tmp_size).await;
     if sz_on_disk != tmp_size {
         eprintln!("[node_result] VERIFY FAIL {out_name}: expected {tmp_size} on-disk={sz_on_disk} job={job_id}");
         let _ = std::fs::remove_file(&path);
@@ -6131,7 +6329,7 @@ async fn node_result(State(store): State<Store>, UrlPath(id): UrlPath<String>, m
     let size = tmp_size;
     // Library-automation jobs land next to the source file, not in outputs/.
     let lp = {
-        let mut s = store.lock().unwrap();
+        let mut s = store.lock().unwrap_or_else(|p| p.into_inner());
         let lp = s.jobs.get(&job_id).and_then(|j| j.lib_path.clone());
         if let Some(j) = s.jobs.get_mut(&job_id) {
             j.output_file = out_name.clone();
@@ -6156,8 +6354,7 @@ async fn node_result(State(store): State<Store>, UrlPath(id): UrlPath<String>, m
 /// node that moved the file itself and reported `localStage` — node_report).
 async fn finish_lib_job(store: &Store, job_id: String, out_name: String, size: u64) -> Response {
     let lp = store
-        .lock()
-        .unwrap()
+        .lock().unwrap_or_else(|p| p.into_inner())
         .jobs
         .get(&job_id)
         .and_then(|j| j.lib_path.clone())
@@ -6170,7 +6367,7 @@ async fn finish_lib_job(store: &Store, job_id: String, out_name: String, size: u
     };
     let path = outputs_dir().join(out_name.clone());
     let (post_plan, src_dur) = {
-        let s = store.lock().unwrap();
+        let s = store.lock().unwrap_or_else(|p| p.into_inner());
         let jp = s.jobs.get(&job_id).map(|j| j.post.clone()).unwrap_or_default();
         let sd = s.library.get(&lp).and_then(|e| e.duration);
         (jp, sd)
@@ -6178,7 +6375,7 @@ async fn finish_lib_job(store: &Store, job_id: String, out_name: String, size: u
     let src_name = src.file_name().and_then(|x| x.to_str()).unwrap_or("").to_string();
     let fail = |msg: String, lp: &str, job_id: &str, store: &Store| -> Response {
         {
-            let mut s = store.lock().unwrap();
+            let mut s = store.lock().unwrap_or_else(|p| p.into_inner());
             s.update_library_entry(&lp, |e| {
                 e.status = "error".into();
                 e.error = Some(msg.clone());
@@ -6220,7 +6417,7 @@ async fn finish_lib_job(store: &Store, job_id: String, out_name: String, size: u
     };
     // The artifact is only "done" when the DEST file's size is
     // verified equal to the uploaded size — never before.
-    let dsize = wait_file_size(&dest, size);
+    let dsize = wait_file_size(&dest, size).await;
     if !moved || dsize != size {
         eprintln!("[node_result] VERIFY FAIL dest {out_name}: moved={moved} dest_size={dsize} expected={size} job={job_id}");
         let _ = std::fs::remove_file(&dest);
@@ -6267,7 +6464,7 @@ async fn finish_lib_job(store: &Store, job_id: String, out_name: String, size: u
                         // Quarantine the SOURCE in the fail
                         // folder (settings) instead of
                         // erroring/requeueing.
-                        let entry = store.lock().unwrap().library.get(&lp).cloned();
+                        let entry = store.lock().unwrap_or_else(|p| p.into_inner()).library.get(&lp).cloned();
                         if let Some(en) = entry {
                             match move_to_fail_folder(
                                 &store,
@@ -6278,7 +6475,7 @@ async fn finish_lib_job(store: &Store, job_id: String, out_name: String, size: u
                             ) {
                                 Ok(fp) => {
                                     {
-                                        let mut s = store.lock().unwrap();
+                                        let mut s = store.lock().unwrap_or_else(|p| p.into_inner());
                                         let msg = format!(
                                             "출력 검증 실패 — 실패 보관함으로 이동: {}",
                                             fp.display()
@@ -6314,7 +6511,7 @@ async fn finish_lib_job(store: &Store, job_id: String, out_name: String, size: u
                             "health check failed: output video={vdbg} duration={odur}s (source {src_dur:?}s) — requeued"
                         );
                         {
-                            let mut s = store.lock().unwrap();
+                            let mut s = store.lock().unwrap_or_else(|p| p.into_inner());
                             s.update_library_entry(&lp, |e| {
                                 e.status = "pending".into();
                                 e.error = Some(msg.clone());
@@ -6358,7 +6555,7 @@ async fn finish_lib_job(store: &Store, job_id: String, out_name: String, size: u
                 } else {
                     true
                 };
-                if !r1 || wait_file_size(&src, size) != size {
+                if !r1 || wait_file_size(&src, size).await != size {
                     // The original may already be gone — best
                     // effort: restore it from the finished file
                     // (same content, at least the path exists).
@@ -6369,7 +6566,7 @@ async fn finish_lib_job(store: &Store, job_id: String, out_name: String, size: u
                 }
                 replaced = true;
                 {
-                    let mut s = store.lock().unwrap();
+                    let mut s = store.lock().unwrap_or_else(|p| p.into_inner());
                     let eff = s
                         .jobs
                         .get(&job_id)
@@ -6406,8 +6603,7 @@ async fn finish_lib_job(store: &Store, job_id: String, out_name: String, size: u
                 // Clone the entry out of the lock BEFORE the await (never
                 // hold the store lock across an async command).
                 let entry = store
-                    .lock()
-                    .unwrap()
+                    .lock().unwrap_or_else(|p| p.into_inner())
                     .library
                     .get(&lp)
                     .cloned();
@@ -6438,7 +6634,7 @@ async fn finish_lib_job(store: &Store, job_id: String, out_name: String, size: u
     }
     if !replaced {
         {
-            let mut s = store.lock().unwrap();
+            let mut s = store.lock().unwrap_or_else(|p| p.into_inner());
             let eff = s
                 .jobs
                 .get(&job_id)
@@ -6453,7 +6649,7 @@ async fn finish_lib_job(store: &Store, job_id: String, out_name: String, size: u
         }
     }
     if requeue {
-        let mut s = store.lock().unwrap();
+        let mut s = store.lock().unwrap_or_else(|p| p.into_inner());
         s.update_library_entry(&lp, |e| {
             e.status = "pending".into();
         });
@@ -6496,7 +6692,7 @@ async fn dispatch(State(store): State<Store>, Json(req): Json<DispatchReq>) -> R
     let container = req.container.unwrap_or_else(|| "mp4".into());
 
     let (node_id, node_name, effective, accelerated, gpu_device) = {
-        let c = store.lock().unwrap().redis();
+        let c = store.lock().unwrap_or_else(|p| p.into_inner()).redis();
         let online = list_nodes_redis(c, "online", None, None).await;
         let counts = active_jobs_by_node(&store, None);
         let idx = if let Some(nid) = &req.node_id {
@@ -6568,7 +6764,7 @@ async fn dispatch(State(store): State<Store>, Json(req): Json<DispatchReq>) -> R
         local_input: None,
         local_output: Some(outputs_dir().to_string_lossy().to_string()),
     };
-    store.lock().unwrap().insert(job);
+    store.lock().unwrap_or_else(|p| p.into_inner()).insert(job);
     Json(json!({
         "id": id,
         "nodeId": node_id,
@@ -6605,12 +6801,12 @@ async fn main() {
     // Restore the persisted library catalog (survives restarts — a rescan
     // must not re-queue finished files).
     {
-        let mut s = store.lock().unwrap();
+        let mut s = store.lock().unwrap_or_else(|p| p.into_inner());
         s.set_library(load_catalog());
     }
     println!(
         "[CodecTrans] library catalog: {} entries",
-        store.lock().unwrap().list_library().len()
+        store.lock().unwrap_or_else(|p| p.into_inner()).list_library().len()
     );
 
     // GPU availability for the scan's health decode: probe the bundled
@@ -6774,7 +6970,7 @@ async fn spawn_mdns(store: &Store, port: u16) {
                                 ffmpeg_version: ff,
                                 last_seen: now_ms(),
                             };
-                            let mut st = store.lock().unwrap();
+                            let mut st = store.lock().unwrap_or_else(|p| p.into_inner());
                             st.upsert_discovered(d);
                         }
                         Ok(_) => {}
@@ -6792,7 +6988,7 @@ async fn spawn_mdns(store: &Store, port: u16) {
         tokio::spawn(async move {
             loop {
                 tokio::time::sleep(std::time::Duration::from_secs(5)).await;
-                store.lock().unwrap().prune_discovered(15_000);
+                store.lock().unwrap_or_else(|p| p.into_inner()).prune_discovered(15_000);
             }
         });
     }
@@ -6801,23 +6997,100 @@ async fn spawn_mdns(store: &Store, port: u16) {
     //    (node died during claim/download before ever reporting "running")
     //    goes back to the queue so another node (or the same one, later)
     //    can pick it up instead of the file being stranded forever.
+    //    A "running" job whose NODE has been offline for 5+ minutes is
+    //    marked error (node lost) and its entry reset to pending — without
+    //    this, an encode interrupted by a node power loss is stuck "running"
+    //    until someone cancels it by hand.
     //    Orphaned ENTRIES (a server restart wiped the in-memory job queue,
     //    but the persistent catalog still says "queued"/"running") are
     //    reset to "pending" so the next scan re-arms them.
     {
         let store = store.clone();
+        let rc = store.lock().unwrap_or_else(|p| p.into_inner()).redis();
+        // job_id -> unix ms when its node was first seen offline (survives
+        // across ticks so a node RESTART doesn't kill a healthy encode).
+        let mut node_down_since: std::collections::HashMap<String, i64> = std::collections::HashMap::new();
         tokio::spawn(async move {
             loop {
                 tokio::time::sleep(std::time::Duration::from_secs(30)).await;
                 let now = now_ms();
+                // --- running jobs on nodes that are gone ---
+                let running: Vec<(String, String)> = store
+                    .lock().unwrap_or_else(|p| p.into_inner())
+                    .jobs
+                    .values()
+                    .filter(|j| j.status == "running" && j.node_id.is_some())
+                    .map(|j| (j.id.clone(), j.node_id.clone().unwrap()))
+                    .collect();
+                let mut changed = false;
+                if !running.is_empty() {
+                    // node_id -> online? (one Redis round-trip per UNIQUE node)
+                    let mut liveness: std::collections::HashMap<String, bool> = std::collections::HashMap::new();
+                    for (_, nid) in &running {
+                        if !liveness.contains_key(nid) {
+                            let on = hgetall_node(rc.clone(), nid)
+                                .await
+                                .map(|n| n.status == "online")
+                                .unwrap_or(false);
+                            liveness.insert(nid.clone(), on);
+                        }
+                    }
+                    for (jid, nid) in &running {
+                        match liveness.get(nid) {
+                            Some(true) => {
+                                node_down_since.remove(jid);
+                            }
+                            Some(false) => {
+                                let since = node_down_since.entry(jid.clone()).or_insert(now);
+                                if now - *since > 300_000 {
+                                    let entry_key = {
+                                        let s = store.lock().unwrap_or_else(|p| p.into_inner());
+                                        s.jobs.get(jid).map(|j| j.input_file.clone())
+                                    };
+                                    let mut s = store.lock().unwrap_or_else(|p| p.into_inner());
+                                    if let Some(j) = s.jobs.get_mut(jid) {
+                                        j.status = "error".to_string();
+                                        j.error = Some(format!("node {nid} lost (offline 5m+) during encode"));
+                                        j.finished_at = Some(now);
+                                    }
+                                    if let Some(k) = entry_key {
+                                        let key = k.clone();
+                                        if let Some(e) = s.library.get_mut(&key) {
+                                            e.status = "pending".to_string();
+                                        } else {
+                                            // entry keyed by folder/path
+                                            let fk = format!("{k}");
+                                            if let Some(pos) = fk.rfind('/') {
+                                                let folder = fk[..pos].to_string();
+                                                let rel = fk[pos + 1..].to_string();
+                                                let fkey = format!("{folder}/{rel}");
+                                                if let Some(e) = s.library.get_mut(&fkey) {
+                                                    e.status = "pending".to_string();
+                                                }
+                                            }
+                                        }
+                                    }
+                                    node_down_since.remove(jid);
+                                    eprintln!("[CodecTrans] job {jid} — node {nid} offline 5m+ during encode: job error, entry pending");
+                                    changed = true;
+                                }
+                            }
+                            None => {}
+                        }
+                    }
+                }
                 {
-                    let mut s = store.lock().unwrap();
+                    let mut s = store.lock().unwrap_or_else(|p| p.into_inner());
                     for j in s.jobs.values_mut() {
                         if j.status == "dispatched" && now - j.created_at > 600_000 {
                             j.status = "queued".to_string();
                             j.node_id = None;
                             eprintln!("[CodecTrans] job {} stuck dispatched 10m — requeued", j.id);
                         }
+                    }
+                    let pruned = s.prune_terminal(500);
+                    if pruned > 0 {
+                        eprintln!("[CodecTrans] pruned {pruned} terminal jobs (history cap 500)");
                     }
                     let live: std::collections::HashSet<String> = s
                         .jobs
@@ -6846,7 +7119,7 @@ async fn spawn_mdns(store: &Store, port: u16) {
                         );
                     }
                     drop(s);
-                    if !orphans.is_empty() {
+                    if !orphans.is_empty() || changed {
                         persist_catalog(&store);
                     }
                 }
@@ -6870,7 +7143,7 @@ async fn spawn_mdns(store: &Store, port: u16) {
                 if minutes == 0 {
                     continue;
                 }
-                let scanning = SCAN_STATE.lock().unwrap().active;
+                let scanning = SCAN_STATE.lock().unwrap_or_else(|p| p.into_inner()).active;
                 // No "busy" gate: with probe-reuse (unchanged files cost
                 // nothing) and scan serialization (SCAN_LOCK), rescanning
                 // while jobs run is cheap and safe — and without this, a
@@ -6885,7 +7158,7 @@ async fn spawn_mdns(store: &Store, port: u16) {
                 )
                 .await;
                 let queued = {
-                    let st = SCAN_STATE.lock().unwrap();
+                    let st = SCAN_STATE.lock().unwrap_or_else(|p| p.into_inner());
                     (st.finished_queued, st.scanned)
                 };
                 let _ = resp;

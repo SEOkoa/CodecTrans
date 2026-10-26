@@ -1160,16 +1160,37 @@ fn update_job(s: &mut NodeState, id: &str, f: impl FnOnce(&mut LocalJob)) {
 //  ffmpeg helpers (same progress logic as the server)
 // ============================================================
 
+/// ffprobe with a hard timeout — a stalled NFS handle must never wedge the
+/// node's worker (the job would sit "running" forever otherwise).
+async fn ffprobe_out(args: &[&str], path: &str) -> Option<String> {
+    let r = tokio::time::timeout(
+        std::time::Duration::from_secs(60),
+        Command::new("ffprobe").args(args).arg(path).output(),
+    )
+    .await;
+    match r {
+        Ok(Ok(o)) => Some(String::from_utf8_lossy(&o.stdout).into_owned()),
+        Ok(Err(e)) => {
+            eprintln!("[node] ffprobe failed {path}: {e}");
+            None
+        }
+        Err(_) => {
+            eprintln!("[node] ffprobe TIMEOUT(60s) {path}");
+            None
+        }
+    }
+}
+
 async fn probe_duration(path: &str) -> f64 {
-    let out = Command::new("ffprobe")
-        .args(["-v", "error", "-show_entries", "format=duration", "-of", "default=nw=1:nk=1", path])
-        .output()
-        .await
-        .ok()
-        .and_then(|o| String::from_utf8(o.stdout).ok())
-        .and_then(|s| s.trim().parse::<f64>().ok())
-        .unwrap_or(0.0);
-    out
+    let Some(s) = ffprobe_out(
+        &["-v", "error", "-show_entries", "format=duration", "-of", "default=nw=1:nk=1"],
+        path,
+    )
+    .await
+    else {
+        return 0.0
+    };
+    s.trim().parse::<f64>().unwrap_or(0.0)
 }
 
 /// True when ffmpeg's stderr points at a HW-DECODE device-init failure
@@ -1202,20 +1223,18 @@ async fn nvenc_av1_fmt_guard(encoder: &str, path: &str) -> Vec<String> {
     if encoder != "av1_nvenc" {
         return Vec::new();
     }
-    let pf = Command::new("ffprobe")
-        .args([
+    let pf = ffprobe_out(
+        &[
             "-v", "error",
             "-select_streams", "v:0",
             "-show_entries", "stream=pix_fmt",
             "-of", "default=nw=1:nk=1",
-            path,
-        ])
-        .output()
-        .await
-        .ok()
-        .and_then(|o| String::from_utf8(o.stdout).ok())
-        .map(|s| s.trim().lines().next().unwrap_or("").to_string())
-        .unwrap_or_default();
+        ],
+        path,
+    )
+    .await
+    .map(|s| s.trim().lines().next().unwrap_or("").to_string())
+    .unwrap_or_default();
     let ok_420 = matches!(pf.as_str(), "yuv420p" | "nv12" | "p010le" | "yuv420p10le" | "" | "N/A");
     if ok_420 {
         Vec::new()
@@ -1585,7 +1604,7 @@ async fn run_job(client: reqwest::Client, state: NState, server: String, node_id
             let mut st = state.lock().unwrap();
             update_job(&mut st, &job.id, |j| j.progress = 0.0);
         }
-        let mut child = match Command::new("ffmpeg").args(&args).envs(pin_env.clone().into_iter()).stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::piped()).spawn() {
+        let mut child = match Command::new("ffmpeg").args(&args).envs(pin_env.clone().into_iter()).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::piped()).spawn() {
             Ok(c) => c,
             Err(e) => {
                 let msg = format!("spawn ffmpeg failed: {e}");
@@ -1605,6 +1624,12 @@ async fn run_job(client: reqwest::Client, state: NState, server: String, node_id
             let mut buf = [0u8; 8192];
             let mut pending = String::new();
             let mut last_report = 0.0f64;
+            // Silence watchdog: no stderr (no progress) for this long means
+            // the encode is wedged (stalled NFS read, disk full, muxer hang)
+            // — kill it so the worker slot and the file are not stranded.
+            let silent_budget =
+                std::time::Duration::from_secs((total.max(60.0) * 8.0) as u64).max(std::time::Duration::from_secs(600));
+            let mut last_activity = std::time::Instant::now();
             // Heartbeat ticker: the server's cancel signal reaches the node
             // on the next report — cap that latency at 10s instead of
             // waiting for the next 5% progress step of a long encode.
@@ -1614,6 +1639,12 @@ async fn run_job(client: reqwest::Client, state: NState, server: String, node_id
                 let read_res: std::io::Result<usize> = tokio::select! {
                     n = s.read(&mut buf) => n,
                     _ = ticker.tick() => {
+                        if std::time::Instant::now() - last_activity > silent_budget {
+                            eprintln!("[node] {} — ffmpeg SILENT {}s — killing (stalled input or muxer)", job.id, silent_budget.as_secs());
+                            let _ = child.kill().await;
+                            last_err = Some("ffmpeg 침묵 — 입력 정전/멈춤 감지, 워치독 강제종료".into());
+                            break;
+                        }
                         let hb = client
                             .post(format!("{}/api/nodes/{}/report", server, node_id))
                             .json(&json!({"jobId": job.id, "status": "running", "progress": last_report}))
@@ -1638,6 +1669,7 @@ async fn run_job(client: reqwest::Client, state: NState, server: String, node_id
                     Ok(n) => n,
                     Err(_) => break,
                 };
+                last_activity = std::time::Instant::now();
                 pending.push_str(&String::from_utf8_lossy(&buf[..n]));
                 while let Some(pos) = pending.find(|c| c == '\r' || c == '\n') {
                     let seg = pending[..pos].to_string();

@@ -33,6 +33,36 @@ function flagUnauthorized(status) {
   }
 }
 
+// ── conditional-GET (ETag) support for the big list endpoints ──────────
+// The server answers 304 (empty body) when the catalog is unchanged, so the
+// UI's periodic refresh of a 4k-entry library costs ~0 bytes.
+const etagCache = new Map();
+async function jfetchETag(path, force) {
+  const headers = {};
+  const t = getAuthToken();
+  if (t) headers.Authorization = `Bearer ${t}`;
+  if (!force && etagCache.has(path)) headers["If-None-Match"] = etagCache.get(path);
+  const res = await fetch(path, { headers });
+  if (res.status === 304) return null; // unchanged — keep the cached state
+  const etag = res.headers.get("ETag");
+  if (etag) etagCache.set(path, etag);
+  const text = await res.text();
+  let body = null;
+  try {
+    body = text ? JSON.parse(text) : null;
+  } catch {
+    body = text;
+  }
+  if (!res.ok) {
+    flagUnauthorized(res.status);
+    const msg = body && body.error ? body.error : `HTTP ${res.status}`;
+    const err = new Error(msg);
+    err.status = res.status;
+    throw err;
+  }
+  return body;
+}
+
 async function jfetch(path, opts = {}) {
   const headers = { ...(opts.headers || {}) };
   const t = getAuthToken();
@@ -141,8 +171,10 @@ export const api = {
 
   downloadUrl: (name) => `/api/download/${encodeURIComponent(name)}`,
 
-  // storage library (server scans a directory of videos, read-only)
-  library: () => jfetch("/api/library"),
+  // storage library (server scans a directory of videos, read-only).
+  // ETag-cached: returns null when the catalog is unchanged (304) — callers
+  // must keep their previous state in that case. Pass true to force.
+  library: (force = false) => jfetchETag("/api/library", force),
   libraryScan: (root, limit, folderId) =>
     jfetch("/api/library/scan", {
       method: "POST",

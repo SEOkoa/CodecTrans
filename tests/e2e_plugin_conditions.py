@@ -137,9 +137,11 @@ try:
     # --- verification ---
     def st(sc, sub):
         return [x[1] for x in results[sc][sub]]
+    def flat(k):
+        return [x[1] for x in results[k]]
     checks = [
-        ("A_field_nomatch.skip",     st("A_field", "no_match"),  ["skipped"]),
-        ("B_field_match.encode",     st("B_field", "all_match"), ["pending"]),
+        ("A_field_nomatch.skip",     flat("A_field_nomatch"),  ["skipped"]),
+        ("B_field_allmatch.encode",  flat("B_field_allmatch"), ["pending"]),
         ("C_cmd.no_marker.skip",     st("C_cmd", "no_marker"),   ["skipped"]),
         ("C_cmd.with_marker.encode", st("C_cmd", "with_marker"), ["pending"]),
         ("D_height.lte100.skip",     st("D_height", "lte100"),   ["skipped"]),
