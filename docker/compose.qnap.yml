@@ -46,6 +46,11 @@ services:
       - /dev/nvidiactl
       - /dev/nvidia-uvm
       - /dev/nvidia-uvm-tools
+      # nvidia-caps: driver >=535 gates cuInit on these capability nodes —
+      # without them cuInit fails (CUDA_ERROR_NOT_INITIALIZED) and the GPU
+      # health decode + node NVENC silently fall back to CPU.
+      - /dev/nvidia-caps/nvidia-cap1
+      - /dev/nvidia-caps/nvidia-cap2
     mem_limit: 4g
     cpus: 4
 
@@ -75,5 +80,7 @@ services:
       - /dev/nvidiactl
       - /dev/nvidia-uvm
       - /dev/nvidia-uvm-tools
+      - /dev/nvidia-caps/nvidia-cap1
+      - /dev/nvidia-caps/nvidia-cap2
     mem_limit: 4g
     cpus: 4

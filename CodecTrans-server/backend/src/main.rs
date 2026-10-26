@@ -2634,6 +2634,25 @@ fn save_lib_cfg(c: &LibraryConfig) -> std::io::Result<()> {
     Ok(())
 }
 
+/// Same atomic write as save_lib_cfg, WITHOUT bumping logic_version.
+/// For the catalog-persist tombstone upkeep (no logic changed — a bump
+/// there would invalidate all saved decisions on every job completion).
+fn save_lib_cfg_quiet(c: &LibraryConfig) -> std::io::Result<()> {
+    let json = serde_json::to_string_pretty(c)?;
+    let p = lib_cfg_path();
+    let bak = p.with_extension("json.bak");
+    if let Ok(old) = std::fs::read(&p) {
+        if !old.is_empty() {
+            let _ = std::fs::write(&bak, old);
+        }
+    }
+    let tmp = p.with_extension("json.tmp");
+    std::fs::write(&tmp, json)?;
+    std::fs::rename(&tmp, &p)?;
+    *LIB_CFG_CACHE.lock().unwrap_or_else(|p| p.into_inner()) = None;
+    Ok(())
+}
+
 fn catalog_path() -> PathBuf {
     base_dir().join("catalog.json")
 }
@@ -2745,6 +2764,11 @@ fn persist_catalog_snapshot(entries: &[LibraryEntry]) {
             eprintln!("[CodecTrans] persist_catalog: temp write failed ({e}) — on-disk catalog untouched");
         }
     }
+    // Tombstone upkeep — short critical section (small file) against the
+    // settings-save handlers, which hold the same lock. QUIET save: this
+    // persist changes NO logic — bumping logic_version here would invalidate
+    // every saved decision and cancel freshly-queued jobs after each scan
+    // (the "stale queued ... logic changed" self-cancellation loop).
     let _g = LIB_CFG_LOCK.lock().unwrap_or_else(|p| p.into_inner());
     let mut c = load_lib_cfg();
     let mut seen: std::collections::HashSet<String> =
@@ -2756,7 +2780,7 @@ fn persist_catalog_snapshot(entries: &[LibraryEntry]) {
     }
     c.tombstone = seen.into_iter().collect();
     c.tombstone.sort();
-    let _ = save_lib_cfg(&c);
+    let _ = save_lib_cfg_quiet(&c);
     CATALOG_VERSION.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 }
 
