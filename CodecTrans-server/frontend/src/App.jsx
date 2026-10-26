@@ -206,7 +206,7 @@ function nodeTitle(n) {
               startsWith: t("\uC2DC\uC791"),
               endsWith: t("\uB05D")
             }[c.op] || c.op || "≥";
-            const val = ["name", "codec", "container", "pixel_fmt"].includes(c.field) ? c.string || "∅" : c.number ?? "∅";
+            const val = ["name", "codec", "container", "pixel_fmt"].includes(c.field) ? c.pattern || "∅" : c.value ?? "∅";
             return "🧩 " + fld + " " + opm + " " + val;
           }
         case "cmd":
@@ -1293,13 +1293,13 @@ export default function App() {
         healthValue: 10
       } : preset.kind === "field" ? {
         kind: "field",
-        field: "size_mb",
+        field: "size",
         op: "gte",
-        number: 0
+        value: 0
       } : preset.kind === "cmd" ? {
         kind: "cmd",
         cmd: "",
-        timeout: 30
+        cmdTimeout: 30
       } : {
         kind: preset.kind || "always"
       }
@@ -1320,7 +1320,7 @@ export default function App() {
       } : preset.kind === "postCmd" ? {
         kind: "postCmd",
         cmd: "",
-        timeout: 30
+        cmdTimeout: 30
       } : {
         kind: preset.kind || "skip"
       }
@@ -2702,18 +2702,16 @@ export default function App() {
                                   </select>
                                 </>}
                               {n.condition?.kind === "field" && <>
-                                  <label>{t("\uD544\uB4DC")}<select value={n.condition?.field || "size_mb"} onChange={e => patchCond(n.id, {
+                                  <label>{t("\uD544\uB4DC")}<select value={n.condition?.field || "size"} onChange={e => patchCond(n.id, {
                             field: e.target.value
                           })}>
-                                      <option value="size_mb">{t("\uD30C\uC77C \uD06C\uAE30 (MB)")}</option>
-                                      <option value="size">{t("\uD30C\uC77C \uD06C\uAE30 (byte)")}</option>
+                                      <option value="size">{t("\uD30C\uC77C \uD06C\uAE30 (MB)")}</option>
                                       <option value="duration_s">{t("\uAE38\uC774 (\uCD08)")}</option>
                                       <option value="width">{t("\uD574\uC0C1\uB3C4 \uAC00\uB85C (px)")}</option>
                                       <option value="height">{t("\uD574\uC0C1\uB3C4 \uC138\uB85C (px)")}</option>
                                       <option value="fps">FPS</option>
-                                      <option value="bitrate">{t("\uC804\uCCB4 \uBE44\uD2B8\uB808\uC774\uD2B8 (Mbps)")}</option>
-                                      <option value="video_bit_rate">{t("\uC601\uC0C1 \uBE44\uD2B8\uB808\uC774\uD2B8 (Mbps)")}</option>
-                                      <option value="audio_bit_rate">{t("\uC624\uB514\uC624 \uBE44\uD2B8\uB808\uC774\uD2B8 (Mbps)")}</option>
+                                      <option value="bitrate">{t("\uC601\uC0C1 \uBE44\uD2B8\uB808\uC774\uD2B8 (Mbps)")}</option>
+                                      <option value="audio_bit_rate">{t("\uc624\ub514\uc624 \ube44\ud2b8\ub808\uc774\ud2b8 (Mbps)")}</option>
                                       <option value="name">{t("\uC774\uB984")}</option>
                                       <option value="codec">{t("\uC601\uC0C1 \uCF54\uB371")}</option>
                                       <option value="container">{t("\uCEE8\uD14C\uC774\uB108")}</option>
@@ -2734,10 +2732,10 @@ export default function App() {
                                       <option value="endsWith">{t("\uB05D\uB0A8 (\uBB38\uC790\uC5F4)")}</option>
                                     </select>
                                   </label>
-                                  <label>{t("\uAC12")}{["name", "codec", "container", "pixel_fmt"].includes(n.condition?.field) ? <input type="text" value={n.condition?.string || ""} placeholder={t("\uC608: hevc / mkv / 10bit")} onChange={e => patchCond(n.id, {
-                            string: e.target.value || null
-                          })} /> : <input type="number" step="any" value={n.condition?.number ?? 0} onChange={e => patchCond(n.id, {
-                            number: e.target.value
+                                  <label>{t("값")}{["name", "codec", "container", "pixel_fmt"].includes(n.condition?.field) ? <input type="text" value={n.condition?.pattern || ""} placeholder={t("예: hevc / mkv / 10bit")} onChange={e => patchCond(n.id, {
+                            pattern: e.target.value || null
+                          })} /> : <input type="number" step="any" value={n.condition?.value ?? 0} onChange={e => patchCond(n.id, {
+                            value: e.target.value
                           })} />}
                                     <span>{t("\uC218\uCE58 \uD544\uB4DC = \uC22B\uC790 \xB7 \uBB38\uC790\uC5F4 \uD544\uB4DC = \uD14D\uC2A4\uD2B8 (\uCF54\uB371\uC740 h264/hevc/av1 \uACC4\uC5F4 \uC774\uB984\uC73C\uB85C \uC815\uADDC\uD654\uB428)")}</span>
                                   </label>
@@ -2746,10 +2744,10 @@ export default function App() {
                                   <label>{t("\uBA85\uB839\uC5B4")}<textarea rows={4} value={n.condition?.cmd || ""} placeholder={t("\uC608: test \"$CT_SIZE_MB\" -lt 2000 && grep -qiE \"sample|trailer\" \"$CT_FILE\"")} onChange={e => patchCond(n.id, {
                             cmd: e.target.value
                           })} />
-                                    <span>{t("\uC178 \uBA85\uB839 \u2014 exit 0 = \u2713. env: CT_FILE(\uC808\uB300\uACBD\uB85C) CT_NAME CT_SIZE CT_SIZE_MB CT_CODEC CT_CONTAINER CT_PIXEL_FMT CT_DURATION_S CT_WIDTH CT_HEIGHT CT_FPS CT_BITRATE CT_VIDEO_BITRATE CT_AUDIO_BITRATE \u2014 \uC2A4\uD06C\uB9BD\uD2B8\uB294 \uC11C\uBC84\uC758 /share/.codectrans/scripts/ \uC5D0 \uB450\uBA74 (PATH\uC5D0 \uC788\uC74C) \uADF8\uB300\uB85C \uC2E4\uD589")}</span>
+                                    <span>{t("\uc178 \uba85\ub839 \u2014 exit 0 = \u2713. env: CT_FILE CT_NAME CT_DIR CT_SIZE_MB CT_DURATION_S CT_CODEC CT_WIDTH CT_HEIGHT CT_FPS CT_BITRATE_MBPS CT_CONTAINER CT_PIXFMT \u2014 \uc2a4\ud06c\ub9bd\ud2b8\ub294 \uc808\ub300 \uacbd\ub85c\ub85c \ud638\ucd9c (PATH\ub85c\ub294 \uc548\ub428)")}</span>
                                   </label>
-                                  <label>{t("\uD0C0\uC784\uC544\uC6C3 (\uCD08)")}<input type="number" min="1" max="300" value={n.condition?.timeout ?? 30} onChange={e => patchCond(n.id, {
-                            timeout: e.target.value
+                                  <label>{t("\uD0C0\uC784\uC544\uC6C3 (\uCD08)")}<input type="number" min="1" max="300" value={n.condition?.cmdTimeout ?? 30} onChange={e => patchCond(n.id, {
+                            cmdTimeout: e.target.value
                           })} />
                                     <span>{t("\uCD08\uACFC \uC2DC \u2717 (\uAE30\uBCF8 30, \uCD5C\uB300 300)")}</span>
                                   </label>
@@ -2820,8 +2818,8 @@ export default function App() {
                           })} />
                                     <span>{t("\uC778\uCF54\uB529\uC774 \uC131\uACF5\uD55C \uB4A4 \uCCB4\uC778 \uC21C\uC11C\uB300\uB85C \uC2E4\uD589 (\uC778\uCF54\uB529 \uCD9C\uB825 \uD3EC\uD2B8\uC5D0 \uC5F0\uACB0). env: CT_OUTPUT(\uCD9C\uB825 \uC808\uB300\uACBD\uB85C) CT_OUTPUT_NAME CT_OUTPUT_SIZE_MB CT_INPUT CT_INPUT_NAME CT_STATUS(ok/error) + \uC6D0\uBCF8 \uBA54\uD0C0 \uBCC0\uC218(CT_NAME CT_SIZE_MB CT_CODEC \u2026) \u2014 \uC2E4\uD328\uD574\uB3C4 \uCCB4\uC778\uC740 \uACC4\uC18D\uB418\uACE0 \uACBD\uACE0\uB9CC \uAE30\uB85D (\uBE44\uCE58\uBA85)")}</span>
                                   </label>
-                                  <label>{t("\uD0C0\uC784\uC544\uC6C3 (\uCD08)")}<input type="number" min="1" max="300" value={n.action?.timeout ?? 30} onChange={e => patchAct(n.id, {
-                            timeout: e.target.value
+                                  <label>{t("\uD0C0\uC784\uC544\uC6C3 (\uCD08)")}<input type="number" min="1" max="300" value={n.action?.cmdTimeout ?? 30} onChange={e => patchAct(n.id, {
+                            cmdTimeout: e.target.value
                           })} />
                                     <span>{t("\uCD08\uACFC \uC2DC \uAC15\uC81C \uC885\uB8CC + \uACBD\uACE0 (\uAE30\uBCF8 30, \uCD5C\uB300 300)")}</span>
                                   </label>

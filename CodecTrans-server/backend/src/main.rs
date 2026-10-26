@@ -287,6 +287,7 @@ pub struct LibraryEntry {
     pub height: Option<u32>,
     pub fps: Option<f64>,
     pub video_bit_rate: Option<u64>, // bits/s
+    pub audio_bit_rate: Option<u64>, // bits/s
     pub pix_fmt: Option<String>,
     pub status: String,        // pending | queued | done | skipped | error
     pub reencoded: Option<String>, // output filename (staged next to the source)
@@ -3656,10 +3657,21 @@ fn field_value(
     f: &str,
     e: &LibraryEntry,
 ) -> (Option<f64>, Option<String>) {
+    // Frontend aliases → canonical names (keeps old saved logics and the
+    // richer UI both working).
+    let f = match f {
+        "size_mb" | "sizeMB" => "size",
+        "duration_s" | "durationS" => "duration",
+        "video_bit_rate" | "video_bitrate" => "bitrate",
+        "pixel_fmt" | "pixelFmt" => "pixFmt",
+        "audio_bitrate" | "audio_bit_rate" => "audio_bitrate",
+        _ => f,
+    };
     match f {
         "duration" => (e.duration, None),
         "size" => (Some(e.size as f64 / 1_048_576.0), None),
         "bitrate" => (e.video_bit_rate.map(|b| b as f64 / 1_000_000.0), None),
+        "audio_bitrate" => (e.audio_bit_rate.map(|b| b as f64 / 1_000_000.0), None),
         "height" => (e.height.map(|h| h as f64), None),
         "width" => (e.width.map(|w| w as f64), None),
         "fps" => (e.fps, None),
@@ -4621,6 +4633,7 @@ async fn library_scan(State(store): State<Store>, Json(req): Json<ScanReq>) -> R
                 height: info.height,
                 fps: info.fps,
                 video_bit_rate: info.video_bit_rate,
+                audio_bit_rate: info.audio_bit_rate,
                 pix_fmt: info.pix_fmt,
                 folder: fid,
                 status: "pending".into(),

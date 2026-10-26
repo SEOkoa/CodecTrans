@@ -413,6 +413,7 @@ export const STR_EN = {
   " 하드웨어 인코더를 가진 노드가 없습니다 — 이 갈래로 온 파일은 에러 처리됩니다.\n⚡ HW 전용을 해제하면 소프트웨어 인코딩(느림)으로 진행합니다.": " node has a hardware encoder for this — files reaching this branch error out.\nUntick ⚡ HW only to fall back to software encoding (slow).",
   "언어 (Language)": "Language",
   "인터페이스 언어 — 서버 설정에 저장되어 모든 기기에서 동일하게 적용됩니다.": "Interface language — saved in server settings, applied identically on all devices.",
+  "셸 명령 — exit 0 = ✓. env: CT_FILE CT_NAME CT_DIR CT_SIZE_MB CT_DURATION_S CT_CODEC CT_WIDTH CT_HEIGHT CT_FPS CT_BITRATE_MBPS CT_CONTAINER CT_PIXFMT — 스크립트는 절대 경로로 호출 (PATH로는 안됨)": "Shell command — exit 0 = ✓. env: CT_FILE CT_NAME CT_DIR CT_SIZE_MB CT_DURATION_S CT_CODEC CT_WIDTH CT_HEIGHT CT_FPS CT_BITRATE_MBPS CT_CONTAINER CT_PIXFMT — invoke scripts by absolute path (not on PATH)",
 };
 
 let _lang = "ko";
