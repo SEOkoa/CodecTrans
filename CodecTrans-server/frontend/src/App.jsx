@@ -2339,6 +2339,30 @@ export default function App() {
 
       {/* ═══ 라이브러리 — per-library sheets + integrated layout ═══ */}
       {tab === "library" && <>
+          <section className="card scannow">
+            <div className="search">
+              <button onClick={() => doScan()} disabled={scanning || folders.length === 0} title={folders.length === 0 ? t("\uB4F1\uB85D\uB41C \uD3F4\uB354\uAC00 \uC5C6\uC2B5\uB2C8\uB2E4 \u2014 \uD3F4\uB354 \uAD00\uB9AC\uC5D0\uC11C \uBA3C\uC800 \uCD94\uAC00\uD558\uC138\uC694") : undefined}>
+                {scanning ? "Scanning…" : folders.length === 0 ? t("\uD3F4\uB354 \uCD94\uAC00 \uD6C4 \uC2A4\uCE94") : t("\uC804\uCCB4 \uB2E4\uC2DC \uC2A4\uCE94")}
+              </button>
+              {scanning && <span className="scanprog" title={t("\uC2A4\uCE94 \uBC94\uC704: ") + (scanProg?.scope || "…")}>
+                  <span className="scanprog-txt">
+                    {scanProg?.total ? t("\uC2A4\uCE94 \uC911\u2026 ") + scanProg.scanned + "/" + scanProg.total : t("\uC2A4\uCE94 \uC900\uBE44\u2026")}
+                    {scanProg?.scope ? ` · ${scanProg.scope}` : ""}
+                  </span>
+                  <span className="bar" style={{
+              flex: 1,
+              height: 6
+            }}>
+                    <span className="fill" style={{
+                width: scanProg?.total > 0 ? `${Math.round(scanProg.scanned / scanProg.total * 100)}%` : "0%"
+              }} />
+                  </span>
+                </span>}
+              {!scanning && scanProg?.active === false && <span className="meta dim">{t("\uB9C8\uC9C0\uB9C9 \uC2A4\uCE94:")}{scanProg.scanned}{t("\uAC1C \uD655\uC778")}{scanProg.finished_queued ? t(", \uD050\uC789 ") + scanProg.finished_queued : ""}
+                  {scanProg.finished_skipped ? t(", \uC2A4\uD0B5 ") + scanProg.finished_skipped : ""}
+                </span>}
+            </div>
+          </section>
           <section className="card auto">
             <h2>{t("\uD3F4\uB354 \uAD00\uB9AC")}</h2>
             <div className="hint">{t("\uAC10\uC2DC\uD560 \uD3F4\uB354(\uB77C\uC774\uBE0C\uB7EC\uB9AC)\uB97C \uCD94\uAC00/\uC81C\uAC70\uD569\uB2C8\uB2E4. \uC0C8 \uD3F4\uB354\uB294")}<b>{t("\uBE44\uD65C\uC131 \uC0C1\uD0DC\uB85C \uCD94\uAC00")}</b>{t("\uB429\uB2C8\uB2E4 \u2014 \uB85C\uC9C1/\uC778\uCF54\uB529 \uC124\uC815(\uC544\uB798 \uB77C\uC774\uBE0C\uB7EC\uB9AC \uC2DC\uD2B8)\uC744 \uB9C8\uCE58\uACE0")}<b>{t("[\uD65C\uC131\uD654]")}</b>{t("\uB97C \uB20C\uB7EC\uC57C \uD050\uC789\uC774 \uC2DC\uC791\uB429\uB2C8\uB2E4.")}</div>
@@ -2376,28 +2400,6 @@ export default function App() {
           <section className="card lib2">
             <h2>Library</h2>
             <div className="hint">{t("\uB4F1\uB85D\uB41C \uD3F4\uB354 \uC804\uCCB4\uB97C")}<b>read-only</b>{t("\uB85C \uC2A4\uCE94\uD569\uB2C8\uB2E4 \u2014 \uD30C\uC77C\uC740 \uC808\uB300 \uAC74\uB4DC\uB9AC\uC9C0 \uC54A\uC2B5\uB2C8\uB2E4.")}<b>{t("\uBE44\uD65C\uC131 \uD3F4\uB354")}</b>{t("\uC758 \uC601\uC0C1\uC740 \uBAA9\uB85D\uC5D0 \uD45C\uC2DC\uB418\uC9C0\uB9CC \uC790\uB3D9 \uD050\uC5D0 \uB4E4\uC5B4\uAC00\uC9C0 \uC54A\uC2B5\uB2C8\uB2E4. \uC544\uB798")}<b>{t("\uC2DC\uD2B8")}</b>{t("\uC5D0\uC11C \uB77C\uC774\uBE0C\uB7EC\uB9AC\uBCC4\uB85C \uB300\uC0C1 \uC601\uC0C1\uC744 \uD655\uC778\uD558\uACE0, \uAC01 \uB77C\uC774\uBE0C\uB7EC\uB9AC\uC758 \uCC98\uB9AC \uBC29\uC2DD\uC744 \uBC14\uB85C \uC870\uC815\uD558\uC138\uC694.")}</div>
-            <div className="search">
-              <button onClick={() => doScan()} disabled={scanning || folders.length === 0} title={folders.length === 0 ? t("\uB4F1\uB85D\uB41C \uD3F4\uB354\uAC00 \uC5C6\uC2B5\uB2C8\uB2E4 \u2014 \uD3F4\uB354 \uAD00\uB9AC\uC5D0\uC11C \uBA3C\uC800 \uCD94\uAC00\uD558\uC138\uC694") : undefined}>
-                {scanning ? "Scanning…" : folders.length === 0 ? t("\uD3F4\uB354 \uCD94\uAC00 \uD6C4 \uC2A4\uCE94") : t("\uC804\uCCB4 \uB2E4\uC2DC \uC2A4\uCE94")}
-              </button>
-              {scanning && <span className="scanprog" title={t("\uC2A4\uCE94 \uBC94\uC704: ") + (scanProg?.scope || "…")}>
-                  <span className="scanprog-txt">
-                    {scanProg?.total ? t("\uC2A4\uCE94 \uC911\u2026 ") + scanProg.scanned + "/" + scanProg.total : t("\uC2A4\uCE94 \uC900\uBE44\u2026")}
-                    {scanProg?.scope ? ` · ${scanProg.scope}` : ""}
-                  </span>
-                  <span className="bar" style={{
-              flex: 1,
-              height: 6
-            }}>
-                    <span className="fill" style={{
-                width: scanProg?.total > 0 ? `${Math.round(scanProg.scanned / scanProg.total * 100)}%` : "0%"
-              }} />
-                  </span>
-                </span>}
-              {!scanning && scanProg?.active === false && <span className="meta dim">{t("\uB9C8\uC9C0\uB9C9 \uC2A4\uCE94:")}{scanProg.scanned}{t("\uAC1C \uD655\uC778")}{scanProg.finished_queued ? t(", \uD050\uC789 ") + scanProg.finished_queued : ""}
-                  {scanProg.finished_skipped ? t(", \uC2A4\uD0B5 ") + scanProg.finished_skipped : ""}
-                </span>}
-            </div>
             {/* library sheets — per-library tabs (전체 + each registered folder) */}
             <div className="libsheets">
               <button className={`libsheet${libSel === "all" ? " on" : ""}`} onClick={() => pickLib("all")} title={t("\uC778\uCF54\uB529 \uB300\uC0C1 (\uC2A4\uD0B5\xB7\uBE44\uC601\uC0C1 \uC81C\uC678) ") + libEntriesTarget(library.entries) + t(" / \uC804\uCCB4 ") + library.entries.length}>{t("\uC804\uCCB4")}<span className="cnt">{libEntriesTarget(library.entries)}</span>
