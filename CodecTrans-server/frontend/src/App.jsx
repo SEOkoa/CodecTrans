@@ -1078,20 +1078,32 @@ export default function App() {
       return String(va).localeCompare(String(vb), "ko") * dir;
     });
   }, [library, folders, folderById, libSel, libFilter, libSort]);
-  // visible row keys (same order as visibleEntries) — checkbox state keys
-  const visKeys = useMemo(() => visibleEntries.map(e => (e.folder ? e.folder + "/" : "") + e.path), [visibleEntries]);
-  const allSel = visKeys.length > 0 && visKeys.every(k => libSelKeys.has(k));
-  const someSel = !allSel && visKeys.some(k => libSelKeys.has(k));
   // pagination window over visibleEntries
   const pageCount = Math.max(1, Math.ceil(visibleEntries.length / libPageSize));
   const page = Math.min(libPage, pageCount - 1);
   const pageRows = visibleEntries.slice(page * libPageSize, (page + 1) * libPageSize);
+  // current-page row keys — checkbox state keys
   const pageKeys = pageRows.map(e => (e.folder ? e.folder + "/" : "") + e.path);
+  // select-all is PAGE-scoped: the header checkbox selects this page's rows,
+  // not the 6k rows of every page (cross-page selection stacks as the user
+  // pages through, which is the expected table behavior).
+  const allSel = pageKeys.length > 0 && pageKeys.every(k => libSelKeys.has(k));
+  const someSel = !allSel && pageKeys.some(k => libSelKeys.has(k));
+  // page change scrolls the table top into view — on mobile the pager sits
+  // below a 30-row table, so without this the user never sees the new page.
+  const libTableRef = useRef(null);
+  const goPage = n => {
+    setLibPage(n);
+    requestAnimationFrame(() =>
+      libTableRef.current?.scrollIntoView({ behavior: "smooth", block: "start" })
+    );
+  };
   // switching sheet/filter deselects + back to first page (rows are not
   // comparable across them)
   useEffect(() => {
     setLibSelKeys(new Set());
-    setLibPage(0);
+    goPage(0);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [libSel, libFilter]);
   const toggleLibSort = key => setLibSort(s => s.key === key ? {
     key,
@@ -2563,20 +2575,20 @@ export default function App() {
                       {libSelKeys.size > 0 && <div className="libbatch" title={t("\uC120\uD0DD\uD55C \uD30C\uC77C \uC77C\uBC31 \uCC98\uB9AC \u2014 \uCCB4\uD06C\uBC84\uC2A4\uB85C \uACE0\uB974\uB2E4 \uD639\uC5B4\uB9AC \uC774\uC5EC\uB124 \uD45C\uC2DC")}>
                           <span className="jmeta">{t("\uC120\uD0DD: ") + libSelKeys.size + t("\uAC74")}</span>
                           <button onClick={() => batchLib("requeue")}>{t("\uC7AC\uC778\uCF54\uB529")}</button>
-                          <button onClick={() => batchLib("skip")}>{t("\uC2A4\uD0A4\uD504")}</button>
+                          <button onClick={() => batchLib("skip")}>{t("스킵")}</button>
                           <button className="linkish" onClick={() => setLibSelKeys(new Set())}>{t("\uC120\uD0DD \uD574\uC81C")}</button>
                         </div>}
                     </>;
           })()}
               </div>}
-            {visibleEntries.length > 0 ? <div className="libtable">
+            {visibleEntries.length > 0 ? <div className="libtable" ref={libTableRef}>
                 <div className="libhead row">
                   <span className="libcheck" title={t("모두 선택")}><input type="checkbox" checked={allSel} ref={el => {
             if (el) el.indeterminate = someSel;
           }} onChange={ev => setLibSelKeys(prev => {
             const s = new Set(prev);
-            if (ev.target.checked) for (const k of visKeys) s.add(k);
-            else for (const k of visKeys) s.delete(k);
+            if (ev.target.checked) for (const k of pageKeys) s.add(k);
+            else for (const k of pageKeys) s.delete(k);
             return s;
           })} /></span>
                   <Th k="name" className="c-name">
@@ -2666,12 +2678,12 @@ export default function App() {
                     <span className="pg-size" title={t("페이지당 보기 개수")}>
                       {[10, 30, 50].map(n => <button key={n} type="button" className={`pg-opt${libPageSize === n ? " on" : ""}`} onClick={() => {
             setLibPageSize(n);
-            setLibPage(0);
+            goPage(0);
           }}>{n}</button>)}
                     </span>
-                    <button type="button" className="pg-nav" disabled={page === 0} onClick={() => setLibPage(page - 1)}>‹</button>
-                    {pageList(page, pageCount).map((p, i) => p === "…" ? <span key={"el" + i} className="pg-ell">…</span> : <button key={p} type="button" className={`pg-num${p === page ? " on" : ""}`} onClick={() => setLibPage(p)}>{p + 1}</button>)}
-                    <button type="button" className="pg-nav" disabled={page >= pageCount - 1} onClick={() => setLibPage(page + 1)}>›</button>
+                    <button type="button" className="pg-nav" disabled={page === 0} onClick={() => goPage(page - 1)}>‹</button>
+                    {pageList(page, pageCount).map((p, i) => p === "…" ? <span key={"el" + i} className="pg-ell">…</span> : <button key={p} type="button" className={`pg-num${p === page ? " on" : ""}`} onClick={() => goPage(p)}>{p + 1}</button>)}
+                    <button type="button" className="pg-nav" disabled={page >= pageCount - 1} onClick={() => goPage(page + 1)}>›</button>
                     <span className="pg-info">{t("페이지")} {page + 1}/{pageCount} · {visibleEntries.length}{t("개")}</span>
                   </div>}
               </div> : <div className="empty">

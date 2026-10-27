@@ -318,6 +318,11 @@ header h1 {
   }
 }
 
+/* consecutive cards get a fixed gap (the old per-class .nodes margin-top
+   left the library tab's folder/library cards stuck together) */
+section.card + section.card {
+  margin-top: 18px;
+}
 .card {
   background: var(--panel);
   border: 1px solid var(--border);
@@ -508,9 +513,6 @@ button.primary:disabled {
 }
 
 /* nodes section */
-.nodes {
-  margin-top: 18px;
-}
 .node {
   border: 1px solid var(--border);
   border-radius: 10px;
@@ -660,6 +662,7 @@ code {
   border: 1px solid var(--border);
   border-radius: 10px;
   overflow-x: auto;
+  scroll-margin-top: 6px;
 }
 .libhead,
 .librow {

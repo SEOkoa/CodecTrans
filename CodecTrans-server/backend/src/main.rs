@@ -3756,22 +3756,57 @@ async fn auto_post(State(_store): State<Store>, Json(c): Json<AutoConfig>) -> Re
 
 /// Resolve the on-disk source for a catalog key ("{folder_id}/{rel}", or a
 /// legacy storage-root-relative path).
-fn resolve_lib_source(lp: &str, store: &Store) -> Option<PathBuf> {
+/// Traced resolution: distinguishes "the file is genuinely gone" (the
+/// folder IS known and the path is missing) from "the folder itself is
+/// unknown" (config race — a concurrent folder/settings save mid-scan can
+/// briefly drop a folder from the cache). Only the former may fail the
+/// health gate; the latter must leave the entry pending. On 2026-10-27 a
+/// mid-scan folder save made 693 healthy files resolve as Unknown and they
+/// were quarantined as corrupt sources.
+enum SourceResolve {
+    Found(PathBuf),
+    /// Folder known, file missing (moved/renamed/deleted).
+    Vanished,
+    /// Folder lookup failed (config race / stale entry) — unknown, NOT
+    /// vanished.
+    Unknown,
+}
+
+fn resolve_lib_source_traced_cfg(
+    lp: &str,
+    store: &Store,
+    cfg: &LibraryConfig,
+) -> SourceResolve {
     if let Some((fid, rel)) = lp.split_once('/') {
-        let cfg = load_lib_cfg();
         if let Some(f) = cfg.folders.iter().find(|f| f.id == fid) {
             let p = PathBuf::from(f.path.clone()).join(rel);
-            if p.is_file() {
-                return Some(p);
-            }
+            return if p.is_file() {
+                SourceResolve::Found(p)
+            } else {
+                SourceResolve::Vanished
+            };
         }
+        return SourceResolve::Unknown;
     }
     let root = store.lock().unwrap_or_else(|p| p.into_inner()).storage_root().to_string();
     let p = PathBuf::from(root).join(lp);
     if p.is_file() {
-        Some(p)
+        SourceResolve::Found(p)
     } else {
-        None
+        SourceResolve::Unknown
+    }
+}
+
+/// Fresh-config variant (standalone paths: quarantine, encode dispatch).
+fn resolve_lib_source_traced(lp: &str, store: &Store) -> SourceResolve {
+    let cfg = load_lib_cfg();
+    resolve_lib_source_traced_cfg(lp, store, &cfg)
+}
+
+fn resolve_lib_source(lp: &str, store: &Store) -> Option<PathBuf> {
+    match resolve_lib_source_traced(lp, store) {
+        SourceResolve::Found(p) => Some(p),
+        _ => None,
     }
 }
 
@@ -3801,8 +3836,20 @@ fn move_to_fail_folder(store: &Store, e: &LibraryEntry, reason: &str) -> Result<
             .unwrap_or_else(|| "unregistered".into()),
         None => "unregistered".into(),
     };
-    let src =
-        resolve_lib_source(&e.key(), store).ok_or_else(|| "원본 파일이 이미 없습니다".to_string())?;
+    // Quarantine is destructive: require the file to be RESOLVED to an
+    // existing path. "Folder unknown" (config race) must abort, not move
+    // the user's data.
+    let src = match resolve_lib_source_traced(&e.key(), store) {
+        SourceResolve::Found(p) => p,
+        SourceResolve::Vanished => return Err("원본 파일이 이미 없습니다".to_string()),
+        SourceResolve::Unknown => {
+            eprintln!(
+                "[fail] quarantine ABORTED — source path unresolvable (folder config race?): {}",
+                e.key()
+            );
+            return Err("원본 경로 확인 실패 — 격리 취소 (다음 스캔에서 재확인)".to_string());
+        }
+    };
     let dest = base.join(&lib_name).join(&e.path);
     if let Some(parent) = dest.parent() {
         std::fs::create_dir_all(parent)
@@ -6543,14 +6590,33 @@ async fn library_scan_inner(store: Store, req: ScanReq) -> Response {
                         .lock()
                         .unwrap_or_else(|p| p.into_inner())
                         .health_total += 1;
-                    match resolve_lib_source(&key, &store_t) {
-                        None => {
-                            // Source vanished (moved/renamed after the probe)
-                            // — fail the gate; the next scan re-probes it.
+                    // Traced: "folder unknown" (config race) must NOT fail
+                    // the gate — it leaves the entry pending. "Folder known
+                    // but file missing" is re-checked after a short delay:
+                    // a stat blip under ZFS load is not proof of corruption.
+                    let resolved = match resolve_lib_source_traced_cfg(&key, &store_t, &libcfg) {
+                        SourceResolve::Vanished => {
+                            tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+                            resolve_lib_source_traced_cfg(&key, &store_t, &libcfg)
+                        }
+                        r => r,
+                    };
+                    match resolved {
+                        SourceResolve::Unknown => {
+                            eprintln!(
+                                "[scan] {} — source unresolved (folder config race?) — no verdict, stays pending",
+                                key
+                            );
+                            None
+                        }
+                        SourceResolve::Vanished => {
+                            // Source vanished (moved/renamed after the
+                            // probe) — fail the gate; the next scan
+                            // re-probes it.
                             SCAN_STATE.lock().unwrap_or_else(|p| p.into_inner()).health_done += 1;
                             Some(false)
                         }
-                        Some(p) => {
+                        SourceResolve::Found(p) => {
                             let srcs = p.to_string_lossy().to_string();
                             let windows = health_windows_for(e.duration, &file_depths, &srcs);
                             if windows.is_empty() {
