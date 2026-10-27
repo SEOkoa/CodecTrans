@@ -3318,8 +3318,31 @@ async fn folders_post(State(store): State<Store>, Json(mut b): Json<FoldersBody>
         .filter(|f| f.enabled && !prev_enabled.contains(&f.id))
         .map(|f| f.id.clone())
         .collect();
+    let old_folders = c.folders.clone();
     c.folders = b.folders.clone();
-    if let Err(e) = save_lib_cfg(&c) {
+    // A folder-list save invalidates saved decisions ONLY when a folder's
+    // encoding rules changed (target / logic / graph / path). A pure
+    // enabled-toggle or plain re-save must NOT bump logic_version —
+    // otherwise every folder flip forces a full re-probe of all pending
+    // files on the next scan (2026-10-27: one enable-toggle bumped 91→92,
+    // invalidating every stored decision).
+    let norm = |f: &FolderRule| -> serde_json::Value {
+        let mut v = serde_json::to_value(f).unwrap_or_default();
+        if let Some(o) = v.as_object_mut() {
+            o.remove("enabled");
+        }
+        v
+    };
+    let rules_changed = b
+        .folders
+        .iter()
+        .any(|f| !old_folders.iter().any(|e| e.id == f.id && norm(e) == norm(f)));
+    let save_res = if rules_changed {
+        save_lib_cfg(&c)
+    } else {
+        save_lib_cfg_quiet(&c)
+    };
+    if let Err(e) = save_res {
         return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": e.to_string() }))).into_response();
     }
     // Drop catalog entries that belonged to removed folders.
@@ -3705,7 +3728,10 @@ async fn settings_post(State(_store): State<Store>, Json(b): Json<SettingsBody>)
         .clone()
         .filter(|l| l == "ko" || l == "en")
         .unwrap_or_else(|| "ko".to_string());
-    match save_lib_cfg(&c) {
+    // Operational settings only (fail dir, scan interval, requeue cap,
+    // language) — none of them change per-file encoding decisions, so a
+    // logic_version bump would needlessly invalidate every stored decision.
+    match save_lib_cfg_quiet(&c) {
         Ok(_) => Json(json!({ "ok": true, "failDir": c.fail_dir, "autoScanMinutes": c.auto_scan_minutes, "language": lang })).into_response(),
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,

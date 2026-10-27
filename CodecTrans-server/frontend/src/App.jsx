@@ -537,6 +537,11 @@ export default function App() {
       api.library().then(l => {
         if (l) setLibrary(l); // null = 304 Not Modified — keep current state
       }).catch(() => {});
+      // keep the header server badge live — it was loaded once at startup,
+      // so a down/up server stayed invisible until a page reload.
+      api.health().then(setHealth).catch(() => setHealth({
+        status: "down"
+      }));
       // Keep the folder list in sync when it changes in ANOTHER window or
       // session (a deleted folder must disappear from the sheets). Compare
       // signatures so an in-flight local edit is never clobbered: if local
@@ -771,6 +776,16 @@ export default function App() {
     }
   };
   useEffect(() => () => stopScanPoll(), []);
+  // Force a full catalog refetch (bypasses the ETag/304 cache). Called right
+  // after an action that changed server state so the table updates
+  // immediately instead of on the next 5s poll — or, worse, never: a scan
+  // that changed nothing leaves the ETag unchanged, so without a force the
+  // UI would keep showing stale/blank rows until a manual page reload.
+  const refreshCatalog = () => {
+    api.library(true).then(l => {
+      if (l) setLibrary(l);
+    }).catch(() => {});
+  };
   async function doScan(folderId) {
     setScanning(true);
     setScanFolder(folderId || "");
@@ -800,6 +815,7 @@ export default function App() {
               stopScanPoll();
               setScanning(false);
               setScanFolder("");
+              refreshCatalog();
             }
           } catch (e) {
             /* best-effort */
@@ -807,11 +823,11 @@ export default function App() {
         }, 1000);
         return;
       }
-      setLibrary({
-        root: "",
-        entries: l.entries || []
-      });
-      flashBlock(l.queued?.length ? t("\uC2A4\uCE94 \uC644\uB8CC \u2014 ") + (l.scanned ?? "?") + t("\uAC1C \uD655\uC778, \uD050\uC789 ") + l.queued.length + t("\uAC74") : t("\uC2A4\uCE94 \uC644\uB8CC \u2014 ") + (l.scanned ?? "?") + t("\uAC1C \uD655\uC778"));
+      // Force a fresh catalog (the scan response carries no full entry
+      // list — the old code here blanked the table, and a no-change scan
+      // then got 304s forever: blank until a page reload).
+      refreshCatalog();
+      flashBlock(l.queued?.length ? t("\uC2A4\uCE94 \uC644\uB8CC \u2014 ") + (l.scanned ?? "?") + t("\uAC1C \uD655\uC778, \uD050\uC99D ") + l.queued.length + t("\uAC74") : t("\uC2A4\uCE94 \uC644\uB8CC \u2014 ") + (l.scanned ?? "?") + t("\uAC1C \uD655\uC778"));
     } catch (err) {
       setError(err.message);
     } finally {
@@ -907,6 +923,7 @@ export default function App() {
     if (!window.confirm(t("이 파일을 스킵할까요? 인코딩되지 않으며, ⟳ 버튼으로 다시 큐에 넣을 수 있습니다."))) return;
     try {
       await api.librarySkip(libKey(e));
+      refreshCatalog();
     } catch (err) {
       setError(err.message);
     }
@@ -959,6 +976,7 @@ export default function App() {
     try {
       const r = await api.nodeQueuedCancel(n.id);
       setSearchMsg(t("대기 큐 ") + (r.cancelled || 0) + t("건 취소 — 다른 노드로 재배정됨"));
+      refreshCatalog();
       setTimeout(() => setSearchMsg(""), 5000);
     } catch (err) {
       setSearchMsg(err.message);
@@ -1945,6 +1963,7 @@ export default function App() {
               await api.jobCancel(activeJob.id);
               setActiveJob(null);
               setJobs(await api.jobs());
+              refreshCatalog();
             } catch (e) {
               setError(e.message);
             }
@@ -1966,6 +1985,7 @@ export default function App() {
               await api.jobsClear();
               if (activeJob?.status === "queued") setActiveJob(null);
               setJobs(await api.jobs());
+              refreshCatalog();
             } catch (e) {
               setError(e.message);
             }
@@ -2015,6 +2035,7 @@ export default function App() {
                 await api.jobCancel(j.id);
                 if (activeJob?.id === j.id) setActiveJob(null);
                 setJobs(await api.jobs());
+                refreshCatalog();
               } catch (e) {
                 setError(e.message);
               }
