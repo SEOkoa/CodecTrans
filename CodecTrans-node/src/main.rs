@@ -203,9 +203,11 @@ fn mount_prefixes() -> Vec<String> {
         let mut out: Vec<String> = Vec::new();
         if let Ok(t) = std::fs::read_to_string("/proc/mounts") {
             for line in t.lines() {
+                // /proc/mounts: DEVICE MOUNTPOINT FSTYPE OPTIONS ...
                 let mut f = line.split_whitespace();
-                let fstype = f.nth(2).unwrap_or("");
+                let _dev = f.next();
                 let mnt = f.next().unwrap_or("").replace("\\040", " ");
+                let fstype = f.next().unwrap_or("");
                 if !CONTENT.contains(&fstype) || SKIP.contains(&mnt.as_str()) {
                     continue;
                 }
