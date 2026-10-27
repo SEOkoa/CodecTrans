@@ -173,6 +173,275 @@ fn map_path(p: &str) -> String {
     }
     p.to_string()
 }
+
+/// Prefixes of server-host paths that are visible on THIS node's filesystem
+/// — reported at registration so the server can route pre-encode health
+/// decodes here (same filesystem: no download, the decode cost lands on
+/// this node instead of the server).
+///
+/// CT_MOUNTS (comma-separated prefixes) wins; otherwise on Linux the
+/// content-type mounts from /proc/mounts (zfs/ext4/xfs/btrfs/nfs/cifs/
+/// fuse/9p — the container's bind-mounted media shares). Empty elsewhere:
+/// a node that can't see the server's files never gets a health job (the
+/// server decodes those itself).
+fn mount_prefixes() -> Vec<String> {
+    if let Ok(m) = std::env::var("CT_MOUNTS") {
+        return m
+            .split(',')
+            .map(|s| s.trim().trim_end_matches('/').to_string())
+            .filter(|s| !s.is_empty())
+            .collect();
+    }
+    #[cfg(target_os = "linux")]
+    {
+        const CONTENT: &[&str] = &[
+            "zfs", "ext4", "ext3", "xfs", "btrfs", "nfs", "nfs4", "cifs", "9p", "vboxsf", "apfs", "fuse.sshfs",
+        ];
+        const SKIP: &[&str] = &[
+            "/", "/boot", "/etc", "/var", "/usr", "/root", "/tmp", "/run", "/dev", "/sys", "/proc", "/lost+found",
+        ];
+        let mut out: Vec<String> = Vec::new();
+        if let Ok(t) = std::fs::read_to_string("/proc/mounts") {
+            for line in t.lines() {
+                let mut f = line.split_whitespace();
+                let fstype = f.nth(2).unwrap_or("");
+                let mnt = f.next().unwrap_or("").replace("\\040", " ");
+                if !CONTENT.contains(&fstype) || SKIP.contains(&mnt.as_str()) {
+                    continue;
+                }
+                if mnt == "/opt/ct/work" || mnt.starts_with("/opt/ct") || mnt.starts_with("/data") {
+                    // The node's own workdir / outputs staging — not a
+                    // library source tree (keeping the list honest).
+                    continue;
+                }
+                if !out.contains(&mnt) {
+                    out.push(mnt);
+                }
+            }
+        }
+        if !out.is_empty() {
+            println!("[node] auto-detected mount prefixes: {}", out.join(", "));
+        }
+        return out;
+    }
+    #[cfg(not(target_os = "linux"))]
+    Vec::new()
+}
+
+/// Pre-encode source health decode (kind="health" jobs) — the node-side
+/// twin of the server's `decode_window_ok`: decode the [seek, seek+len]
+/// window to null with `-v error`; healthy = clean exit AND no real error
+/// lines (benign seek/dts artifacts filtered — the SAME list the server
+/// uses, so verdicts match). A timeout is not proof of corruption: retry
+/// once at 3x before declaring the source broken.
+async fn health_window_ok(path: &str, seek: f64, len: f64, timeout_s: u64, full_check: bool) -> bool {
+    let cuda = nvidia_libdir();
+    let build = || {
+        let mut c = tokio::process::Command::new("ffmpeg");
+        c.arg("-v").arg("error").arg("-nostdin");
+        if let Some(lib) = &cuda {
+            c.arg("-hwaccel").arg("cuda");
+            c.env("LD_LIBRARY_PATH", lib.clone());
+        } else {
+            c.arg("-threads").arg("2");
+        }
+        if seek > 0.0 {
+            c.arg("-ss").arg(format!("{seek:.3}"));
+        }
+        c.arg("-i").arg(path);
+        c.arg("-t").arg(format!("{len:.3}"));
+        // Memory guard (mirrors the server): cap spot-check frames; the
+        // explicit "all" (full-file) verification stays uncapped.
+        if !full_check {
+            c.args(["-frames:v", "120"]);
+        }
+        c.args(["-f", "null", "-"]);
+        c.stdout(std::process::Stdio::piped());
+        c.stderr(std::process::Stdio::piped());
+        c
+    };
+    async fn run_once(
+        build: &impl Fn() -> tokio::process::Command,
+        timeout_s: u64,
+    ) -> Result<std::process::Output, ()> {
+        let mut child = match build().spawn() {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!("[node] health decode spawn error: {e}");
+                return Err(());
+            }
+        };
+        // wait() borrows — the timeout can drop the future and we still
+        // own the child to KILL it (a dropped wait_with_output orphans the
+        // ffmpeg and it keeps decoding with dead pipes).
+        let stderr = child.stderr.take();
+        match tokio::time::timeout(std::time::Duration::from_secs(timeout_s), child.wait()).await {
+            Ok(status) => {
+                let status = match status {
+                    Ok(s) => s,
+                    Err(_) => return Err(()),
+                };
+                let mut errbuf = String::new();
+                if let Some(mut se) = stderr {
+                    use tokio::io::AsyncReadExt;
+                    let _ = se.read_to_string(&mut errbuf).await;
+                }
+                Ok(std::process::Output {
+                    status,
+                    stdout: Vec::new(),
+                    stderr: errbuf.into_bytes(),
+                })
+            }
+            Err(_) => {
+                let _ = child.kill().await;
+                let _ = child.wait().await;
+                Err(())
+            }
+        }
+    }
+    // Benign h264 decoder messages that do NOT indicate real corruption
+    // (same list as the server's decode_stderr_real).
+    let benign = |l: &str| {
+        l.contains("non monotonically increasing dts")
+            || l.contains("monotonically increasing dts")
+            || l.contains("Application provided invalid")
+            || l.contains("co located POCs unavailable")
+            || l.contains("mmco: unref short failure")
+            || l.contains("mmco: unref long failure")
+            || l.contains("estimating timebase from")
+            || l.contains("dts is unset in packet")
+    };
+    let judge = |o: &std::process::Output| -> (bool, String) {
+        let err = String::from_utf8_lossy(&o.stderr);
+        let filtered: String = err.lines().filter(|l| !benign(l)).collect::<Vec<_>>().join("\n");
+        (o.status.success() && filtered.trim().is_empty(), filtered)
+    };
+    match run_once(&build, timeout_s).await {
+        Ok(o) => {
+            let (ok, real) = judge(&o);
+            if !ok {
+                eprintln!(
+                    "[node] health decode FAILED window({seek:.3}+{len:.3}) of {path}: {}",
+                    real.lines().take(3).collect::<Vec<_>>().join(" | ")
+                );
+            }
+            ok
+        }
+        Err(()) => {
+            eprintln!(
+                "[node] health decode TIMEOUT({timeout_s}s) window({seek:.3}+{len:.3}) of {path} — retrying at 3x"
+            );
+            let retry_s = timeout_s.saturating_mul(3).max(60);
+            match run_once(&build, retry_s).await {
+                Ok(o) => {
+                    let (ok, real) = judge(&o);
+                    if !ok {
+                        eprintln!(
+                            "[node] health decode RETRY FAILED window({seek:.3}+{len:.3}) of {path}: {}",
+                            real.lines().take(3).collect::<Vec<_>>().join(" | ")
+                        );
+                    }
+                    ok
+                }
+                Err(()) => {
+                    eprintln!("[node] health decode RETRY TIMEOUT — source marked broken");
+                    false
+                }
+            }
+        }
+    }
+}
+
+/// Report the verdict/progress of a health job to the server (direct
+/// control-plane call, same pattern as run_job's reports).
+async fn health_report(
+    client: &reqwest::Client,
+    server: &str,
+    node_id: &str,
+    job_id: &str,
+    status: &str,
+    healthy: Option<bool>,
+    progress: f64,
+    error: Option<String>,
+) {
+    let _ = client
+        .post(format!("{}/api/nodes/{}/report", server, node_id))
+        .json(&json!({
+            "jobId": job_id,
+            "status": status,
+            "progress": progress,
+            "error": error,
+            "healthy": healthy,
+        }))
+        .send()
+        .await;
+}
+
+/// Run a kind="health" job: decode every window of a locally-visible
+/// source and report the verdict. The server only routes here when our
+/// registered mounts cover the path, so the file needs no download.
+///
+/// Semantics: a file the check could NOT verify (missing here, ffmpeg
+/// failure) reports status "error" — the server's deadline logic falls
+/// back to its own workers. A file that decodes clean / corrupt reports
+/// status "done" with `healthy` set (the job itself succeeded either way).
+async fn run_health_job(
+    client: reqwest::Client,
+    server: String,
+    node_id: String,
+    job: RemoteJob,
+) {
+    let local = match job.local_input.as_deref().and_then(|p| {
+        let mapped = map_path(p);
+        std::path::Path::new(&mapped).is_file().then(|| mapped)
+    }) {
+        Some(p) => p,
+        None => {
+            eprintln!("[node] health job {}: source not visible locally — error (server falls back)", job.id);
+            health_report(&client, &server, &node_id, &job.id, "error", None, 0.0, Some("source not visible on this node".into())).await;
+            return;
+        }
+    };
+    let windows = match job.health_windows {
+        Some(w) if !w.is_empty() => w,
+        _ => {
+            // No windows (shouldn't happen) — nothing to check.
+            health_report(&client, &server, &node_id, &job.id, "done", Some(true), 1.0, None).await;
+            return;
+        }
+    };
+    println!(
+        "[node] health job {}: {} window(s) of {}",
+        job.id,
+        windows.len(),
+        local
+    );
+    health_report(&client, &server, &node_id, &job.id, "running", None, 0.02, None).await;
+    let mut healthy = true;
+    for (i, w) in windows.iter().enumerate() {
+        if !health_window_ok(&local, w.seek, w.len, w.timeout_s, w.full_check).await {
+            healthy = false;
+            break;
+        }
+        let p = 0.02 + 0.98 * ((i + 1) as f64 / windows.len() as f64);
+        health_report(&client, &server, &node_id, &job.id, "running", None, p, None).await;
+    }
+    if healthy {
+        health_report(&client, &server, &node_id, &job.id, "done", Some(true), 1.0, None).await;
+    } else {
+        health_report(
+            &client,
+            &server,
+            &node_id,
+            &job.id,
+            "done",
+            Some(false),
+            1.0,
+            Some("source decode failed a window".into()),
+        )
+        .await;
+    }
+}
 fn now_ms() -> i64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_millis() as i64).unwrap_or(0)
 }
@@ -1054,6 +1323,37 @@ struct RemoteJob {
     /// straight there (same-FS rename) and report `localStage`.
     #[serde(default)]
     local_output: Option<String>,
+    /// "encode" (default) | "health" — a pre-encode source-integrity spot
+    /// check: decode every window to null and report `healthy`. Runs on the
+    /// node's own healthWorkers slots, independent of the encode slots.
+    #[serde(default = "default_job_kind")]
+    kind: String,
+    /// Precomputed decode windows for kind="health" (seek s, len s,
+    /// per-window timeout s, full-file "all" mode) — the server did the
+    /// math; the node just runs each window.
+    #[serde(default)]
+    health_windows: Option<Vec<HealthWindow>>,
+}
+
+fn default_job_kind() -> String {
+    "encode".into()
+}
+
+/// One decode window of a health-check job (camelCase mirrors the server's
+/// HealthWindow serde naming).
+#[derive(serde::Deserialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct HealthWindow {
+    seek: f64,
+    len: f64,
+    #[serde(default = "default_timeout_s")]
+    timeout_s: u64,
+    #[serde(default)]
+    full_check: bool,
+}
+
+fn default_timeout_s() -> u64 {
+    300
 }
 
 /// Multi-GPU device pinning: the server picked the concrete encoder AND a
@@ -1914,6 +2214,10 @@ async fn do_register(client: &reqwest::Client, server: &str, name: &str, caps: &
         "hwEncoders": caps.hw_encoders,
         "accels": caps.accels,
         "diag": DIAG.lock().unwrap().clone(),
+        // Server-host prefixes visible on this node's filesystem — the
+        // server routes pre-encode health decodes here only when a mount
+        // covers the source path (same FS, no download).
+        "mounts": mount_prefixes(),
     });
     let resp = client.post(format!("{}/api/nodes/register", server)).json(&body).send().await;
     match resp {
@@ -2206,17 +2510,31 @@ async fn poll_loop(
         std::env::var("CT_MAX_JOBS").ok().and_then(|s| s.parse().ok()).unwrap_or(1).clamp(1, 16),
     ));
     let active: Arc<std::sync::atomic::AtomicU32> = Arc::new(std::sync::atomic::AtomicU32::new(0));
+    // Health-check slots — INDEPENDENT of the encode slots: pre-encode
+    // source decodes run alongside encodes (the server offers a health job
+    // only when we advertise a free slot, and never sets our "current
+    // job" badge). CT_HEALTH_WORKERS seeds the default; the server pushes
+    // the live value in the poll config (0 = this node runs no checks).
+    let health_workers: Arc<std::sync::atomic::AtomicU32> = Arc::new(std::sync::atomic::AtomicU32::new(
+        std::env::var("CT_HEALTH_WORKERS").ok().and_then(|s| s.parse().ok()).unwrap_or(0).clamp(0, 16),
+    ));
+    let health_active: Arc<std::sync::atomic::AtomicU32> = Arc::new(std::sync::atomic::AtomicU32::new(0));
     let slot_free = Arc::new(tokio::sync::Notify::new());
     loop {
-        // Claim while under capacity.
+        // Claim while under capacity (encode OR health).
         loop {
-            if active.load(std::sync::atomic::Ordering::Relaxed)
-                >= max_jobs.load(std::sync::atomic::Ordering::Relaxed)
-            {
+            let enc_free = active.load(std::sync::atomic::Ordering::Relaxed)
+                < max_jobs.load(std::sync::atomic::Ordering::Relaxed);
+            let h_free = health_active.load(std::sync::atomic::Ordering::Relaxed)
+                < health_workers.load(std::sync::atomic::Ordering::Relaxed);
+            if !enc_free && !h_free {
                 break;
             }
             let nid = id.lock().unwrap().clone();
-            let url = format!("{}/api/nodes/{}/poll", server, nid);
+            let h_slots = health_workers
+                .load(std::sync::atomic::Ordering::Relaxed)
+                .saturating_sub(health_active.load(std::sync::atomic::Ordering::Relaxed));
+            let url = format!("{}/api/nodes/{}/poll?health={h_slots}", server, nid);
             let resp = client.get(&url).send().await;
             match resp {
                 Ok(r) if r.status() == reqwest::StatusCode::NOT_FOUND => {
@@ -2231,6 +2549,31 @@ async fn poll_loop(
                         if let Some(cfg) = v.get("config") {
                             if let Some(m) = cfg.get("maxJobs").and_then(|x| x.as_u64()) {
                                 max_jobs.store(m.clamp(1, 16) as u32, std::sync::atomic::Ordering::Relaxed);
+                            }
+                            if let Some(h) = cfg.get("healthWorkers").and_then(|x| x.as_u64()) {
+                                health_workers.store(h.clamp(0, 16) as u32, std::sync::atomic::Ordering::Relaxed);
+                            }
+                        }
+                        // Health job first (it runs on its own slots).
+                        if let Some(hv) = v.get("healthJob").filter(|j| !j.is_null()) {
+                            if let Ok(job) = serde_json::from_value::<RemoteJob>(hv.clone()) {
+                                if health_active.load(std::sync::atomic::Ordering::Relaxed)
+                                    < health_workers.load(std::sync::atomic::Ordering::Relaxed)
+                                {
+                                    println!("[node] claimed health job {} ({})", job.id, job.input_file);
+                                    health_active.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                    let client2 = client.clone();
+                                    let server2 = server.clone();
+                                    let nid2 = id.lock().unwrap().clone();
+                                    let ha2 = health_active.clone();
+                                    let free2 = slot_free.clone();
+                                    tokio::spawn(async move {
+                                        run_health_job(client2, server2, nid2, job).await;
+                                        ha2.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+                                        free2.notify_one();
+                                    });
+                                    continue; // claim the next one
+                                }
                             }
                         }
                         if let Some(jobv) = v.get("job").filter(|j| !j.is_null()) {

@@ -182,11 +182,41 @@ pub struct Job {
     /// the input directly — skipping the multi-GB loopback download.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub local_input: Option<String>,
+    /// "encode" (default) | "health" — a pre-encode source-integrity spot
+    /// check executed by a node that shares the source's filesystem (its
+    /// `mounts` cover `local_input`), so the decode cost lands on the node
+    /// instead of the server. Carries precomputed decode windows.
+    #[serde(default = "default_job_kind")]
+    pub kind: String,
+    /// Precomputed decode windows for kind="health" jobs: (seek s, len s,
+    /// per-window timeout s, full-file "all" mode). The node runs each
+    /// window with `-ss/-t [-frames:v 120] -f null` and reports the verdict.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub health_windows: Option<Vec<HealthWindow>>,
+    /// The node's verdict for kind="health": true = source decodes clean in
+    /// every window. Set only on terminal statuses.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub healthy: Option<bool>,
     /// Absolute path of the server's outputs/ staging dir ON THE SERVER'S
     /// HOST. A node sharing that filesystem moves its finished file straight
     /// there (a same-FS rename) and reports `localStage` instead of uploading.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub local_output: Option<String>,
+}
+
+fn default_job_kind() -> String {
+    "encode".into()
+}
+
+/// One decode window of a health-check job (server-side computation of the
+/// srcHealth graph node's mode/percentage, so the node stays dumb).
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HealthWindow {
+    pub seek: f64,
+    pub len: f64,
+    pub timeout_s: u64,
+    pub full_check: bool,
 }
 
 /// One accelerator as reported by a node: a physical device (GPU or iGPU)
@@ -237,6 +267,19 @@ pub struct Node {
     /// do 2-3 encodes without losing throughput). Default 1.
     #[serde(default = "default_one")]
     pub max_jobs: u32,
+    /// Concurrent PRE-ENCODE health checks this node may run (scan phase 2):
+    /// source-integrity decodes for files on filesystems the node shares
+    /// (see `mounts`), offloading the decode cost from the server. Separate
+    /// from `max_jobs` — health checks never block an encode slot. 0 (default)
+    /// = the node takes no health jobs.
+    #[serde(default)]
+    pub health_workers: u32,
+    /// Absolute mount roots on the node's filesystem that also exist on the
+    /// server (e.g. ["/media"] for a node container on the same NAS). Health
+    /// jobs are only routed to nodes whose mounts cover the source path —
+    /// the node reads the file directly, no download.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub mounts: Vec<String>,
     pub status: String,          // online | offline
     pub last_heartbeat: i64,
     /// When this node was first seen in the registry (epoch ms; persisted in Redis).
@@ -323,6 +366,13 @@ pub struct LibraryEntry {
     /// every scan. Reset on fresh scan evaluation and on manual ⟳.
     #[serde(default, skip_serializing_if = "is_zero_u32")]
     pub requeue_count: u32,
+    /// Last pre-encode source-health verdict (scan phase 2): Some(true) =
+    /// the srcHealth spot decode(s) passed, Some(None) = never checked
+    /// (no srcHealth gate in the file's logic, or the check is disabled).
+    /// The phase-3 graph evaluation feeds this value into the srcHealth
+    /// condition instead of decoding again.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub src_health: Option<bool>,
 }
 
 /// Default post-encode requeue cap (overridable via the settings tab,
@@ -484,7 +534,26 @@ impl JobStore {
         let best_id: Option<String> = self
             .jobs
             .values()
-            .filter(|j| j.status == "queued" && j.node_id.as_deref() == Some(node_id))
+            .filter(|j| j.kind == "encode" && j.status == "queued" && j.node_id.as_deref() == Some(node_id))
+            .map(|j| (&j.created_at, &j.id))
+            .min()
+            .map(|(_, id)| id.clone());
+        let Some(id) = best_id else { return None };
+        let mut j = self.jobs.get(&id)?.clone();
+        j.status = "dispatched".into();
+        j.dispatched_at = Some(now_ms());
+        self.jobs.insert(j.id.clone(), j.clone());
+        Some(j)
+    }
+
+    /// Health-check job variant: same claim semantics, kind filter — and
+    /// ONLY called when the node still has a free health slot (the poll
+    /// handler checks that against the node's configured healthWorkers).
+    pub fn claim_health_for_node(&mut self, node_id: &str) -> Option<Job> {
+        let best_id: Option<String> = self
+            .jobs
+            .values()
+            .filter(|j| j.kind == "health" && j.status == "queued" && j.node_id.as_deref() == Some(node_id))
             .map(|j| (&j.created_at, &j.id))
             .min()
             .map(|(_, id)| id.clone());
@@ -603,6 +672,8 @@ fn parse_node(id: &str, h: &NodeHash, online: bool) -> Option<Node> {
     let display_name = hash_get(h, "displayName").map(|s| s.to_string()).filter(|s| !s.is_empty());
     let allow_software = hash_get(h, "allowSoftware").map(|s| s == "true").unwrap_or(true);
     let max_jobs = hash_get(h, "maxJobs").and_then(|s| s.parse::<u32>().ok()).unwrap_or(1).clamp(1, 16);
+    let health_workers = hash_get(h, "healthWorkers").and_then(|s| s.parse::<u32>().ok()).unwrap_or(0).clamp(0, 16);
+    let mounts: Vec<String> = serde_json::from_str(hash_get(h, "mounts").unwrap_or("[]")).unwrap_or_default();
     let stat_u64 = |k: &str| -> Option<u64> { hash_get(h, k).and_then(|s| s.parse::<u64>().ok()) };
     let stat_f64 = |k: &str| -> Option<f64> { hash_get(h, k).and_then(|s| s.parse::<f64>().ok()) };
     accels.sort_by(|a, b| a.backend.cmp(&b.backend));
@@ -618,6 +689,8 @@ fn parse_node(id: &str, h: &NodeHash, online: bool) -> Option<Node> {
         enabled_backends,
         allow_software,
         max_jobs,
+        health_workers,
+        mounts,
         status: if online { "online".into() } else { "offline".into() },
         last_heartbeat,
         first_seen,
@@ -658,6 +731,7 @@ async fn reg_node(
     hw_encoders: &[String],
     accels: &[Accel],
     diag: &[String],
+    mounts: &[String],
 ) -> Result<Node, String> {
     let mut c = c;
     let now = now_ms();
@@ -690,6 +764,7 @@ async fn reg_node(
         .arg("hwEncoders").arg(serde_json::to_string(hw_encoders).unwrap_or_else(|_| "[]".into()))
         .arg("accels").arg(serde_json::to_string(accels).unwrap_or_else(|_| "[]".into()))
         .arg("diag").arg(serde_json::to_string(diag).unwrap_or_else(|_| "[]".into()))
+        .arg("mounts").arg(serde_json::to_string(mounts).unwrap_or_else(|_| "[]".into()))
         .arg("firstSeen").arg(first_seen)
         .arg("lastHeartbeat").arg(now);
     // Registration = (re)start: whatever job the old process "had" is gone.
@@ -714,6 +789,8 @@ async fn reg_node(
         enabled_backends: None,
         allow_software: true,
         max_jobs: 1,
+        health_workers: 0,
+        mounts: mounts.to_vec(),
         status: "online".into(),
         last_heartbeat: now,
         first_seen,
@@ -2025,6 +2102,19 @@ pub struct LibraryConfig {
     /// DEFAULT_REQUEUE_LIMIT.
     #[serde(default)]
     pub requeue_limit: Option<u32>,
+    /// Pre-encode source health check (settings tab, scan phase 2): decode
+    /// the srcHealth spot windows BEFORE the encode is queued, on a node
+    /// that shares the file's filesystem when one is online, else on the
+    /// server. Default on; off = the srcHealth gate evaluates as healthy
+    /// (corrupt sources are no longer quarantined pre-encode).
+    #[serde(default = "default_true")]
+    pub pre_health_check: bool,
+    /// Concurrent health-check workers on the SERVER (settings tab). Nodes
+    /// run their own (per-node `healthWorkers`). None = auto (4 with a GPU
+    /// decode path, 2 without), Some(0) = server decodes off, Some(n) = n.
+    /// The CT_HEALTH_WORKERS env still overrides at the deployment level.
+    #[serde(default)]
+    pub health_workers: Option<u32>,
     /// Bumped on EVERY settings save (logic / graph / folders / …). Saved
     /// encode decisions carry the version they were made with; a scan
     /// re-evaluates any decision whose version is older than this, so an
@@ -2328,11 +2418,15 @@ fn init_cuda() {
 /// pct% PLUS one random-position pct% window (the front is always part of
 /// the random check). Healthy = every window decodes without ffmpeg errors.
 ///
+/// Compute the decode windows for a srcHealth check from the file's graph
+/// depths — SHARED by the server-side check and the node health jobs (the
+/// node stays dumb: it just runs each window with -ss/-t -f null).
 /// `duration` may be UNKNOWN (None) — webm/matroska captures frequently
 /// carry no duration metadata. An unknown duration is NOT corruption: fall
 /// back to a fixed 3s front window (enough to exercise the decode
-/// pipeline) instead of auto-failing the file.
-async fn decode_health_check(path: &str, duration: Option<f64>, depths: &[(String, u32)]) -> bool {
+/// pipeline) instead of auto-failing the file. `path` seeds the "random"
+/// window's re-seed (different spots get spot-checked over time).
+fn health_windows_for(duration: Option<f64>, depths: &[(String, u32)], path: &str) -> Vec<HealthWindow> {
     const UNKNOWN_WINDOW_S: f64 = 3.0;
     let known = duration.map_or(false, |d| d > 0.0);
     let d = duration.unwrap_or(0.0);
@@ -2382,7 +2476,7 @@ async fn decode_health_check(path: &str, duration: Option<f64>, depths: &[(Strin
         }
     }
     if windows.is_empty() {
-        return true;
+        return Vec::new();
     }
     // Merge overlapping windows (several nodes may request the same span).
     windows.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
@@ -2396,18 +2490,38 @@ async fn decode_health_check(path: &str, duration: Option<f64>, depths: &[(Strin
         }
         merged.push((s, l));
     }
-    for (seek, len) in merged {
-        // Timeouts scale with the decode length: ~8x realtime (slow-CPU
-        // software decode), clamped. Window decodes max out at 15 min; a
-        // full-file "all" decode at 1 hour.
-        let scaled = (len * 8.0) as u64;
-        let full_check = known && len >= d - 0.5;
-        let timeout_s = if full_check {
-            scaled.clamp(30, 3600)
-        } else {
-            scaled.clamp(30, 900)
-        };
-        if !decode_window_ok(path, seek, len, timeout_s, full_check).await {
+    // Timeouts scale with the decode length: ~8x realtime (slow-CPU
+    // software decode), clamped. Window decodes max out at 15 min; a
+    // full-file "all" decode at 1 hour.
+    merged
+        .iter()
+        .map(|&(seek, len)| {
+            let scaled = (len * 8.0) as u64;
+            let full_check = known && len >= d - 0.5;
+            let timeout_s = if full_check {
+                scaled.clamp(30, 3600)
+            } else {
+                scaled.clamp(30, 900)
+            };
+            HealthWindow {
+                seek,
+                len,
+                timeout_s,
+                full_check,
+            }
+        })
+        .collect()
+}
+
+/// Server-side source health check: run every window on this host (GPU
+/// decode when the container carries a bundled NVIDIA userland).
+async fn decode_health_check(path: &str, duration: Option<f64>, depths: &[(String, u32)]) -> bool {
+    let windows = health_windows_for(duration, depths, path);
+    if windows.is_empty() {
+        return true;
+    }
+    for w in &windows {
+        if !decode_window_ok(path, w.seek, w.len, w.timeout_s, w.full_check).await {
             return false;
         }
     }
@@ -2674,6 +2788,9 @@ static LIB_CFG_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 struct ScanState {
     /// A scan is running right now.
     active: bool,
+    /// Current pipeline phase: "index" (walk+probe, list fills live) |
+    /// "health" (pre-encode source integrity) | "logic" (evaluate+queue).
+    phase: String,
     /// Files probed so far (this run).
     scanned: usize,
     /// Total files to probe (known after the directory walk).
@@ -2682,6 +2799,13 @@ struct ScanState {
     started_at: i64,
     /// Human scope: "all folders" | "folder: /path" | ad-hoc root.
     scope: String,
+    /// Files whose logic actually needs a srcHealth decode (phase 2).
+    health_total: usize,
+    /// Phase-2 files checked so far (verdict stored on the entry).
+    health_done: usize,
+    /// Files skipped in phase 2 (no srcHealth gate, or the gate can't
+    /// change the outcome for that file — decode would be pure waste).
+    health_skipped: usize,
     /// Result of the last finished run (kept for the UI after it ends).
     finished_queued: usize,
     finished_skipped: usize,
@@ -2689,10 +2813,14 @@ struct ScanState {
 
 static SCAN_STATE: std::sync::Mutex<ScanState> = std::sync::Mutex::new(ScanState {
     active: false,
+    phase: String::new(),
     scanned: 0,
     total: 0,
     started_at: 0,
     scope: String::new(),
+    health_total: 0,
+    health_done: 0,
+    health_skipped: 0,
     finished_queued: 0,
     finished_skipped: 0,
 });
@@ -3708,6 +3836,11 @@ struct SettingsBody {
     /// Post-encode requeue cap (missing = leave as-is, 0 = default 3,
     /// N = clamp 1..=100).
     requeue_limit: Option<u32>,
+    /// Pre-encode source health check (missing = leave as-is).
+    pre_health_check: Option<bool>,
+    /// Server-side health-check workers (missing = leave as-is, null = auto,
+    /// 0 = off, N = clamp 0..=16).
+    health_workers: Option<Option<u32>>,
 }
 
 /// GET /api/settings — server-level settings (fail folder, auto-rescan).
@@ -3723,6 +3856,8 @@ async fn settings_get(State(_store): State<Store>) -> impl IntoResponse {
         "autoScanMinutes": c.auto_scan_minutes,
         "language": lang,
         "requeueLimit": c.requeue_limit.filter(|v| *v > 0).unwrap_or(DEFAULT_REQUEUE_LIMIT),
+        "preHealthCheck": c.pre_health_check,
+        "healthWorkers": c.health_workers,
     }))
 }
 
@@ -3743,6 +3878,21 @@ async fn settings_post(State(_store): State<Store>, Json(b): Json<SettingsBody>)
     if let Some(r) = b.requeue_limit {
         c.requeue_limit = if r == 0 { None } else { Some(r.min(100)) };
     }
+    // Toggling the pre-encode health check CHANGES per-file outcomes (a
+    // corrupt source quarantines vs queues), so an actual flip must bump
+    // logic_version — saved decisions were made under the old gate. A
+    // no-op re-save stays quiet.
+    let health_flip = b
+        .pre_health_check
+        .is_some_and(|on| on != c.pre_health_check);
+    if let Some(on) = b.pre_health_check {
+        c.pre_health_check = on;
+    }
+    if let Some(w) = b.health_workers {
+        // null = back to auto (None); Some(n) clamped 0..=16 (0 = server
+        // decodes off — nodes still run their own).
+        c.health_workers = w.map(|n| n.min(16));
+    }
     match b.language {
         Some(None) => c.language = None,
         Some(Some(l)) => c.language = Some(if l == "en" { "en" } else { "ko" }.to_string()),
@@ -3754,9 +3904,17 @@ async fn settings_post(State(_store): State<Store>, Json(b): Json<SettingsBody>)
         .filter(|l| l == "ko" || l == "en")
         .unwrap_or_else(|| "ko".to_string());
     // Operational settings only (fail dir, scan interval, requeue cap,
-    // language) — none of them change per-file encoding decisions, so a
-    // logic_version bump would needlessly invalidate every stored decision.
-    match save_lib_cfg_quiet(&c) {
+    // language, health workers) — none of them change per-file encoding
+    // decisions, so a logic_version bump would needlessly invalidate every
+    // stored decision. EXCEPTION: flipping the pre-encode health check
+    // changes the srcHealth gate outcome, which is a decision input — that
+    // one must invalidate (full save bumps logic_version).
+    let saved = if health_flip {
+        save_lib_cfg(&c)
+    } else {
+        save_lib_cfg_quiet(&c)
+    };
+    match saved {
         Ok(_) => Json(json!({ "ok": true, "failDir": c.fail_dir, "autoScanMinutes": c.auto_scan_minutes, "language": lang })).into_response(),
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -4247,7 +4405,9 @@ fn active_jobs_by_node_dev(
     let s = store.lock().unwrap_or_else(|p| p.into_inner());
     let mut m: std::collections::HashMap<u32, u32> = std::collections::HashMap::new();
     for j in s.jobs.values() {
-        if matches!(j.status.as_str(), "queued" | "dispatched" | "running")
+        // Encode jobs only (health checks pin no GPU and use their own slots).
+        if j.kind == "encode"
+            && matches!(j.status.as_str(), "queued" | "dispatched" | "running")
             && j.node_id.as_deref() == Some(node_id)
         {
             if let Some(p) = prefix {
@@ -4306,7 +4466,9 @@ fn active_jobs_by_node(store: &Store, prefix: Option<&str>) -> std::collections:
     let s = store.lock().unwrap_or_else(|p| p.into_inner());
     let mut m: std::collections::HashMap<String, u32> = std::collections::HashMap::new();
     for j in s.jobs.values() {
-        if matches!(j.status.as_str(), "queued" | "dispatched" | "running") {
+        // Encode jobs only — health checks run on the node's own
+        // healthWorkers slots and must not count against the encode load.
+        if j.kind == "encode" && matches!(j.status.as_str(), "queued" | "dispatched" | "running") {
             if let Some(nid) = &j.node_id {
                 if let Some(p) = prefix {
                     match &j.lib_path {
@@ -4437,13 +4599,15 @@ fn max_queued() -> usize {
 /// Jobs currently occupying the queue (not finished, not cancelled).
 fn active_job_count(store: &Store) -> usize {
     // No-clone count (list() clones+sorts the whole map — this runs on every
-    // job completion, a few times per sweep on a busy node).
+    // job completion, a few times per sweep on a busy node). Health-check
+    // jobs are EXCLUDED: they run on the node's own health slots (never an
+    // encode slot) and must not eat the encode queue cap.
     store
         .lock()
         .unwrap_or_else(|p| p.into_inner())
         .jobs
         .values()
-        .filter(|j| matches!(j.status.as_str(), "queued" | "dispatched" | "running"))
+        .filter(|j| j.kind == "encode" && matches!(j.status.as_str(), "queued" | "dispatched" | "running"))
         .count()
 }
 
@@ -4468,16 +4632,18 @@ async fn dispatch_lib_job(
     if resolve_lib_source(&key, store).is_none() {
         return Ok(false);
     }
-    // Duplicate guard: a queued/running job for this exact source means the
-    // encode is already in flight (requeue fired while the first run is
-    // active, two scans raced, ...). Queueing a second job would write the
-    // same deterministic output path twice and muddle results — treat it as
-    // "busy" so the entry stays pending and a later rescan retries it.
+    // Duplicate guard: a queued/running ENCODE job for this exact source
+    // means the encode is already in flight (requeue fired while the first
+    // run is active, two scans raced, ...). Queueing a second job would
+    // write the same deterministic output path twice and muddle results —
+    // treat it as "busy" so the entry stays pending and a later rescan
+    // retries it. (kind="health" jobs share input_file — that is the
+    // in-flight pre-check, not a duplicate encode.)
     if store
         .lock().unwrap_or_else(|p| p.into_inner())
         .jobs
         .values()
-        .any(|j| j.input_file == key && (j.status == "queued" || j.status == "running"))
+        .any(|j| j.kind == "encode" && j.input_file == key && (j.status == "queued" || j.status == "running"))
     {
         return Ok(false);
     }
@@ -4667,6 +4833,9 @@ async fn dispatch_lib_job(
         post: post.to_vec(),
         local_input,
         local_output: Some(outputs_dir().to_string_lossy().to_string()),
+        kind: "encode".into(),
+        health_windows: None,
+        healthy: None,
     };
     store.lock().unwrap_or_else(|p| p.into_inner()).insert(job);
     Ok(true)
@@ -5527,6 +5696,73 @@ async fn library_scan(
     library_scan_inner(store, req).await
 }
 
+/// Phase-1 commit — runs INSIDE each probe task the moment that file's
+/// probe finishes: carry-forward merge (a rescan must not reset done /
+/// skipped / in-flight entries), the cheap notvideo gate, then a LIVE
+/// insert into the catalog so the dashboard list fills up while the probe
+/// phase is still running (the old all-at-once commit left the UI empty
+/// for the whole scan, and 2026-10-27's 2066-file scan stranded the
+/// sequential collector on one lost task — with per-task commits a
+/// stranded task only loses itself, the rest of the scan flows on).
+/// Persist is batched: every 25th commit snapshots the catalog (the
+/// fire-and-forget blocking-pool writer coalesces bursts).
+async fn commit_indexed_entry(
+    store: &Store,
+    e: &mut LibraryEntry,
+    old: Option<&LibraryEntry>,
+    live: &std::collections::HashSet<String>,
+) {
+    let key = e.key();
+    if let Some(o) = old {
+        let keep = match o.status.as_str() {
+            "done" => true,
+            "skipped" => true,
+            "queued" | "running" | "dispatched" => live.contains(&key),
+            _ => false,
+        };
+        // A saved decision is worth keeping even when the entry status is
+        // reset — the fast path re-uses it on the next pass.
+        e.decision = o.decision.clone();
+        e.decision_version = o.decision_version;
+        if keep {
+            e.status = o.status.clone();
+            e.reencoded = o.reencoded.clone();
+            e.new_size = o.new_size;
+            e.new_codec = o.new_codec.clone();
+            e.error = o.error.clone();
+            if o.status == "done" {
+                // The done entry is the ENCODED output — its probe fields
+                // describe the replacement file on disk, not the source.
+                e.size = o.size;
+                e.duration = o.duration;
+                e.video_codec = o.video_codec.clone();
+                e.audio_codec = o.audio_codec.clone();
+                e.width = o.width;
+                e.height = o.height;
+                e.fps = o.fps;
+                e.video_bit_rate = o.video_bit_rate;
+                e.pix_fmt = o.pix_fmt.clone();
+            }
+        }
+    }
+    // NOTE: the notvideo gate stays in the scan's pass 1 (it needs the
+    // container/extension nuances and must NOT fire for disabled-folder or
+    // size-0 sentinel entries) — this commit only carries forward +
+    // inserts.
+    {
+        let mut s = store.lock().unwrap_or_else(|p| p.into_inner());
+        s.library.insert(key, e.clone());
+    }
+    let n = {
+        let mut st = SCAN_STATE.lock().unwrap_or_else(|p| p.into_inner());
+        st.scanned += 1;
+        st.scanned
+    };
+    if n % 25 == 0 {
+        persist_catalog(store);
+    }
+}
+
 /// The actual scan (also called internally by the auto-rescan loop).
 async fn library_scan_inner(store: Store, req: ScanReq) -> Response {
     // Boot gate (2026-10-27 wedge): a client that re-detects the server
@@ -5687,10 +5923,14 @@ async fn library_scan_inner(store: Store, req: ScanReq) -> Response {
     };
     *SCAN_STATE.lock().unwrap_or_else(|p| p.into_inner()) = ScanState {
         active: true,
+        phase: "index".into(),
         scanned: 0,
         total: plan.len(),
         started_at: now_ms(),
         scope: scan_scope_label(&roots, &libcfg),
+        health_total: 0,
+        health_done: 0,
+        health_skipped: 0,
         finished_queued: 0,
         finished_skipped: 0,
     };
@@ -5701,13 +5941,17 @@ async fn library_scan_inner(store: Store, req: ScanReq) -> Response {
         let live: std::collections::HashSet<String> = s
             .list()
             .into_iter()
-            .filter(|j| j.lib_path.is_some() && !["done", "error"].contains(&j.status.as_str()))
+            .filter(|j| j.kind == "encode" && j.lib_path.is_some() && !["done", "error"].contains(&j.status.as_str()))
             .map(|j| j.input_file)
             .collect();
         (s.list_library(), live)
     };
     let old_map: std::collections::HashMap<String, LibraryEntry> =
         old_entries.iter().map(|o| (o.key(), o.clone())).collect();
+    // The live set is read INSIDE each probe task (the live commit merges
+    // carry-forward statuses per file as probes finish) — Arc so the clone
+    // is a pointer bump, not a set copy, 2066 times over.
+    let live: std::sync::Arc<std::collections::HashSet<String>> = std::sync::Arc::new(live);
 
     // Probe in parallel (bounded). A file already in the catalog with the
     // SAME size and a non-error status is unchanged — reuse its probe
@@ -5778,6 +6022,9 @@ async fn library_scan_inner(store: Store, req: ScanReq) -> Response {
         // duration of a NAS stall and freezes the whole spawn phase
         // (2026-10-26: scan wedged mid-loop, 0 child procs, 0 CPU).
         let old_entry = old_map.get(&key).cloned();
+        let old_for_commit = old_entry.clone();
+        let live_c = live.clone();
+        let store_c = store.clone();
         let sem = sem.clone();
         handles.push(tokio::spawn(async move {
             PROBE_TASKS_STARTED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -5848,7 +6095,7 @@ async fn library_scan_inner(store: Store, req: ScanReq) -> Response {
                             eprintln!(
                                 "[scan] probe semaphore starved >120s — deferring to next scan: {pstr}"
                             );
-                            return Some(LibraryEntry {
+                            let mut e = LibraryEntry {
                                 path: rel.to_string_lossy().to_string(),
                                 name: full
                                     .file_name()
@@ -5860,7 +6107,9 @@ async fn library_scan_inner(store: Store, req: ScanReq) -> Response {
                                 container: if ext.is_empty() { None } else { Some(ext) },
                                 folder: fid,
                                 ..Default::default()
-                            });
+                            };
+                            commit_indexed_entry(&store_c, &mut e, old_for_commit.as_ref(), &live_c).await;
+                            return Some(e);
                         }
                     };
                     phase_set(&pstr, "probe");
@@ -5868,7 +6117,7 @@ async fn library_scan_inner(store: Store, req: ScanReq) -> Response {
                     probe_full(&pstr).await
                 }
             };
-            Some(LibraryEntry {
+            let mut e = LibraryEntry {
                 path: rel.to_string_lossy().to_string(),
                 name: full
                     .file_name()
@@ -5897,7 +6146,10 @@ async fn library_scan_inner(store: Store, req: ScanReq) -> Response {
                 decision: None,
                 decision_version: None,
                 requeue_count: 0,
-            })
+                src_health: None,
+            };
+            commit_indexed_entry(&store_c, &mut e, old_for_commit.as_ref(), &live_c).await;
+            Some(e)
         }));
     }
     eprintln!("[scan] spawned {} probe tasks — collecting", handles.len());
@@ -6150,30 +6402,36 @@ async fn library_scan_inner(store: Store, req: ScanReq) -> Response {
             SCAN_STATE.lock().unwrap_or_else(|p| p.into_inner()).finished_queued += 1;
         }
     }
-    // Pass 2 — one streaming task per surviving file.
+    // Pass 2 (phases "health" + "logic") — one streaming task per
+    // surviving file: pre-encode source health check (node-routed first,
+    // server fallback) → graph decision → job dispatch, so the queue fills
+    // while the later files are still being checked.
     let online = std::sync::Arc::new(online);
     let eff_graph = std::sync::Arc::new(eff_graph);
     let live = std::sync::Arc::new(live);
-    // Health decode workers. CT_HEALTH_WORKERS overrides per deployment
-    // (0 = OFF: no decode runs, the srcHealth gate evaluates as healthy);
-    // otherwise the auto default — with the GPU decode the decodes cost ~0
-    // CPU so run 4 in parallel; without a GPU stay at 2 (2 x 2 threads ≈
-    // 4 of 8 cores) so the CPU path can't oversubscribe the box.
-    let health_conc: usize = match std::env::var("CT_HEALTH_WORKERS").ok() {
-        Some(s) => match s.parse() {
-            Ok(n) => n,
-            Err(_) => 2,
-        },
-        None => {
-            let d = if cuda_libdir().is_some() { 4 } else { 2 };
-            eprintln!("[CodecTrans] health workers: {d} (auto — set CT_HEALTH_WORKERS to override, 0 = off)");
-            d
+    // Server-side health-decode budget. CT_HEALTH_WORKERS still wins as a
+    // per-deployment override; otherwise the SETTINGS value (None = auto:
+    // GPU 4 / CPU 2, 0 = off — the gate then evaluates as healthy, so
+    // node-mounted decodes are the only ones that run).
+    let server_health: u32 = if let Ok(s) = std::env::var("CT_HEALTH_WORKERS") {
+        s.parse().unwrap_or(2)
+    } else {
+        match libcfg.health_workers {
+            Some(0) => 0,
+            Some(n) => n.clamp(1, 16),
+            None => {
+                let d = if cuda_libdir().is_some() { 4 } else { 2 };
+                eprintln!("[CodecTrans] server health workers: {d} (auto — set the settings value, 0 = off)");
+                d
+            }
         }
     };
-    if health_conc == 0 {
-        eprintln!("[CodecTrans] health workers: 0 — srcHealth decode disabled (gate evaluates as healthy)");
+    if server_health == 0 {
+        eprintln!("[CodecTrans] server health workers: 0 — only node-mounted sources get decoded; the rest evaluate as healthy");
     }
-    let health_sem = std::sync::Arc::new(tokio::sync::Semaphore::new(health_conc.max(1)));
+    let pre_health = libcfg.pre_health_check;
+    SCAN_STATE.lock().unwrap_or_else(|p| p.into_inner()).phase = "health".into();
+    let health_sem = std::sync::Arc::new(tokio::sync::Semaphore::new(server_health.max(1) as usize));
     let libcfg = std::sync::Arc::new(libcfg);
     let store_t = store.clone();
     let mut handles: Vec<tokio::task::JoinHandle<(String, Option<String>, Option<LibraryEntry>)>> = Vec::new();
@@ -6193,60 +6451,265 @@ async fn library_scan_inner(store: Store, req: ScanReq) -> Response {
                 .find(|f| e.folder.as_deref() == Some(f.id.as_str()));
             let folder_target: TargetCfg =
                 folder.map(|f| f.target.clone()).unwrap_or_default();
-            // Graph decision — with a LAZY health check. If the graph
-            // reaches the SAME decision with srcHealth true AND false, the
-            // decode is pure waste for this file (it is skipped by cheaper
+            // Pre-encode source health check — LAZY: if the graph reaches
+            // the SAME decision with srcHealth true AND false, the decode
+            // is pure waste for this file (it is skipped by cheaper
             // conditions first) — only files whose outcome actually depends
             // on the health gate pay for the decode. (evaluate_graph is a
             // free async fn — a local fn item can't capture this block's
             // dynamic environment.)
-            let h_true = std::collections::HashMap::from([(key.clone(), true)]);
-            let h_false = std::collections::HashMap::from([(key.clone(), false)]);
-            // This file's own srcHealth depth: derived from its EFFECTIVE
-            // graph only. Empty = the file's graph never asks for a decode
-            // -> evaluate without touching the source.
+            //
+            // PHASE 2 ROUTING (settings: preHealthCheck / healthWorkers):
+            //   * the file's own graph decides — its EFFECTIVE graph's
+            //     srcHealth depths; empty = the file's graph never asks
+            //     for a decode, so nothing is evaluated for it
+            //   * preHealthCheck OFF -> the gate evaluates as healthy
+            //     (no quarantine; corrupt sources surface at encode)
+            //   * ON -> the decode runs on a NODE that (a) is online,
+            //     (b) is configured with healthWorkers, and (c) MOUNTS
+            //     the source path — same filesystem, so the file is
+            //     visible locally (no download). The decode cost lands on
+            //     the node (NVDEC ≈ 0 CPU) instead of the server.
+            //     Otherwise the server decodes it itself, bounded by the
+            //     server healthWorkers budget.
             let file_depths: Vec<(String, u32)> =
                 effective_graph_for(folder, &libcfg, &eff_graph)
                     .map(|g| src_health_depths(&[g]))
                     .unwrap_or_default();
-            let decision = if file_depths.is_empty() {
-                evaluate_graph(&h_true, &e, folder, &libcfg, &eff_graph, &online).await
-            } else if health_conc == 0 {
-                // Workers disabled (CT_HEALTH_WORKERS=0): the decode never
-                // runs, so the gate can only ever pass — evaluate as
-                // healthy. (Corrupt files are no longer quarantined.)
-                evaluate_graph(&h_true, &e, folder, &libcfg, &eff_graph, &online).await
+            // None = the gate is never consulted for this file.
+            let verdict: Option<bool> = if file_depths.is_empty() || !pre_health {
+                // (preHealthCheck OFF: the gate always passes — below the
+                // graph is evaluated with srcHealth=true.)
+                if !pre_health && !file_depths.is_empty() {
+                    Some(true)
+                } else {
+                    None
+                }
             } else {
+                let h_true = std::collections::HashMap::from([(key.clone(), true)]);
+                let h_false = std::collections::HashMap::from([(key.clone(), false)]);
                 let d_true = evaluate_graph(&h_true, &e, folder, &libcfg, &eff_graph, &online).await;
                 let d_false =
                     evaluate_graph(&h_false, &e, folder, &libcfg, &eff_graph, &online).await;
                 if d_true == d_false {
                     // The health gate changes nothing for this file — skip
                     // the decode entirely.
-                    d_true
+                    None
                 } else {
-                    // Health MATTERS — run the srcHealth decode (bounded to
-                    // 4 parallel decodes across the scan). An unknown
-                    // duration is not corruption: decode_health_check falls
-                    // back to a short front window.
-                    let h = match resolve_lib_source(&key, &store_t) {
-                        Some(p) => {
-                            let _g = health_sem.acquire_owned().await.expect("health sem");
-                            decode_health_check(&p.to_string_lossy(), e.duration, &file_depths).await
+                    match resolve_lib_source(&key, &store_t) {
+                        None => {
+                            // Source vanished (moved/renamed after the probe)
+                            // — fail the gate; the next scan re-probes it.
+                            SCAN_STATE.lock().unwrap_or_else(|p| p.into_inner()).health_done += 1;
+                            Some(false)
                         }
-                        None => false,
-                    };
-                    evaluate_graph(
-                        if h { &h_true } else { &h_false },
-                        &e,
-                        folder,
-                        &libcfg,
-                        &eff_graph,
-                        &online,
-                    )
-                    .await
+                        Some(p) => {
+                            let srcs = p.to_string_lossy().to_string();
+                            let windows = health_windows_for(e.duration, &file_depths, &srcs);
+                            if windows.is_empty() {
+                                Some(true)
+                            } else {
+                                // Route: least-loaded ONLINE node that covers
+                                // the path with its mounts. (Encode load as
+                                // the tiebreaker — health has its own slots,
+                                // but a pegged node is pegged.)
+                                let counts = active_jobs_by_node(&store_t, None);
+                                let node = online
+                                    .iter()
+                                    .filter(|n| {
+                                        n.health_workers > 0
+                                            && n.mounts.iter().any(|m| {
+                                                let m = m.trim_end_matches('/');
+                                                !m.is_empty() && srcs.starts_with(m)
+                                            })
+                                    })
+                                    .min_by_key(|n| counts.get(&n.id).copied().unwrap_or(0));
+                                match node {
+                                    Some(n) => {
+                                        // NODE health job: queue a
+                                        // kind="health" job and wait for the
+                                        // verdict — the node advertises its
+                                        // free health slots on every poll
+                                        // (?health=N) and claims from the
+                                        // health queue. Deadline = 1.5x the
+                                        // window budget + 5 min; a silent
+                                        // node falls back to the server
+                                        // budget (or "healthy" when the
+                                        // server runs no health workers —
+                                        // the legacy no-worker semantics).
+                                        let sum_timeout: u64 =
+                                            windows.iter().map(|w| w.timeout_s).sum();
+                                        let deadline =
+                                            now_ms() + ((sum_timeout.saturating_mul(3) / 2) + 300) as i64;
+                                        let job = Job {
+                                            id: uuid::Uuid::new_v4().to_string(),
+                                            input_file: key.clone(),
+                                            output_file: String::new(),
+                                            video_codec: String::new(),
+                                            effective_video_codec: String::new(),
+                                            audio_codec: String::new(),
+                                            container: String::new(),
+                                            crf: None,
+                                            video_bitrate: None,
+                                            bitrate_pct: None,
+                                            source_bit_rate: e.video_bit_rate,
+                                            status: "queued".into(),
+                                            progress: 0.0,
+                                            created_at: now_ms(),
+                                            started_at: None,
+                                            dispatched_at: None,
+                                            finished_at: None,
+                                            error: None,
+                                            input_size: Some(e.size),
+                                            output_size: None,
+                                            node_id: Some(n.id.clone()),
+                                            executed_by: n.display().to_string(),
+                                            accelerated: false,
+                                            lib_path: Some(key.clone()),
+                                            gpu_device: None,
+                                            post: vec![],
+                                            local_input: Some(srcs.clone()),
+                                            local_output: None,
+                                            kind: "health".into(),
+                                            health_windows: Some(windows.clone()),
+                                            healthy: None,
+                                        };
+                                        let jid = job.id.clone();
+                                        store_t.lock().unwrap_or_else(|p2| p2.into_inner()).insert(job);
+                                        let mut verdict = None;
+                                        loop {
+                                            let (st, hd) = {
+                                                let s =
+                                                    store_t.lock().unwrap_or_else(|p2| p2.into_inner());
+                                                s.jobs
+                                                    .get(&jid)
+                                                    .map(|j| (j.status.clone(), j.healthy))
+                                                    .unwrap_or_else(|| ("error".to_string(), None))
+                                            };
+                                            match st.as_str() {
+                                                "done" => {
+                                                    verdict = Some(hd.unwrap_or(true));
+                                                    break;
+                                                }
+                                                "error" | "cancelled" => {
+                                                    verdict = Some(hd.unwrap_or(false));
+                                                    break;
+                                                }
+                                                _ => {
+                                                    if now_ms() >= deadline {
+                                                        // Timed out — cancel
+                                                        // the node job and
+                                                        // fall back.
+                                                        {
+                                                            let mut s =
+                                                                store_t
+                                                                    .lock()
+                                                                    .unwrap_or_else(|p2| p2.into_inner());
+                                                            if let Some(j) = s.jobs.get_mut(&jid) {
+                                                                if j.status != "done" {
+                                                                    j.status = "cancelled".into();
+                                                                }
+                                                            }
+                                                        }
+                                                        if server_health > 0 {
+                                                            eprintln!(
+                                                                "[scan] health job {jid} timed out on {} — server fallback",
+                                                                n.display()
+                                                            );
+                                                            let _g =
+                                                                health_sem.acquire_owned().await.expect("health sem");
+                                                            let mut ok = true;
+                                                            for w in &windows {
+                                                                if !decode_window_ok(
+                                                                    &srcs,
+                                                                    w.seek,
+                                                                    w.len,
+                                                                    w.timeout_s,
+                                                                    w.full_check,
+                                                                )
+                                                                .await
+                                                                {
+                                                                    ok = false;
+                                                                    break;
+                                                                }
+                                                            }
+                                                            verdict = Some(ok);
+                                                        } else {
+                                                            eprintln!(
+                                                                "[scan] health job {jid} timed out on {} — no server workers, evaluating as healthy",
+                                                                n.display()
+                                                            );
+                                                            verdict = Some(true);
+                                                        }
+                                                        break;
+                                                    }
+                                                    tokio::time::sleep(std::time::Duration::from_millis(2000))
+                                                        .await;
+                                                }
+                                            }
+                                        }
+                                        SCAN_STATE
+                                            .lock()
+                                            .unwrap_or_else(|p| p.into_inner())
+                                            .health_done += 1;
+                                        verdict
+                                    }
+                                    None if server_health > 0 => {
+                                        // SERVER decode — bounded to the
+                                        // settings budget. An unknown
+                                        // duration is not corruption: the
+                                        // windows fall back to a short front
+                                        // window (health_windows_for).
+                                        let _g = health_sem.acquire_owned().await.expect("health sem");
+                                        let mut ok = true;
+                                        for w in &windows {
+                                            if !decode_window_ok(
+                                                &srcs,
+                                                w.seek,
+                                                w.len,
+                                                w.timeout_s,
+                                                w.full_check,
+                                            )
+                                            .await
+                                            {
+                                                ok = false;
+                                                break;
+                                            }
+                                        }
+                                        SCAN_STATE
+                                            .lock()
+                                            .unwrap_or_else(|p| p.into_inner())
+                                            .health_done += 1;
+                                        Some(ok)
+                                    }
+                                    None => {
+                                        // No health workers anywhere — the
+                                        // legacy no-worker semantics: the
+                                        // gate can only pass.
+                                        eprintln!(
+                                            "[scan] no health workers for {} — evaluating as healthy",
+                                            srcs
+                                        );
+                                        SCAN_STATE
+                                            .lock()
+                                            .unwrap_or_else(|p| p.into_inner())
+                                            .health_skipped += 1;
+                                        Some(true)
+                                    }
+                                }
+                            }
+                        }
+                    }
                 }
             };
+            // The verdict the graph actually sees (None / healthy = true).
+            let h_true = std::collections::HashMap::from([(key.clone(), true)]);
+            let h_false = std::collections::HashMap::from([(key.clone(), false)]);
+            let h_map = match verdict {
+                Some(false) => &h_false,
+                _ => &h_true,
+            };
+            let decision = evaluate_graph(h_map, &e, folder, &libcfg, &eff_graph, &online).await;
             let mut saved_decision: Option<String> = None;
             let outcome: Option<String> = match decision {
                 None => None,
@@ -6322,6 +6785,9 @@ async fn library_scan_inner(store: Store, req: ScanReq) -> Response {
                 let mut e3 = e.clone();
                 e3.decision = saved_decision;
                 e3.decision_version = Some(logic_version);
+                // The phase-2 verdict, so the next scan's fast path (and the
+                // UI) can see whether the source was verified.
+                e3.src_health = verdict;
                 // Fresh evaluation — the requeue cap starts over.
                 e3.requeue_count = 0;
                 if let Some(mark) = &outcome {
@@ -6425,6 +6891,7 @@ async fn library_scan_inner(store: Store, req: ScanReq) -> Response {
     {
         let mut st = SCAN_STATE.lock().unwrap_or_else(|p| p.into_inner());
         st.active = false;
+        st.phase = "logic".into();
         st.scanned = scanned;
         st.total = scanned;
         st.finished_queued = queued.len();
@@ -6615,6 +7082,9 @@ async fn transcode(State(store): State<Store>, Json(req): Json<TranscodeReq>) ->
         post: Vec::new(),
         local_input: None,
         local_output: None,
+        kind: "encode".into(),
+        health_windows: None,
+        healthy: None,
     };
     let job_for_worker = job.clone();
     {
@@ -6627,10 +7097,14 @@ async fn transcode(State(store): State<Store>, Json(req): Json<TranscodeReq>) ->
 }
 
 async fn list_jobs(State(store): State<Store>) -> impl IntoResponse {
+    // The UI's job list shows ENCODE jobs only — health-check jobs are
+    // internal pipeline work (they flash through the list and mean nothing
+    // to the user).
     let v: Vec<Value> = store
         .lock().unwrap_or_else(|p| p.into_inner())
         .list()
         .into_iter()
+        .filter(|j| j.kind == "encode")
         .map(serde_json::to_value)
         .collect::<Result<Vec<_>, _>>()
         .unwrap_or_default();
@@ -6783,7 +7257,12 @@ struct RegisterReq {
     accels: Option<Vec<Accel>>,
     /// Startup diagnostics (probe failures, driver state) — headless nodes.
     #[serde(default)]
-    diag: Option<Vec<String>>,
+    pub diag: Option<Vec<String>>,
+    /// Absolute mount roots the node shares with the server's filesystem
+    /// (CT_MOUNTS env, comma-separated) — health checks are only routed to
+    /// nodes whose mounts cover the source path.
+    #[serde(default)]
+    mounts: Vec<String>,
 }
 
 /// POST /api/nodes/register — a node announces itself with its ffmpeg capabilities.
@@ -6791,12 +7270,13 @@ struct RegisterReq {
 /// and heartbeat are refreshed and the SAME id is returned (safe to re-register,
 /// e.g. after a server restart).
 async fn node_register(State(store): State<Store>, Json(req): Json<RegisterReq>) -> Response {
-    let (ffmpeg_version, haccels, hw_encoders, accels, diag) = (
+    let (ffmpeg_version, haccels, hw_encoders, accels, diag, mounts) = (
         req.ffmpeg_version.unwrap_or_default(),
         req.haccels.unwrap_or_default(),
         req.hw_encoders.unwrap_or_default(),
         req.accels.unwrap_or_default(),
         req.diag.unwrap_or_default(),
+        req.mounts.iter().map(|m| m.trim().to_string()).filter(|m| !m.is_empty() && m.starts_with('/')).collect::<Vec<_>>(),
     );
     // idempotent re-register by name — the id is looked up in Redis, so a
     // node keeps its identity across server (and its own) restarts.
@@ -6807,7 +7287,7 @@ async fn node_register(State(store): State<Store>, Json(req): Json<RegisterReq>)
         .await
         .ok()
         .flatten();
-    let node = match reg_node(c, &req.name, &ffmpeg_version, &haccels, &hw_encoders, &accels, &diag).await {
+    let node = match reg_node(c, &req.name, &ffmpeg_version, &haccels, &hw_encoders, &accels, &diag, &mounts).await {
         Ok(n) => n,
         Err(e) => return (StatusCode::BAD_GATEWAY, Json(json!({ "error": e }))).into_response(),
     };
@@ -6877,6 +7357,9 @@ struct NodeConfigBody {
     pub allow_software: Option<bool>,
     /// Absent = unchanged. Clamped 1..=16.
     pub max_jobs: Option<u32>,
+    /// Concurrent pre-encode health checks this node runs (0 = none).
+    /// Absent = unchanged. Clamped 0..=16.
+    pub health_workers: Option<u32>,
 }
 
 async fn node_config_patch(
@@ -6928,6 +7411,12 @@ async fn node_config_patch(
             .arg(rk_node(&id))
             .arg("maxJobs")
             .arg(m.clamp(1, 16).to_string());
+    }
+    if let Some(h) = body.health_workers {
+        pipe.cmd("HSET")
+            .arg(rk_node(&id))
+            .arg("healthWorkers")
+            .arg(h.clamp(0, 16).to_string());
     }
     let _: () = match pipe.query_async(&mut c).await {
         Ok(v) => v,
@@ -7128,7 +7617,7 @@ async fn search_node(State(store): State<Store>, Json(req): Json<SearchReq>) -> 
 
     // 3. Upsert into the Redis registry (idempotent by name).
     let c = store.lock().unwrap_or_else(|p| p.into_inner()).redis();
-    let node = match reg_node(c, &name, &ffmpeg_version, &haccels, &hw_encoders, &accels, &[]).await {
+    let node = match reg_node(c, &name, &ffmpeg_version, &haccels, &hw_encoders, &accels, &[], &[]).await {
         Ok(n) => n,
         Err(e) => return (StatusCode::BAD_GATEWAY, Json(json!({ "error": e }))).into_response(),
     };
@@ -7156,7 +7645,24 @@ fn is_node_paused(store: &Store, id: &str) -> bool {
 /// GET /api/nodes/:id/poll — long-poll (up to 20s) for the next dispatched
 /// job. The response also carries the node's worker settings so the node can
 /// adapt (e.g. raise/lower its concurrent-job pool).
-async fn node_poll(State(store): State<Store>, UrlPath(id): UrlPath<String>) -> Response {
+/// Long-poll claim. The node advertises its FREE HEALTH slots in the query
+/// (`?health=N`): when N > 0 (and the node is configured with healthWorkers)
+/// a queued health job is offered FIRST — health checks run on their own
+/// slots, independent of the encode slots. Otherwise the regular encode
+/// claim applies.
+#[derive(Deserialize, Default)]
+struct PollQuery {
+    /// Free pre-encode health slots on the node right now (0 = full or off).
+    #[serde(default)]
+    health: u32,
+}
+
+
+async fn node_poll(
+    State(store): State<Store>,
+    UrlPath(id): UrlPath<String>,
+    Query(q): Query<PollQuery>,
+) -> Response {
     let node = {
         let c = store.lock().unwrap_or_else(|p| p.into_inner()).redis();
         match hgetall_node(c, &id).await {
@@ -7166,6 +7672,7 @@ async fn node_poll(State(store): State<Store>, UrlPath(id): UrlPath<String>) -> 
     };
     let cfg = json!({
         "maxJobs": node.max_jobs,
+        "healthWorkers": node.health_workers,
         "enabledBackends": node.enabled_backends.clone(),
         "allowSoftware": node.allow_software,
     });
@@ -7175,23 +7682,64 @@ async fn node_poll(State(store): State<Store>, UrlPath(id): UrlPath<String>) -> 
         // it resumes instantly when unpaused (300ms check cadence).
         if is_node_paused(&store, &id) {
             if std::time::Instant::now() >= deadline {
-                return Json(json!({"job": null, "config": cfg})).into_response();
+                return Json(json!({"job": null, "healthJob": null, "config": cfg})).into_response();
             }
             tokio::time::sleep(std::time::Duration::from_millis(300)).await;
             continue;
         }
-        let claimed = store.lock().unwrap_or_else(|p| p.into_inner()).claim_for_node(&id);
+        // Health first: the node said it has a free slot.
+        if q.health > 0 && node.health_workers > 0 {
+            // Claim into a LOCAL first: `if let Some(job) = store.lock()…claim()`
+            // would keep the std MutexGuard ALIVE across the .await in the
+            // body (temporaries in an if-let scrutinee live to the block
+            // end) — a std guard across an await makes the future non-Send
+            // and breaks axum's Handler bound.
+            let health_claimed =
+                store.lock().unwrap_or_else(|p| p.into_inner()).claim_health_for_node(&id);
+            if let Some(job) = health_claimed {
+                let c = store.lock().unwrap_or_else(|p| p.into_inner()).redis();
+                // No set_current_job: health runs alongside encodes — the
+                // node's "current job" badge stays the encode's.
+                let _ = set_job_mapping(c, &job.id, job.lib_path.as_deref(), &id).await;
+                return match serde_json::to_value(job) {
+                    Ok(v) => Json(json!({"job": null, "healthJob": v, "config": cfg})).into_response(),
+                    Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e.to_string()}))).into_response(),
+                };
+            }
+        }
+        let claimed = (|| {
+            // Only offer an encode when the node has a free ENCODE slot,
+            // counted server-side (dispatched/running — queued jobs are
+            // waiting their turn, not running). The node now polls even
+            // when its encode slots are full (to reach health jobs), so a
+            // blind claim would hand it more work than it can run.
+            let inflight = store
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .jobs
+                .values()
+                .filter(|j| {
+                    j.kind == "encode"
+                        && j.node_id.as_deref() == Some(id.as_str())
+                        && matches!(j.status.as_str(), "dispatched" | "running")
+                })
+                .count() as u32;
+            if inflight >= node.max_jobs {
+                return None;
+            }
+            store.lock().unwrap_or_else(|p| p.into_inner()).claim_for_node(&id)
+        })();
         if let Some(job) = claimed {
             let c = store.lock().unwrap_or_else(|p| p.into_inner()).redis();
             let _ = set_job_mapping(c.clone(), &job.id, job.lib_path.as_deref(), &id).await;
             let _ = set_current_job(c, &id, Some(&job.id)).await;
             return match serde_json::to_value(job) {
-                Ok(v) => Json(json!({"job": v, "config": cfg})).into_response(),
+                Ok(v) => Json(json!({"job": v, "healthJob": null, "config": cfg})).into_response(),
                 Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e.to_string()}))).into_response(),
             };
         }
         if std::time::Instant::now() >= deadline {
-            return Json(json!({"job": null, "config": cfg})).into_response();
+            return Json(json!({"job": null, "healthJob": null, "config": cfg})).into_response();
         }
         tokio::time::sleep(std::time::Duration::from_millis(300)).await;
     }
@@ -7262,6 +7810,9 @@ struct ReportReq {
     /// happened; the server verifies it and runs the post-plan.
     #[serde(default)]
     local_stage: Option<bool>,
+    /// Health-job verdict: true = the source decoded clean in every window.
+    #[serde(default)]
+    healthy: Option<bool>,
 }
 
 /// POST /api/nodes/:id/report — a node reports job progress / completion.
@@ -7295,6 +7846,9 @@ async fn node_report(State(store): State<Store>, UrlPath(id): UrlPath<String>, J
             }
             if req.status == "done" || req.status == "error" {
                 j.finished_at = Some(now_ms());
+            }
+            if let Some(h) = req.healthy {
+                j.healthy = Some(h);
             }
             if req.status == "running" && j.started_at.is_none() {
                 j.started_at = Some(now_ms());
@@ -7349,29 +7903,34 @@ async fn node_report(State(store): State<Store>, UrlPath(id): UrlPath<String>, J
     // Library-automation job failed → mark the entry so a rescan re-queues it.
     // A user-cancelling stop re-arms the entry as plain pending instead.
     if req.status == "error" {
-        let (lp, cancelled) = {
+        let (lp, cancelled, kind) = {
             let s = store.lock().unwrap_or_else(|p| p.into_inner());
             let j = s.jobs.get(&req.job_id);
             (
                 j.and_then(|j| j.lib_path.clone()),
                 j.map(|j| j.status == "cancelled").unwrap_or(false),
+                j.map(|j| j.kind.clone()).unwrap_or_else(|| "encode".into()),
             )
         };
-        if let Some(lp) = lp {
-            {
-                let mut s = store.lock().unwrap_or_else(|p| p.into_inner());
-                s.update_library_entry(&lp, |e| {
-                    if cancelled {
-                        e.status = "pending".into();
-                        e.error = None;
-                    } else {
-                        e.status = "error".into();
-                        e.error = req_error;
-                    }
-                });
+        // HEALTH jobs never park the entry — the scan's health phase owns
+        // the failure handling (it re-runs the check on the server).
+        if kind == "encode" {
+            if let Some(lp) = lp {
+                {
+                    let mut s = store.lock().unwrap_or_else(|p| p.into_inner());
+                    s.update_library_entry(&lp, |e| {
+                        if cancelled {
+                            e.status = "pending".into();
+                            e.error = None;
+                        } else {
+                            e.status = "error".into();
+                            e.error = req_error;
+                        }
+                    });
+                }
+                // (lock dropped — persist_catalog re-acquires it)
+                persist_catalog(&store);
             }
-            // (lock dropped — persist_catalog re-acquires it)
-            persist_catalog(&store);
         }
     }
     let cancel = was_cancelled
@@ -8109,6 +8668,9 @@ async fn dispatch(State(store): State<Store>, Json(req): Json<DispatchReq>) -> R
         post: Vec::new(),
         local_input: None,
         local_output: Some(outputs_dir().to_string_lossy().to_string()),
+        kind: "encode".into(),
+        health_windows: None,
+        healthy: None,
     };
     store.lock().unwrap_or_else(|p| p.into_inner()).insert(job);
     Json(json!({

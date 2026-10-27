@@ -429,6 +429,9 @@ export default function App() {
   const [failDirDraft, setFailDirDraft] = useState(null); // null = not loaded yet
   const [autoScanDraft, setAutoScanDraft] = useState(null); // null = not loaded yet
   const [requeueDraft, setRequeueDraft] = useState(null); // null = not loaded yet (default 3)
+  const [preHealthDraft, setPreHealthDraft] = useState(null); // null = not loaded yet (default true)
+  // "" = auto (GPU 4 / CPU 2); "0" = server decode off; "N" = fixed workers
+  const [serverHealthDraft, setServerHealthDraft] = useState("");
   const [pauseState, setPauseState] = useState({ all: false, nodeIds: [] }); // queue pause
   const [settingsMsg, setSettingsMsg] = useState("");
   const [lang, setLangState] = useState("ko"); // "ko" | "en" — server setting
@@ -493,6 +496,8 @@ export default function App() {
       setFailDirDraft(s.failDir ?? "");
       setAutoScanDraft(s.autoScanMinutes ?? 0);
       setRequeueDraft(s.requeueLimit ?? 3);
+      setPreHealthDraft(s.preHealthCheck ?? true);
+      setServerHealthDraft(s.healthWorkers === undefined || s.healthWorkers === null ? "" : String(s.healthWorkers));
       // setLang BEFORE setLangState: the re-render reads the module var,
       // and a bare module mutation (useEffect) would never re-render.
       const l = s.language === "en" ? "en" : "ko";
@@ -712,6 +717,7 @@ export default function App() {
       backends: n.enabledBackends === undefined ? all : new Set(n.enabledBackends),
       allowSw: n.allowSoftware !== false,
       maxJobs: n.maxJobs || 1,
+      healthWorkers: n.healthWorkers || 0,
       msg: ""
     });
   };
@@ -747,7 +753,8 @@ export default function App() {
         name: nodeCfg.name,
         enabledBackends: [...nodeCfg.backends],
         allowSoftware: nodeCfg.allowSw,
-        maxJobs: nodeCfg.maxJobs
+        maxJobs: nodeCfg.maxJobs,
+        healthWorkers: nodeCfg.healthWorkers
       });
       setNodes(ns => ns.map(x => x.id === nodeCfg.id ? {
         ...x,
@@ -3350,6 +3357,38 @@ export default function App() {
             <div className="search">
               <input type="number" min="1" max="100" value={requeueDraft ?? 3} onChange={e => setRequeueDraft(e.target.value)} />
               <button onClick={saveRequeueLimit}>{t("저장")}</button>
+            </div>
+          </div>
+          <div className="setblock">
+            <h3>{t("사전 인코딩 헬스체크")}</h3>
+            <div className="hint">{t("인코딩 전에 소스 파일이 깨지지 않았는지 미리 확인합니다. 깨진 파일은 인코딩 전에 격리되어 GPU를 낭비하지 않습니다. 확인은 같은 파일 시스템을 보는 노드(노드 설정의 '사전 헬스체크 워커')에서 수행되고, 해당 노드가 없으면 서버에서 수행됩니다.")}</div>
+            <div className="search">
+              <label style={{ display: "flex", alignItems: "center", gap: 8, cursor: "pointer" }}>
+                <input type="checkbox" checked={preHealthDraft ?? true} onChange={e => setPreHealthDraft(e.target.checked)} />
+                {t("사전 인코딩 헬스체크 사용")}
+              </label>
+              <button onClick={() => api.settingsPost({
+        preHealthCheck: preHealthDraft ?? true
+      }).then(r => {
+        setPreHealthDraft(r.preHealthCheck ?? true);
+        flashBlock(t("사전 헬스체크 설정 저장됨 ✓"));
+      })}>{t("저장")}</button>
+            </div>
+            <div className="search">
+              <select value={serverHealthDraft} onChange={e => setServerHealthDraft(e.target.value)} title={t("서버가 직접 디코딩 헬스체크를 수행할 워커 수 (해당 노드가 없는 파일만) — 자동: GPU 4 / CPU 2")}>
+                <option value="">{t("서버 헬스체크 워커: 자동")}</option>
+                <option value="0">{t("서버 헬스체크 워커: 끄기 (노드만)")}</option>
+                <option value="1">{t("서버 헬스체크 워커: 1")}</option>
+                <option value="2">{t("서버 헬스체크 워커: 2")}</option>
+                <option value="4">{t("서버 헬스체크 워커: 4")}</option>
+                <option value="8">{t("서버 헬스체크 워커: 8")}</option>
+              </select>
+              <button onClick={() => api.settingsPost({
+        healthWorkers: serverHealthDraft === "" ? null : Number(serverHealthDraft)
+      }).then(r => {
+        setServerHealthDraft(r.healthWorkers === undefined || r.healthWorkers === null ? "" : String(r.healthWorkers));
+        flashBlock(t("서버 헬스체크 워커 저장됨 ✓"));
+      })}>{t("저장")}</button>
             </div>
           </div>
           <div className="setblock">
