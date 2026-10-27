@@ -20,11 +20,11 @@ const STAGE_META = {
   },
   "pre-checking": {
     cls: "precheck",
-    label: t("\uC0AC\uC804\uAC80\uC0C1")
+    label: t("무결성 검증")
   },
   "queuing": {
     cls: "queuing",
-    label: t("\uCF00\uC784")
+    label: t("대기중")
   },
   "transcoding": {
     cls: "transcoding",
@@ -36,7 +36,7 @@ const STAGE_META = {
   },
   "skipped": {
     cls: "skipped",
-    label: t("\uC2A4\uD0A4\uD504")
+    label: t("스킵")
   },
   "notvideo": {
     cls: "notvideo",
@@ -77,7 +77,7 @@ const brBucket = k => {
   if (k < 20000) return "20";
   return "20+";
 };
-const BR_OPTIONS = [["5", t("5M \uC77C\uD558")], ["10", "5–10M"], ["20", "10–20M"], ["20+", t("20M \uC774\uC0C1")]];
+const BR_OPTIONS = [["5", t("5M 이하")], ["10", "5–10M"], ["20", "10–20M"], ["20+", t("20M 이상")]];
 // FPS buckets: standard rates ±0.1 (23.976 → 24, 59.94 → 60, …)
 const fpsBucket = f => {
   if (typeof f !== "number" || !(f > 0)) return null;
@@ -509,6 +509,7 @@ export default function App() {
   const [preHealthDepthDraft, setPreHealthDepthDraft] = useState("");
   const [pauseState, setPauseState] = useState({ all: false, nodeIds: [] }); // queue pause
   const [settingsMsg, setSettingsMsg] = useState("");
+  const [settingsSaving, setSettingsSaving] = useState(false);
   const [lang, setLangState] = useState("ko"); // "ko" | "en" — server setting
   useEffect(() => {
     setLang(lang);
@@ -533,6 +534,8 @@ export default function App() {
   const [libResFilter, setLibResFilter] = useState("");
   const [libBrFilter, setLibBrFilter] = useState("");
   const [libFpsFilter, setLibFpsFilter] = useState("");
+  const [libFilterOpen, setLibFilterOpen] = useState(false);
+  const libFilterRef = useRef(null);
   const pickLib = sel => {
     setLibSel(sel);
     setLibFilter(null);
@@ -1076,6 +1079,31 @@ export default function App() {
       flashBlock(t("리큐 제한 ") + (r.requeueLimit ?? 3) + t("회 저장됨 ✓"));
     }).catch(() => {});
   }
+  // Single settings save: ONE button (bottom-right of the settings box)
+  // persists every section in this tab with a single atomic POST.
+  async function saveSettingsAll() {
+    setSettingsSaving(true);
+    try {
+      const r = await api.settingsPost({
+        failDir: failDirDraft || null,
+        autoScanMinutes: autoScanDraft ?? 0,
+        requeueLimit: Math.max(1, Math.min(100, Number(requeueDraft) || 3)),
+        preHealthCheck: preHealthDraft ?? true,
+        preHealthDepth: preHealthDepthDraft === "" ? 0 : Number(preHealthDepthDraft),
+      });
+      setFailDirDraft(r.failDir ?? "");
+      setAutoScanDraft(r.autoScanMinutes ?? 0);
+      setRequeueDraft(r.requeueLimit ?? 3);
+      setPreHealthDraft(r.preHealthCheck ?? true);
+      setPreHealthDepthDraft(r.preHealthDepth === undefined || r.preHealthDepth === null ? "" : String(r.preHealthDepth));
+      setSettingsMsg(t("세팅 저장됨 ✓"));
+      loadFailures();
+    } catch (err) {
+      setSettingsMsg(err.message);
+    }
+    setTimeout(() => setSettingsMsg(""), 2500);
+    setSettingsSaving(false);
+  }
 
   // ── library tab: per-library sheets + sortable table ──────────
   const libName = f => (f.path || "").split("/").filter(Boolean).pop() || f.path;
@@ -1196,6 +1224,22 @@ export default function App() {
     goPage(0);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [libSel, libFilter, libSearch, libResFilter, libBrFilter, libFpsFilter]);
+  // spec-filter popover: close on outside click / Esc
+  useEffect(() => {
+    if (!libFilterOpen) return;
+    const onDown = ev => {
+      if (libFilterRef.current && !libFilterRef.current.contains(ev.target)) setLibFilterOpen(false);
+    };
+    const onKey = ev => {
+      if (ev.key === "Escape") setLibFilterOpen(false);
+    };
+    document.addEventListener("mousedown", onDown);
+    document.addEventListener("keydown", onKey);
+    return () => {
+      document.removeEventListener("mousedown", onDown);
+      document.removeEventListener("keydown", onKey);
+    };
+  }, [libFilterOpen]);
   const toggleLibSort = key => setLibSort(s => s.key === key ? {
     key,
     dir: -s.dir
@@ -2334,8 +2378,8 @@ export default function App() {
                 <span className={`status ${n.status === "online" ? "done" : ""}`}>{n.status}</span>
                 {n.healthTotal > 0 && (() => {
                   const pct = Math.round((n.healthDone / n.healthTotal) * 100);
-                  return <span className="nhealth" title={t("사전 헬스체크 진행 (pre-check) — ") + n.healthDone + " / " + n.healthTotal + t(" 완료")}>
-                    <span className="nhealth-label">{t("\uC0AC\uC804\uAC80\uC0C1")}</span>
+                  return <span className="nhealth" title={t("무결성 검증 진행 — ") + n.healthDone + " / " + n.healthTotal + t(" 완료")}>
+                    <span className="nhealth-label">{t("무결성 검증")}</span>
                     <span className="nhealth-bar"><i style={{ width: pct + "%" }} /></span>
                     <span className="nhealth-pct">{n.healthDone}/{n.healthTotal}</span>
                   </span>;
@@ -2725,18 +2769,36 @@ export default function App() {
                       {libFilter && <span className="ls-item filterhint">{t("\uD544\uD130 \uC911 \u2014 \uB2E4\uC2DC \uD074\uB9AD\uD558\uBA74 \uD574\uC81C")}</span>}
                       <input className="libsearch" type="search" placeholder={t("검색 — 이름/경로/코덱")} value={libSearch} onChange={e => setLibSearch(e.target.value)} title={t("이름, 파일의 전체 경로, 코덱번호 기준 검색 — 기존 필터와 결합")} />
                       {libSearch.trim() && <span className="ls-item filterhint">{t("검색 중 — ") + visibleEntries.length + t("건 확인")}</span>}
-                      <select className="libfilter-sel" value={libResFilter} onChange={e => setLibResFilter(e.target.value)} title={t("해상도 필터 — 그 사이의 값은 낮은 단계로 묶음 (예: 1085p → 1080, 1445p → 2K)")}>
-                        <option value="">{t("해상도 전체")}</option>
-                        {RES_OPTIONS.map(([v, l]) => <option key={v} value={v}>{l}</option>)}
-                      </select>
-                      <select className="libfilter-sel" value={libBrFilter} onChange={e => setLibBrFilter(e.target.value)} title={t("비트레이트 필터 — 소스 파일의 비디오 비트레이트 기준")}>
-                        <option value="">{t("비트레이트 전체")}</option>
-                        {BR_OPTIONS.map(([v, l]) => <option key={v} value={v}>{l}</option>)}
-                      </select>
-                      <select className="libfilter-sel" value={libFpsFilter} onChange={e => setLibFpsFilter(e.target.value)} title={t("프레임률 필터 — 표준 프레임률 ±0.1 (23.976 → 24)")}>
-                        <option value="">{t("프레임 전체")}</option>
-                        {FPS_OPTIONS.map(([v, l]) => <option key={v} value={v}>{l}</option>)}
-                      </select>
+                      <div className="libfilter-wrap" ref={libFilterRef}>
+                        <button type="button" className="libfilter-btn" onClick={() => setLibFilterOpen(o => !o)} title={t("필터 — 해상도/비트레이트/프레임 (클릭하면 열리고, 다시 클릭하면 닫힘)")}>
+                          {t("필터")}{[libResFilter, libBrFilter, libFpsFilter].filter(Boolean).length > 0 && <span className="libfilter-badge">{[libResFilter, libBrFilter, libFpsFilter].filter(Boolean).length}</span>}
+                        </button>
+                        {libFilterOpen && <div className="libfilter-panel">
+                          <label className="libfilter-field">{t("해상도")}
+                            <select className="libfilter-sel" value={libResFilter} onChange={e => setLibResFilter(e.target.value)} title={t("해상도 필터 — 그 사이의 값은 낮은 단계로 묶음 (예: 1085p → 1080, 1445p → 2K)")}>
+                              <option value="">{t("전체")}</option>
+                              {RES_OPTIONS.map(([v, l]) => <option key={v} value={v}>{l}</option>)}
+                            </select>
+                          </label>
+                          <label className="libfilter-field">{t("비트레이트")}
+                            <select className="libfilter-sel" value={libBrFilter} onChange={e => setLibBrFilter(e.target.value)} title={t("비트레이트 필터 — 소스 파일의 비디오 비트레이트 기준")}>
+                              <option value="">{t("전체")}</option>
+                              {BR_OPTIONS.map(([v, l]) => <option key={v} value={v}>{l}</option>)}
+                            </select>
+                          </label>
+                          <label className="libfilter-field">{t("프레임")}
+                            <select className="libfilter-sel" value={libFpsFilter} onChange={e => setLibFpsFilter(e.target.value)} title={t("프레임률 필터 — 표준 프레임률 ±0.1 (23.976 → 24)")}>
+                              <option value="">{t("전체")}</option>
+                              {FPS_OPTIONS.map(([v, l]) => <option key={v} value={v}>{l}</option>)}
+                            </select>
+                          </label>
+                          <button type="button" className="linkish" onClick={() => {
+                            setLibResFilter("");
+                            setLibBrFilter("");
+                            setLibFpsFilter("");
+                          }}>{t("필터 초기화")}</button>
+                        </div>}
+                      </div>
                       {libSelKeys.size > 0 && <div className="libbatch" title={t("\uC120\uD0DD\uD55C \uD30C\uC77C \uC77C\uBC31 \uCC98\uB9AC \u2014 \uCCB4\uD06C\uBC84\uC2A4\uB85C \uACE0\uB974\uB2E4 \uD639\uC5B4\uB9AC \uC774\uC5EC\uB124 \uD45C\uC2DC")}>
                           <span className="jmeta">{t("\uC120\uD0DD: ") + libSelKeys.size + t("\uAC74")}</span>
                           <button onClick={() => batchLib("requeue")}>{t("\uC7AC\uC778\uCF54\uB529")}</button>
@@ -2826,7 +2888,7 @@ export default function App() {
               })() : <span className="statusrow">
                           {(() => {
                             const m = stageMeta(e);
-                            return <span className={`status ${m.cls}`} title={e.status === "done" ? t("원본: ") + fmtSize(e.size) + " " + [e.videoCodec, e.audioCodec].filter(Boolean).join("/") + t(" → 결과: ") + (e.newSize != null ? fmtSize(e.newSize) : "?") + " " + (e.newCodec || "") + " (" + (e.reencoded || "?") + ")" : e.status === "pre-checking" ? t("사전 헬스체크 진행 중 — 노드가 디코딩 창을 검사합니다 (완료되면 큐잉으로 넘어갑니다)") : e.status === "error" || e.status === "failed" || e.status === "skipped" || e.status === "notvideo" ? e.error : undefined}>
+                            return <span className={`status ${m.cls}`} title={e.status === "done" ? t("원본: ") + fmtSize(e.size) + " " + [e.videoCodec, e.audioCodec].filter(Boolean).join("/") + t(" → 결과: ") + (e.newSize != null ? fmtSize(e.newSize) : "?") + " " + (e.newCodec || "") + " (" + (e.reencoded || "?") + ")" : e.status === "pre-checking" ? t("무결성 검증 진행 중 — 노드가 디코딩 창을 검사합니다 (완료되면 큐잉으로 넘어갑니다)") : e.status === "error" || e.status === "failed" || e.status === "skipped" || e.status === "notvideo" ? e.error : undefined}>
                               {m.label}
                             </span>;
                           })()}
@@ -3510,9 +3572,8 @@ export default function App() {
               <code>{t("<\uBCF4\uAD00\uD3F4\uB354>/\uB77C\uC774\uBE0C\uB7EC\uB9AC\uD3F4\uB354\uBA85/\uC6D0\uBCF8 \uC0C1\uB300\uACBD\uB85C")}</code>{t("\u2014 \uC6D0\uBCF8 \uC704\uCE58\xB7\uC774\uC720\uB294 \uD30C\uC77C \uC606")}<code>.ctfail.json</code>{t("\uC5D0 \uAE30\uB85D\uB418\uACE0,")}{" "}
               <b>{t("\uC2E4\uD328 \uBCF4\uAD00\uD568")}</b>{t("\uD0ED\uC5D0\uC11C \uD655\uC778/\uBCF5\uC6D0/\uC0AD\uC81C\uD560 \uC218 \uC788\uC2B5\uB2C8\uB2E4.")}</div>
             <div className="search">
-              <input value={failDirDraft ?? ""} onChange={e => setFailDirDraft(e.target.value)} onKeyDown={e => e.key === "Enter" && saveFailDir()} placeholder={t("\uC2E4\uD328 \uBCF4\uAD00 \uD3F4\uB354 \uACBD\uB85C (\uC608: /mnt/nas/Failed)")} />
-              <button onClick={() => openTree("faildir")} title={t("\uD30C\uC77C\uC2DC\uC2A4\uD15C \uD2B8\uB9AC\uB85C \uD3F4\uB354 \uCC3E\uAE30")}>{t("\uD83D\uDD0D \uD3F4\uB354 \uCC3E\uC544\uBCF4\uAE30")}</button>
-              <button onClick={saveFailDir}>{t("\uC800\uC7A5")}</button>
+              <input value={failDirDraft ?? ""} onChange={e => setFailDirDraft(e.target.value)} onKeyDown={e => e.key === "Enter" && saveSettingsAll()} placeholder={t("실패 보관 폴더 경로 (예: /mnt/nas/Failed)")} />
+              <button onClick={() => openTree("faildir")} title={t("파일시스템 트리로 폴더 찾기")}>{t("🔍 폴더 찾아보기")}</button>
               {failures.failDir && <button onClick={() => {
             setFailDirDraft("");
             api.settingsPost({
@@ -3520,7 +3581,6 @@ export default function App() {
             }).then(() => loadFailures());
           }} title={t("\uBCF4\uAD00 \uD3F4\uB354 \uD574\uC81C")}>{t("\uD574\uC81C")}</button>}
             </div>
-            {settingsMsg && <div className="meta ok-text">{settingsMsg}</div>}
           </div>
           <div className="setblock">
             <h3>{t("\uC790\uB3D9 \uAC10\uC9C0")}</h3>
@@ -3533,12 +3593,6 @@ export default function App() {
                 <option value={10}>{t("10\uBD84\uB9C8\uB2E4")}</option>
                 <option value={30}>{t("30\uBD84\uB9C8\uB2E4")}</option>
               </select>
-              <button onClick={() => api.settingsPost({
-            autoScanMinutes: autoScanDraft ?? 0
-          }).then(r => {
-            setAutoScanDraft(r.autoScanMinutes ?? 0);
-            flashBlock(t("\uC790\uB3D9 \uAC10\uC9C0 \uC8FC\uAE30 \uC800\uC7A5\uB428 \u2713"));
-          })}>{t("\uC800\uC7A5")}</button>
             </div>
           </div>
           <div className="setblock">
@@ -3546,7 +3600,6 @@ export default function App() {
             <div className="hint">{t("인코딩 완료 후 출력 파일의 헬스체크(재검증)가 반복해서 실패하면 자동으로 다시 인코딩합니다. 이 횟수까지 재인코딩을 시도하고, 초과하면 파일을")}<b>{t("오류")}</b>{t("상태로 보관합니다. 스캔 또는 ⟳ 버튼으로 다시 큐에 넣을 수 있습니다.")}</div>
             <div className="search">
               <input type="number" min="1" max="100" value={requeueDraft ?? 3} onChange={e => setRequeueDraft(e.target.value)} />
-              <button onClick={saveRequeueLimit}>{t("저장")}</button>
             </div>
           </div>
           <div className="setblock">
@@ -3557,23 +3610,11 @@ export default function App() {
                 <input type="checkbox" checked={preHealthDraft ?? true} onChange={e => setPreHealthDraft(e.target.checked)} />
                 {t("사전 인코딩 헬스체크 사용")}
               </label>
-              <button onClick={() => api.settingsPost({
-        preHealthCheck: preHealthDraft ?? true
-      }).then(r => {
-        setPreHealthDraft(r.preHealthCheck ?? true);
-        flashBlock(t("사전 헬스체크 설정 저장됨 ✓"));
-      })}>{t("저장")}</button>
             </div>
             <div className="search">
               <label className="cfglabel">{t("체크 범위 (% of source)")}<input type="number" className="num" min={1} max={100} value={preHealthDepthDraft} placeholder={t("로직별 기본")} onChange={e => setPreHealthDepthDraft(e.target.value === "" ? "" : String(Math.max(1, Math.min(100, Number(e.target.value) || 1))))} title={t("파일의 몇 %를 디코딩해 검사할지 (1-100) — 비워두면 각 로직 srcHealth 게이트가 정의한 값 사용")} />
                 <span className="meta">{t("예: 5 = 앞 5% + 랜덤 5% 윈도우 (최대 15초)")}</span>
               </label>
-              <button onClick={() => api.settingsPost({
-        preHealthDepth: preHealthDepthDraft === "" ? 0 : Number(preHealthDepthDraft)
-      }).then(r => {
-        setPreHealthDepthDraft(r.preHealthDepth === undefined || r.preHealthDepth === null ? "" : String(r.preHealthDepth));
-        flashBlock(t("헬스체크 범위 저장됨 ✓"));
-      })}>{t("저장")}</button>
             </div>
           </div>
           <div className="setblock">
@@ -3614,6 +3655,10 @@ export default function App() {
               </div>
             </div>
           </div>
+          </div>
+          <div className="settings-save-row">
+            {settingsMsg && <span className="meta settings-msg">{settingsMsg}</span>}
+            <button className="primary" disabled={settingsSaving} onClick={saveSettingsAll} title={t("이 탭의 전체 세팅(실패 보관 폴더 · 자동 감지 · 리큐 제한 · 헬스체크 · 체크 범위)을 한 번에 저장")}>{settingsSaving ? t("저장 중…") : t("세팅 저장")}</button>
           </div>
         </section>}
 
