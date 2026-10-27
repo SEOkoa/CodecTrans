@@ -1928,6 +1928,11 @@ button:disabled {
   font-size: 13px;
   border-radius: 8px;
 }
+/* primary has border:none — give it a 1px accent border so the pair is
+   pixel-identical in height (37px) */
+.cfgactions button.primary {
+  border: 1px solid var(--accent);
+}
 .cfgactions .meta {
   margin-right: auto;
 }
