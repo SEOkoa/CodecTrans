@@ -22,6 +22,12 @@ body {
   color: var(--text);
   font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Apple SD Gothic Neo", "Noto Sans KR", "Malgun Gothic", "Pretendard", Helvetica, Arial, sans-serif;
   min-height: 100vh;
+  /* safety net at ALL widths: rows wrap (see .row), so any residual
+     horizontal overflow is clipped instead of pushing content off-screen */
+  overflow-x: hidden;
+}
+html {
+  overflow-x: hidden;
 }
 
 .wrap {
@@ -34,6 +40,7 @@ header {
   display: flex;
   align-items: center;
   gap: 14px;
+  flex-wrap: wrap;
 }
 header h1 {
   font-size: 26px;
@@ -56,6 +63,7 @@ header h1 {
   background: var(--panel);
   border: 1px solid var(--border);
   border-radius: 10px;
+  flex-wrap: wrap;
 }
 .tabs button {
   border: 0;
@@ -268,11 +276,7 @@ header h1 {
     min-width: 0;
     overflow-wrap: anywhere;
   }
-  /* Safety net: leftover horizontal overflow is clipped — the data tables
-     have their own internal scroll (.libtable overflow-x:auto). */
-  body {
-    overflow-x: hidden;
-  }
+  /* (body overflow-x:hidden now applies at all widths — see base body rule) */
   /* Library table: the 780px min-width forces a horizontal scroll wall on a
      phone — instead let the cells WRAP onto clean rows (no squishing). The
      header loses its meaning once rows wrap, so it goes away too. */
@@ -421,6 +425,11 @@ button.primary:disabled {
   display: flex;
   align-items: center;
   gap: 10px;
+  /* wrap at EVERY width — at wide screens there is room so nothing moves,
+     but at intermediate widths (700-1100px) a long title + chips + buttons
+     used to widen the page and clip content at the window edges */
+  flex-wrap: wrap;
+  row-gap: 4px;
 }
 .pct {
   margin-left: auto;
@@ -2329,6 +2338,10 @@ button.mini.bad:hover {
   text-overflow: ellipsis;
   white-space: nowrap;
   max-width: 340px;
+}
+.nodejob .jmeta:first-child {
+  flex: 1 1 auto;
+  min-width: 0;
 }
 .nodejob .prog-pct {
   min-width: 34px;
