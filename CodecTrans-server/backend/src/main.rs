@@ -379,6 +379,11 @@ pub struct LibraryEntry {
     /// failure can't permanently mislabel it.
     #[serde(default)]
     pub probe_failed: bool,
+    /// Display pipeline stage (computed, not persisted):
+    /// pending → pre-checking (health decode in flight) → queuing →
+    /// transcoding → done/skipped. Empty = same as `status`.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub stage: String,
 }
 
 /// Default post-encode requeue cap (overridable via the settings tab,
@@ -2845,6 +2850,12 @@ struct ScanState {
     /// Files skipped in phase 2 (no srcHealth gate, or the gate can't
     /// change the outcome for that file — decode would be pure waste).
     health_skipped: usize,
+    /// Per-NODE pre-check progress for the current run: node id → [done,
+    /// total] (a node that claimed N health jobs and finished M of them).
+    /// Feeds the green per-worker progress bar on the dashboard. Reset per
+    /// run; server-side fallback decodes are not attributed to a node.
+    /// (Option because a `static` initializer can't call HashMap::new().)
+    health_node: Option<std::collections::HashMap<String, [usize; 2]>>,
     /// Result of the last finished run (kept for the UI after it ends).
     finished_queued: usize,
     finished_skipped: usize,
@@ -2860,6 +2871,7 @@ static SCAN_STATE: std::sync::Mutex<ScanState> = std::sync::Mutex::new(ScanState
     health_total: 0,
     health_done: 0,
     health_skipped: 0,
+    health_node: None,
     finished_queued: 0,
     finished_skipped: 0,
 });
@@ -5677,7 +5689,29 @@ async fn library_get(State(store): State<Store>, headers: axum::http::HeaderMap)
     }
     let s = store.lock().unwrap_or_else(|p| p.into_inner());
     let root = s.storage_root().to_string();
-    let entries = s.list_library();
+    let mut entries = s.list_library();
+    // Display stage: the raw status says *what happened*; the stage says
+    // *where in the pipeline the file is right now*. A "pending" entry
+    // with a live health job is PRE-CHECKING (first health decode);
+    // "queued" → queuing, "running"/"dispatched" → transcoding.
+    let health_live: std::collections::HashSet<String> = s
+        .jobs
+        .values()
+        .filter(|j| {
+            j.kind == "health"
+                && matches!(j.status.as_str(), "queued" | "dispatched" | "running")
+        })
+        .filter_map(|j| j.lib_path.clone())
+        .filter(|k| !k.is_empty())
+        .collect();
+    for e in entries.iter_mut() {
+        e.stage = match e.status.as_str() {
+            "pending" if health_live.contains(&e.key()) => "pre-checking".to_string(),
+            "queued" => "queuing".to_string(),
+            "running" | "dispatched" => "transcoding".to_string(),
+            _ => String::new(),
+        };
+    }
     (
         StatusCode::OK,
         [(axum::http::header::ETAG.to_string(), etag)],
@@ -6037,6 +6071,7 @@ async fn library_scan_inner(store: Store, req: ScanReq) -> Response {
         health_total: 0,
         health_done: 0,
         health_skipped: 0,
+        health_node: None,
         finished_queued: 0,
         finished_skipped: 0,
     };
@@ -6268,6 +6303,7 @@ async fn library_scan_inner(store: Store, req: ScanReq) -> Response {
                 requeue_count: 0,
                 probe_failed,
                 src_health: None,
+                stage: String::new(),
             };
             commit_indexed_entry(&store_c, &mut e, old_for_commit.as_ref(), &live_c).await;
             Some(e)
@@ -7713,12 +7749,31 @@ struct NodeFilter {
 async fn list_nodes(State(store): State<Store>, Query(f): Query<NodeFilter>) -> impl IntoResponse {
     let c = store.lock().unwrap_or_else(|p| p.into_inner()).redis();
     let status = f.status.as_deref().unwrap_or("online");
-    let v: Vec<Value> = list_nodes_redis(c, status, f.backend.as_deref(), f.family.as_deref())
+    let mut v: Vec<Value> = list_nodes_redis(c, status, f.backend.as_deref(), f.family.as_deref())
         .await
         .into_iter()
         .map(serde_json::to_value)
         .collect::<Result<Vec<_>, _>>()
         .unwrap_or_default();
+    // Per-worker pre-check progress (green bar): merge the current
+    // scan's per-node health counters onto each node object.
+    let hn = SCAN_STATE
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .health_node
+        .clone()
+        .unwrap_or_default();
+    for val in v.iter_mut() {
+        let id = val.get("id").and_then(Value::as_str).map(str::to_string);
+        if let (Some(obj), Some(id)) = (val.as_object_mut(), id) {
+            if let Some([done, total]) = hn.get(&id) {
+                if *total > 0 {
+                    obj.insert("healthDone".to_string(), json!(done));
+                    obj.insert("healthTotal".to_string(), json!(total));
+                }
+            }
+        }
+    }
     Json(Value::Array(v))
 }
 
@@ -7963,6 +8018,16 @@ async fn node_poll(
             let health_claimed =
                 store.lock().unwrap_or_else(|p| p.into_inner()).claim_health_for_node(&id);
             if let Some(job) = health_claimed {
+                // Per-worker pre-check progress (green bar on the dashboard).
+                {
+                    let mut st = SCAN_STATE.lock().unwrap_or_else(|p| p.into_inner());
+                    let e = st
+                        .health_node
+                        .get_or_insert_with(std::collections::HashMap::new)
+                        .entry(id.clone())
+                        .or_insert([0, 0]);
+                    e[1] += 1;
+                }
                 let c = store.lock().unwrap_or_else(|p| p.into_inner()).redis();
                 // No set_current_job: health runs alongside encodes — the
                 // node's "current job" badge stays the encode's.
@@ -8099,6 +8164,19 @@ async fn node_report(State(store): State<Store>, UrlPath(id): UrlPath<String>, J
                 j.status = req.status.clone();
                 if let Some(e) = req.error {
                     j.error = Some(e);
+                }
+            }
+            // Per-worker pre-check progress: a health job reached a
+            // terminal state (done or error) — count it for the node.
+            if !was_cancelled
+                && j.kind == "health"
+                && (req.status == "done" || req.status == "error")
+            {
+                let mut st = SCAN_STATE.lock().unwrap_or_else(|p| p.into_inner());
+                if let Some(hn) = st.health_node.as_mut() {
+                    if let Some(e) = hn.get_mut(&id) {
+                        e[0] += 1;
+                    }
                 }
             }
             if let Some(p) = req.progress {

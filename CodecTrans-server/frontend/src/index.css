@@ -110,6 +110,15 @@ header h1 {
   margin-top: 8px;
   margin-bottom: 0;
 }
+/* settings "server info" values are long strings (service name, ffmpeg
+   version) — the 22px display size overflows the card and clips. */
+.stat-val.small {
+  font-size: 13px;
+  font-weight: 600;
+  overflow-wrap: anywhere;
+  min-width: 0;
+}
+.stat-top { flex-wrap: wrap; gap: 4px; }
 
 /* ── automation form ──────────────────────────────────── */
 .autoform {
@@ -537,8 +546,12 @@ code {
   display: flex;
   gap: 8px;
   margin: 4px 0 8px;
+  flex-wrap: wrap;
 }
-.search input {
+/* flex:1 only for DIRECT input children — nested inputs (e.g. the
+   check-scope number box inside a .cfglabel) must keep their own width,
+   or the row's save button gets squeezed. */
+.search > input {
   flex: 1;
   background: var(--panel);
   border: 1px solid var(--border);
@@ -547,15 +560,21 @@ code {
   padding: 8px 10px;
   font-size: 13px;
 }
-.search input.port {
+.search > input.port {
   flex: 0 0 90px;
 }
 .search input:focus {
   outline: none;
   border-color: var(--accent);
 }
+.search .cfglabel {
+  flex: 1 1 220px;
+  min-width: 0;
+  margin-bottom: 0;
+}
 .search button {
   flex: 0 0 auto;
+  min-width: 64px;
   background: var(--accent);
   color: #10131a;
   border: none;
@@ -2348,6 +2367,89 @@ button.mini.bad:hover {
   border-color: #5c5340;
   background: rgba(92, 83, 64, 0.25);
 }
+
+/* ── library: pre-check pipeline stage chips ── */
+.status.precheck {
+  color: #4ade80;
+  border-color: rgba(74, 222, 128, 0.45);
+  background: rgba(74, 222, 128, 0.12);
+  animation: precheckpulse 1.6s ease-in-out infinite;
+}
+@keyframes precheckpulse {
+  0%, 100% { box-shadow: 0 0 0 0 rgba(74, 222, 128, 0); }
+  50% { box-shadow: 0 0 8px 1px rgba(74, 222, 128, 0.35); }
+}
+.status.queuing {
+  color: var(--accent);
+  border-color: rgba(79, 156, 255, 0.4);
+  background: rgba(79, 156, 255, 0.1);
+}
+.status.transcoding {
+  color: #fbbf24;
+  border-color: rgba(251, 191, 36, 0.45);
+  background: rgba(251, 191, 36, 0.1);
+}
+
+/* ── dashboard: per-node green health-check bar ── */
+.nhealth {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+.nhealth-label {
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.5px;
+  text-transform: uppercase;
+  color: #4ade80;
+}
+.nhealth-bar {
+  width: 84px;
+  height: 6px;
+  border-radius: 3px;
+  background: rgba(74, 222, 128, 0.15);
+  overflow: hidden;
+}
+.nhealth-bar i {
+  display: block;
+  height: 100%;
+  border-radius: 3px;
+  background: linear-gradient(90deg, #22c55e, #4ade80);
+  transition: width 0.5s ease;
+}
+.nhealth-pct {
+  font-size: 10px;
+  color: #4ade80;
+  font-variant-numeric: tabular-nums;
+}
+
+/* ── library: text search input ── */
+.libsearch {
+  flex: 1 1 160px;
+  max-width: 260px;
+  min-width: 120px;
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  color: var(--text);
+  font-size: 12px;
+  padding: 4px 10px;
+  outline: none;
+}
+.libsearch:focus { border-color: var(--accent); }
+.libsearch::placeholder { color: var(--muted); opacity: 0.7; }
+.libfilter-sel {
+  flex: 0 0 auto;
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  color: var(--text);
+  font-size: 12px;
+  padding: 4px 8px;
+  outline: none;
+  cursor: pointer;
+}
+.libfilter-sel:focus { border-color: var(--accent); }
 .jout {
   color: var(--muted);
   font-size: 0.92em;

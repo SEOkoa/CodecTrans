@@ -10,6 +10,82 @@ const STATUS_LABEL = {
   notvideo: t("\uBE44\uC601\uC0C1")
 };
 
+// Library-entry pipeline stage → chip style + label. The backend sends
+// `stage` (pending → pre-checking → queuing → transcoding → done/skipped);
+// when it's absent we fall back to the raw status with the same table.
+const STAGE_META = {
+  "pending": {
+    cls: "",
+    label: t("\uB300\uAE30")
+  },
+  "pre-checking": {
+    cls: "precheck",
+    label: t("\uC0AC\uC804\uAC80\uC0C1")
+  },
+  "queuing": {
+    cls: "queuing",
+    label: t("\uCF00\uC784")
+  },
+  "transcoding": {
+    cls: "transcoding",
+    label: t("\uD2B8\uB79C\uC2A4\uCF58\uB529")
+  },
+  "done": {
+    cls: "done",
+    label: t("\uC644\uB8CC")
+  },
+  "skipped": {
+    cls: "skipped",
+    label: t("\uC2A4\uD0A4\uD504")
+  },
+  "notvideo": {
+    cls: "notvideo",
+    label: t("\uBE44\uC601\uC0C1")
+  },
+  "error": {
+    cls: "error",
+    label: t("\uC5D0\uB7EC")
+  },
+  "failed": {
+    cls: "failed",
+    label: t("\uBCF4\uAD00\uD56D")
+  }
+};
+const stageMeta = e => STAGE_META[e.stage || e.status] || {
+  cls: "",
+  label: e.stage || e.status
+};
+
+// ── library table: spec filters (resolution / bitrate / fps) ──
+// Resolution buckets by the HIGHEST tier at or below the source height, so
+// values in between land in the lower tier (1085p → "1080", 1445p → "2K").
+const resBucket = h => {
+  if (typeof h !== "number" || !h) return null;
+  if (h >= 2160) return "2160";
+  if (h >= 1440) return "1440";
+  if (h >= 1080) return "1080";
+  if (h >= 720) return "720";
+  if (h >= 480) return "480";
+  return null;
+};
+const RES_OPTIONS = [["480", "480"], ["720", "720"], ["1080", "1080"], ["1440", "2K"], ["2160", "4K"]];
+// Bitrate buckets (kbps): ≤5M / 5–10M / 10–20M / 20M+
+const brBucket = k => {
+  if (typeof k !== "number" || !(k > 0)) return null;
+  if (k < 5000) return "5";
+  if (k < 10000) return "10";
+  if (k < 20000) return "20";
+  return "20+";
+};
+const BR_OPTIONS = [["5", t("5M \uC77C\uD558")], ["10", "5–10M"], ["20", "10–20M"], ["20+", t("20M \uC774\uC0C1")]];
+// FPS buckets: standard rates ±0.1 (23.976 → 24, 59.94 → 60, …)
+const fpsBucket = f => {
+  if (typeof f !== "number" || !(f > 0)) return null;
+  for (const s of [24, 25, 30, 60, 120]) if (Math.abs(f - s) < 0.1) return String(s);
+  return null;
+};
+const FPS_OPTIONS = [["24", "24"], ["25", "25"], ["30", "30"], ["60", "60"], ["120", "120"]];
+
 // Map an HW encoder name (h264_nvenc, hevc_vaapi, av1_qsv, …) to a short
 // family label + a color class, so a node's accelerators render as colored
 // chips instead of a raw list.
@@ -453,6 +529,10 @@ export default function App() {
   // Clickable summary-chip filter: "remaining" | "done" | "active" |
   // "error" | "failed" (null = no filter).
   const [libFilter, setLibFilter] = useState(null);
+  const [libSearch, setLibSearch] = useState("");
+  const [libResFilter, setLibResFilter] = useState("");
+  const [libBrFilter, setLibBrFilter] = useState("");
+  const [libFpsFilter, setLibFpsFilter] = useState("");
   const pickLib = sel => {
     setLibSel(sel);
     setLibFilter(null);
@@ -1048,7 +1128,16 @@ export default function App() {
   };
   const visibleEntries = useMemo(() => {
     // a sheet for a removed folder falls back to "all"
-    const base = libFilter ? sheetBase.filter(libFilterMatch) : sheetBase;
+    let base = libFilter ? sheetBase.filter(libFilterMatch) : sheetBase;
+    // text search over name / path / video codec (case-insensitive)
+    const q = libSearch.trim().toLowerCase();
+    if (q) {
+      base = base.filter(e => (e.name || "").toLowerCase().includes(q) || (e.path || "").toLowerCase().includes(q) || (e.videoCodec || "").toLowerCase().includes(q));
+    }
+    // spec filters: resolution / bitrate / fps (in-between values bucket down)
+    if (libResFilter || libBrFilter || libFpsFilter) {
+      base = base.filter(e => (!libResFilter || resBucket(e.resolution) === libResFilter) && (!libBrFilter || brBucket(e.bitrateKbps) === libBrFilter) && (!libFpsFilter || fpsBucket(e.fps) === libFpsFilter));
+    }
     const {
       key,
       dir
@@ -1077,7 +1166,7 @@ export default function App() {
       if (typeof va === "number" && typeof vb === "number") return (va - vb) * dir;
       return String(va).localeCompare(String(vb), "ko") * dir;
     });
-  }, [library, folders, folderById, libSel, libFilter, libSort]);
+  }, [library, folders, folderById, libSel, libFilter, libSort, libSearch, libResFilter, libBrFilter, libFpsFilter]);
   // pagination window over visibleEntries
   const pageCount = Math.max(1, Math.ceil(visibleEntries.length / libPageSize));
   const page = Math.min(libPage, pageCount - 1);
@@ -1098,13 +1187,13 @@ export default function App() {
       libTableRef.current?.scrollIntoView({ behavior: "smooth", block: "start" })
     );
   };
-  // switching sheet/filter deselects + back to first page (rows are not
-  // comparable across them)
+  // switching sheet/filter/search deselects + back to first page (rows are
+  // not comparable across them)
   useEffect(() => {
     setLibSelKeys(new Set());
     goPage(0);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [libSel, libFilter]);
+  }, [libSel, libFilter, libSearch, libResFilter, libBrFilter, libFpsFilter]);
   const toggleLibSort = key => setLibSort(s => s.key === key ? {
     key,
     dir: -s.dir
@@ -1363,6 +1452,58 @@ export default function App() {
       selectLogic(rest.length ? rest[0].id : "", rest);
       api.foldersGet().then(setFolders).catch(() => {});
     }).catch(e => flashBlock(e.message));
+  };
+  // Export the saved logic as a JSON file (for backup / sharing with
+  // another CodecTrans install).
+  const exportLogic = () => {
+    const id = activeLogicRef.current;
+    const l = logics.find(x => x.id === id);
+    if (!l) {
+      flashBlock(t("내보낼 저장된 로직이 없습니다 — 먼저 저장 버튼을 누르세요"));
+      return;
+    }
+    const blob = new Blob([JSON.stringify({
+      name: l.name,
+      graph: l.graph
+    }, null, 2)], {
+      type: "application/json"
+    });
+    const a = document.createElement("a");
+    a.href = URL.createObjectURL(blob);
+    a.download = "codectrans-logic-" + (l.name || "logic").replace(/[^\w\-가-힣]+/g, "-") + ".json";
+    a.click();
+    URL.revokeObjectURL(a.href);
+  };
+  // Import a logic from a JSON file — always created as a NEW logic.
+  const importLogic = ev => {
+    const file = ev.target.files && ev.target.files[0];
+    ev.target.value = "";
+    if (!file) return;
+    file.text().then(txt => {
+      let obj;
+      try {
+        obj = JSON.parse(txt);
+      } catch (e) {
+        flashBlock(t("JSON 파싱 실패 — 로직 내보내기 파일인지 확인하세요"));
+        return;
+      }
+      if (!obj || typeof obj.name !== "string" || !obj.graph || !Array.isArray(obj.graph.nodes) || !Array.isArray(obj.graph.edges)) {
+        flashBlock(t("로직 파일 형식이 아닙니다 (name + graph.nodes/edges 필요)"));
+        return;
+      }
+      if (logicDirtyRef.current) {
+        flashBlock(t("미저장 변경이 있어 가져오기를 중단했습니다 — 먼저 저장하거나 새 로직으로 전환하세요"));
+        return;
+      }
+      api.logicsPost({
+        name: obj.name,
+        graph: obj.graph
+      }).then(r => {
+        if (r.logics) setLogics(r.logics);
+        if (r.logic) selectLogic(r.logic.id, r.logics);
+        flashBlock(t("로직 가져오기 완료: ") + obj.name);
+      }).catch(err => flashBlock(err.message));
+    }).catch(() => flashBlock(t("파일을 읽을 수 없습니다")));
   };
   const patchNode = (id, patch) => {
     const g = graphRef.current;
@@ -2189,6 +2330,14 @@ export default function App() {
           return <div key={n.id} className="node">
               <div className="row">
                 <span className={`status ${n.status === "online" ? "done" : ""}`}>{n.status}</span>
+                {n.healthTotal > 0 && (() => {
+                  const pct = Math.round((n.healthDone / n.healthTotal) * 100);
+                  return <span className="nhealth" title={t("사전 헬스체크 진행 (pre-check) — ") + n.healthDone + " / " + n.healthTotal + t(" 완료")}>
+                    <span className="nhealth-label">{t("\uC0AC\uC804\uAC80\uC0C1")}</span>
+                    <span className="nhealth-bar"><i style={{ width: pct + "%" }} /></span>
+                    <span className="nhealth-pct">{n.healthDone}/{n.healthTotal}</span>
+                  </span>;
+                })()}
                 <span className="jname" title={n.name === (n.displayName || n.name) ? undefined : t("\uB4F1\uB85D\uBA85: ") + n.name}>
                   {n.displayName || n.name}
                 </span>
@@ -2572,6 +2721,20 @@ export default function App() {
                       {saved > 0 && <span className="ls-item save" title={shrunk.length + t("\uAC1C \uD30C\uC77C \uC6D0\uBCF8 \uB300\uBE44 \uC6A9\uB7C9 \uAC10\uC18C\uBD84")}>
                           💾 <b>{fmtSize(saved)}</b>{t("\uC808\uC57D")}</span>}
                       {libFilter && <span className="ls-item filterhint">{t("\uD544\uD130 \uC911 \u2014 \uB2E4\uC2DC \uD074\uB9AD\uD558\uBA74 \uD574\uC81C")}</span>}
+                      <input className="libsearch" type="search" placeholder={t("검색 — 이름/경로/코덱")} value={libSearch} onChange={e => setLibSearch(e.target.value)} title={t("이름, 파일의 전체 경로, 코덱번호 기준 검색 — 기존 필터와 결합")} />
+                      {libSearch.trim() && <span className="ls-item filterhint">{t("검색 중 — ") + visibleEntries.length + t("건 확인")}</span>}
+                      <select className="libfilter-sel" value={libResFilter} onChange={e => setLibResFilter(e.target.value)} title={t("해상도 필터 — 그 사이의 값은 낮은 단계로 묶음 (예: 1085p → 1080, 1445p → 2K)")}>
+                        <option value="">{t("해상도 전체")}</option>
+                        {RES_OPTIONS.map(([v, l]) => <option key={v} value={v}>{l}</option>)}
+                      </select>
+                      <select className="libfilter-sel" value={libBrFilter} onChange={e => setLibBrFilter(e.target.value)} title={t("비트레이트 필터 — 소스 파일의 비디오 비트레이트 기준")}>
+                        <option value="">{t("비트레이트 전체")}</option>
+                        {BR_OPTIONS.map(([v, l]) => <option key={v} value={v}>{l}</option>)}
+                      </select>
+                      <select className="libfilter-sel" value={libFpsFilter} onChange={e => setLibFpsFilter(e.target.value)} title={t("프레임률 필터 — 표준 프레임률 ±0.1 (23.976 → 24)")}>
+                        <option value="">{t("프레임 전체")}</option>
+                        {FPS_OPTIONS.map(([v, l]) => <option key={v} value={v}>{l}</option>)}
+                      </select>
                       {libSelKeys.size > 0 && <div className="libbatch" title={t("\uC120\uD0DD\uD55C \uD30C\uC77C \uC77C\uBC31 \uCC98\uB9AC \u2014 \uCCB4\uD06C\uBC84\uC2A4\uB85C \uACE0\uB974\uB2E4 \uD639\uC5B4\uB9AC \uC774\uC5EC\uB124 \uD45C\uC2DC")}>
                           <span className="jmeta">{t("\uC120\uD0DD: ") + libSelKeys.size + t("\uAC74")}</span>
                           <button onClick={() => batchLib("requeue")}>{t("\uC7AC\uC778\uCF54\uB529")}</button>
@@ -2659,9 +2822,12 @@ export default function App() {
                               <span className="prog-pct">{pct}%</span>
                             </span>;
               })() : <span className="statusrow">
-                          <span className={`status ${e.status === "done" ? "done" : e.status === "error" ? "error" : e.status === "failed" ? "failed" : e.status === "queued" ? "running" : e.status === "notvideo" ? "notvideo" : e.status === "skipped" ? "skipped" : ""}`} title={e.status === "done" ? t("\uC6D0\uBCF8: ") + fmtSize(e.size) + " " + [e.videoCodec, e.audioCodec].filter(Boolean).join("/") + t(" \u2192 \uACB0\uACFC: ") + (e.newSize != null ? fmtSize(e.newSize) : "?") + " " + (e.newCodec || "") + " (" + (e.reencoded || "?") + ")" : e.status === "error" || e.status === "failed" || e.status === "skipped" || e.status === "notvideo" ? e.error : undefined}>
-                            {e.status === "notvideo" ? t("\uBE44\uC601\uC0C1") : e.status}
-                          </span>
+                          {(() => {
+                            const m = stageMeta(e);
+                            return <span className={`status ${m.cls}`} title={e.status === "done" ? t("원본: ") + fmtSize(e.size) + " " + [e.videoCodec, e.audioCodec].filter(Boolean).join("/") + t(" → 결과: ") + (e.newSize != null ? fmtSize(e.newSize) : "?") + " " + (e.newCodec || "") + " (" + (e.reencoded || "?") + ")" : e.status === "pre-checking" ? t("사전 헬스체크 진행 중 — 노드가 디코딩 창을 검사합니다 (완료되면 큐잉으로 넘어갑니다)") : e.status === "error" || e.status === "failed" || e.status === "skipped" || e.status === "notvideo" ? e.error : undefined}>
+                              {m.label}
+                            </span>;
+                          })()}
                           {["pending", "queued", "error", "failed"].includes(e.status) && <button className="mini" title={t("스킵 — 인코딩하지 않음 (⟳으로 다시 큐에 넣기)")} onClick={() => doSkip(e)}>
                               ⏭
                             </button>}
@@ -2721,6 +2887,12 @@ export default function App() {
             color: "#e6b455"
           }}>{t("\uBCC0\uACBD\uC0AC\uD56D \uBBF8\uC800\uC7A5")}</span>}
               <button className="rm-del" onClick={deleteLogic} disabled={!activeLogic} title={t("\uC120\uD0DD\uB41C \uB85C\uC9C1 \uC0AD\uC81C")}>{t("\uC0AD\uC81C")}</button>
+              <button onClick={exportLogic} disabled={!activeLogic} title={t("\uC120\uD0DD\uB41C \uB85C\uC9C1\uC744 JSON \uD30C\uC77C\uB85C \uB098\uB3C4\uC5EC\uAE30 (\uBC31\uC5C5\u00B7\uACE0\uC6A9 \u2014 \uB85C\uC9C1 \uD0C0\uBE0C\uC758 '\uAC00\uC8FC\uC624\uAE30'\uB85C \uB2E4\uC2DC \uC624\uB9C9)")}>⬇ {t("\uB098\uB3C4\uC5EC\uAE30")}</button>
+              <label title={t("JSON \uD30C\uC77C\uC5D0\uC11C \uB85C\uC9C1 \uAC00\uC8FC\uC624\uAE30 \u2014 \uC0C8 \uB85C\uC9C1\uC73C\uB85C \uCD94\uAC00\uB429\uB2C8\uB2E4")} style={{
+        cursor: "pointer"
+      }}>⬆ {t("\uAC00\uC8FC\uC624\uAE30")}<input type="file" accept=".json,application/json" style={{
+            display: "none"
+          }} onChange={importLogic} /></label>
               <span className="meta dim">{t("\uB178\uB4DC: \uD5E4\uB354\uB85C \uB4DC\uB798\uADF8 \xB7 \uC81C\uBAA9 \uB354\uBE14\uD074\uB9AD = \uC774\uB984 \uBCC0\uACBD \xB7 \uC640\uC774\uC5B4 \uD074\uB9AD = \uB04A\uAE30 \xB7 \uCE94\uBC84\uC2A4 \uB4DC\uB798\uADF8 = \uC774\uB3D9 \xB7 \uD720 = \uD655\uB300/\uCD95\uC18C \u2014 \uC800\uC7A5\uB41C \uB85C\uC9C1\uC740")}{" "}
                 <b>{t("\uB77C\uC774\uBE0C\uB7EC\uB9AC \uD0ED")}</b>{t("\uC5D0\uC11C \uD3F4\uB354\uC5D0 \uBC30\uC815\uD569\uB2C8\uB2E4")}</span>
               {blockMsg && <span className="meta ok-text">{blockMsg}</span>}
@@ -3426,14 +3598,14 @@ export default function App() {
             <div className="statgrid">
               <div className="stat">
                 <div className="stat-top">
-                  <span className="stat-label">{t("\uC11C\uBE44\uC2A4")}</span>
-                  <span className="stat-val">{health?.service || "—"}</span>
+                  <span className="stat-label">{t("서비스")}</span>
+                  <span className="stat-val small">{health?.service || "—"}</span>
                 </div>
               </div>
               <div className="stat">
                 <div className="stat-top">
                   <span className="stat-label">FFmpeg</span>
-                  <span className="stat-val">
+                  <span className="stat-val small">
                     {health?.ffmpeg ? health.ffmpeg.split(" ").slice(0, 3).join(" ") : "—"}
                   </span>
                 </div>
