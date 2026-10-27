@@ -3298,6 +3298,26 @@ async fn folders_post(State(store): State<Store>, Json(mut b): Json<FoldersBody>
             }
         }
     }
+    // Enabled-state transitions (drives queue removal on disable and the
+    // immediate scan on enable, below).
+    let prev_enabled: std::collections::HashSet<String> = c
+        .folders
+        .iter()
+        .filter(|f| f.enabled)
+        .map(|f| f.id.clone())
+        .collect();
+    let newly_disabled: Vec<String> = b
+        .folders
+        .iter()
+        .filter(|f| !f.enabled && prev_enabled.contains(&f.id))
+        .map(|f| f.id.clone())
+        .collect();
+    let newly_enabled: Vec<String> = b
+        .folders
+        .iter()
+        .filter(|f| f.enabled && !prev_enabled.contains(&f.id))
+        .map(|f| f.id.clone())
+        .collect();
     c.folders = b.folders.clone();
     if let Err(e) = save_lib_cfg(&c) {
         return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": e.to_string() }))).into_response();
@@ -3323,6 +3343,60 @@ async fn folders_post(State(store): State<Store>, Json(mut b): Json<FoldersBody>
         }
     }
     persist_catalog(&store);
+    // Disable transition: pull the library OUT of the queue now. Cancel its
+    // queued jobs (dispatched ones are picked up by the node's in-flight
+    // cancel poll and ffmpeg is killed) and reset its in-flight entries to
+    // pending with saved decisions cleared — a re-enable then re-evaluates
+    // fresh instead of re-dispatching a stale decision.
+    for fid in &newly_disabled {
+        let mut s = store.lock().unwrap_or_else(|p| p.into_inner());
+        let prefix = format!("{fid}/");
+        let mut cancelled = 0usize;
+        for j in s.jobs.values_mut() {
+            if (j.status == "queued" || j.status == "dispatched")
+                && j.input_file.starts_with(&prefix)
+            {
+                j.status = "cancelled".into();
+                j.error = Some("라이브러리 비활성화 — 큐에서 제거".into());
+                j.finished_at = Some(now_ms());
+                cancelled += 1;
+            }
+        }
+        let mut reset = 0usize;
+        for e in s.library.values_mut() {
+            if e.folder.as_deref() == Some(fid.as_str())
+                && (e.status == "queued" || e.status == "dispatched")
+            {
+                e.status = "pending".into();
+                e.error = None;
+                e.decision = None;
+                e.decision_version = None;
+                e.requeue_count = 0;
+                reset += 1;
+            }
+        }
+        if cancelled > 0 || reset > 0 {
+            eprintln!(
+                "[CodecTrans] folder {fid} disabled — cancelled {cancelled} jobs, reset {reset} entries to pending"
+            );
+        }
+    }
+    if !newly_disabled.is_empty() {
+        persist_catalog(&store);
+    }
+    // Enable transition: scan the folder NOW (normal flow: gate → health →
+    // decision → queue with the usual cap) so its files don't sit unhandled
+    // until the next 30-min auto-scan tick.
+    for fid in newly_enabled {
+        let store = store.clone();
+        tokio::spawn(async move {
+            let _ = library_scan_inner(
+                store,
+                ScanReq { root: None, folder_id: Some(fid), limit: Some(5000) },
+            )
+            .await;
+        });
+    }
     Json(json!({ "ok": true, "folders": b.folders })).into_response()
 }
 
@@ -5469,6 +5543,10 @@ async fn library_scan_inner(store: Store, req: ScanReq) -> Response {
             libcfg
                 .folders
                 .iter()
+                // Disabled libraries are frozen: not walked, not evaluated,
+                // nothing queued. (2026-10-27: a disabled folder's files
+                // were re-scanned and re-queued every 30-min auto-scan.)
+                .filter(|f| f.enabled)
                 .map(|f| (Some(f.id.clone()), PathBuf::from(f.path.clone())))
                 .filter(|(_, p)| p.is_dir())
                 .collect()
@@ -5876,10 +5954,22 @@ async fn library_scan_inner(store: Store, req: ScanReq) -> Response {
     // LAST one to be health-checked before a single bulk dispatch.
     //
     // Pass 1 — cheap per-entry gates (no concurrency needed).
+    let disabled_fids: std::collections::HashSet<&str> = libcfg
+        .folders
+        .iter()
+        .filter(|f| !f.enabled)
+        .map(|f| f.id.as_str())
+        .collect();
     let mut todo: Vec<usize> = Vec::new();
     let mut redispatch: Vec<usize> = Vec::new();
     for i in 0..entries.len() {
         if entries[i].status != "pending" {
+            continue;
+        }
+        // Disabled library: frozen — no gate, no health decode, no
+        // decision, no re-dispatch (even when the folder is scanned
+        // explicitly). Entries keep their status until re-enabled.
+        if entries[i].folder.as_deref().is_some_and(|f| disabled_fids.contains(f)) {
             continue;
         }
         // Starved sentinel: the probe was deferred to the next scan
