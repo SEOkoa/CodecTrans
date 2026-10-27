@@ -76,7 +76,7 @@ services:
       # (UI에서 /media/Volume1 형태로 폴더 등록)
       - /share/YourVolume1:/media/Volume1  # adjust to your share names
       - /share/YourVolume2:/media/Volume2  # adjust to your share names
-      - /share/YourVolume3:/media/Volume3
+      - /share/YourVolume3:/media/Volume3  # adjust to your share names
       # ────────────────────────────────────────────────────────
     depends_on:
       codectrans-redis:
@@ -117,4 +117,4 @@ services:
       # 같은 파일시스템 소스 직접 읽기 (멀티 GB 루프백 회피)
       - /share/YourVolume1:/media/Volume1  # adjust to your share names
       - /share/YourVolume2:/media/Volume2  # adjust to your share names
-      - /share/YourVolume3:/media/Volume3
+      - /share/YourVolume3:/media/Volume3  # adjust to your share names
