@@ -1247,6 +1247,19 @@ button:disabled {
   font-size: 12.5px;
   word-break: break-all;
 }
+/* Mobile: a squeezed flex:1 path cell breaks one character per line and the
+   folder row balloons vertically. Give the path its own full-width line and
+   let the buttons wrap beneath it. */
+@media (max-width: 720px) {
+  .folder .row {
+    flex-wrap: wrap;
+  }
+  .fpath {
+    flex: 1 1 100%;
+    order: -1;
+    margin-bottom: 2px;
+  }
+}
 .frow {
   display: flex;
   gap: 10px;

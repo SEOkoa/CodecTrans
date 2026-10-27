@@ -2125,12 +2125,11 @@ pub struct LibraryConfig {
     /// (corrupt sources are no longer quarantined pre-encode).
     #[serde(default = "default_true")]
     pub pre_health_check: bool,
-    /// Concurrent health-check workers on the SERVER (settings tab). Nodes
-    /// run their own (per-node `healthWorkers`). None = auto (4 with a GPU
-    /// decode path, 2 without), Some(0) = server decodes off, Some(n) = n.
-    /// The CT_HEALTH_WORKERS env still overrides at the deployment level.
+    /// How much of each source the pre-encode check decodes (settings
+    /// tab): percent 1..=100, overriding every srcHealth gate's own
+    /// value. None = use the value each logic's srcHealth gate defines.
     #[serde(default)]
-    pub health_workers: Option<u32>,
+    pub pre_health_depth: Option<u8>,
     /// Bumped on EVERY settings save (logic / graph / folders / …). Saved
     /// encode decisions carry the version they were made with; a scan
     /// re-evaluates any decision whose version is older than this, so an
@@ -3854,9 +3853,10 @@ struct SettingsBody {
     requeue_limit: Option<u32>,
     /// Pre-encode source health check (missing = leave as-is).
     pre_health_check: Option<bool>,
-    /// Server-side health-check workers (missing = leave as-is, null = auto,
-    /// 0 = off, N = clamp 0..=16).
-    health_workers: Option<Option<u32>>,
+    /// Pre-encode check depth (missing = leave as-is, 0 = per-logic gate
+    /// values, N = clamp 1..=100 percent). JSON null also reads as absent,
+    /// so 0 is the explicit "back to per-logic" sentinel.
+    pre_health_depth: Option<u32>,
 }
 
 /// GET /api/settings — server-level settings (fail folder, auto-rescan).
@@ -3873,7 +3873,7 @@ async fn settings_get(State(_store): State<Store>) -> impl IntoResponse {
         "language": lang,
         "requeueLimit": c.requeue_limit.filter(|v| *v > 0).unwrap_or(DEFAULT_REQUEUE_LIMIT),
         "preHealthCheck": c.pre_health_check,
-        "healthWorkers": c.health_workers,
+        "preHealthDepth": c.pre_health_depth,
     }))
 }
 
@@ -3904,10 +3904,16 @@ async fn settings_post(State(_store): State<Store>, Json(b): Json<SettingsBody>)
     if let Some(on) = b.pre_health_check {
         c.pre_health_check = on;
     }
-    if let Some(w) = b.health_workers {
-        // null = back to auto (None); Some(n) clamped 0..=16 (0 = server
-        // decodes off — nodes still run their own).
-        c.health_workers = w.map(|n| n.min(16));
+    // 0 = back to per-logic gate values (None); N clamped 1..=100.
+    // (JSON null deserializes to absent for a single Option, so the
+    // "clear" path must be an explicit 0 — same convention as requeueLimit.)
+    let mut depth_flip = false;
+    if let Some(v) = b.pre_health_depth {
+        let parsed: Option<u8> = if v == 0 { None } else { Some(v.clamp(1, 100) as u8) };
+        if parsed != c.pre_health_depth {
+            depth_flip = true;
+            c.pre_health_depth = parsed;
+        }
     }
     match b.language {
         Some(None) => c.language = None,
@@ -3923,15 +3929,16 @@ async fn settings_post(State(_store): State<Store>, Json(b): Json<SettingsBody>)
     // language, health workers) — none of them change per-file encoding
     // decisions, so a logic_version bump would needlessly invalidate every
     // stored decision. EXCEPTION: flipping the pre-encode health check
-    // changes the srcHealth gate outcome, which is a decision input — that
-    // one must invalidate (full save bumps logic_version).
-    let saved = if health_flip {
+    // (or its depth) changes the srcHealth gate outcome, which is a
+    // decision input — that one must invalidate (full save bumps
+    // logic_version).
+    let saved = if health_flip || depth_flip {
         save_lib_cfg(&c)
     } else {
         save_lib_cfg_quiet(&c)
     };
     match saved {
-        Ok(_) => Json(json!({ "ok": true, "failDir": c.fail_dir, "autoScanMinutes": c.auto_scan_minutes, "language": lang })).into_response(),
+        Ok(_) => Json(json!({ "ok": true, "failDir": c.fail_dir, "autoScanMinutes": c.auto_scan_minutes, "language": lang, "preHealthCheck": c.pre_health_check, "preHealthDepth": c.pre_health_depth })).into_response(),
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(json!({ "error": e.to_string() })),
@@ -6425,22 +6432,16 @@ async fn library_scan_inner(store: Store, req: ScanReq) -> Response {
     let online = std::sync::Arc::new(online);
     let eff_graph = std::sync::Arc::new(eff_graph);
     let live = std::sync::Arc::new(live);
-    // Server-side health-decode budget. CT_HEALTH_WORKERS still wins as a
-    // per-deployment override; otherwise the SETTINGS value (None = auto:
-    // GPU 4 / CPU 2, 0 = off — the gate then evaluates as healthy, so
-    // node-mounted decodes are the only ones that run).
+    // Server-side health-decode budget. The CT_HEALTH_WORKERS env is the
+    // deployment-level override (0 = off — the gate then evaluates as
+    // healthy for sources no node-mounted decode covers); otherwise auto:
+    // 4 with a GPU decode path, 2 without.
     let server_health: u32 = if let Ok(s) = std::env::var("CT_HEALTH_WORKERS") {
         s.parse().unwrap_or(2)
     } else {
-        match libcfg.health_workers {
-            Some(0) => 0,
-            Some(n) => n.clamp(1, 16),
-            None => {
-                let d = if cuda_libdir().is_some() { 4 } else { 2 };
-                eprintln!("[CodecTrans] server health workers: {d} (auto — set the settings value, 0 = off)");
-                d
-            }
-        }
+        let d = if cuda_libdir().is_some() { 4 } else { 2 };
+        eprintln!("[CodecTrans] server health workers: {d} (auto — set CT_HEALTH_WORKERS to override)");
+        d
     };
     if server_health == 0 {
         eprintln!("[CodecTrans] server health workers: 0 — only node-mounted sources get decoded; the rest evaluate as healthy");
@@ -6488,10 +6489,17 @@ async fn library_scan_inner(store: Store, req: ScanReq) -> Response {
             //     the node (NVDEC ≈ 0 CPU) instead of the server.
             //     Otherwise the server decodes it itself, bounded by the
             //     server healthWorkers budget.
-            let file_depths: Vec<(String, u32)> =
+            let mut file_depths: Vec<(String, u32)> =
                 effective_graph_for(folder, &libcfg, &eff_graph)
                     .map(|g| src_health_depths(&[g]))
                     .unwrap_or_default();
+            // Global "check amount" (settings): replace every gate's
+            // value, keep each gate's mode (front/random/all).
+            if let Some(p) = libcfg.pre_health_depth {
+                for d in file_depths.iter_mut() {
+                    d.1 = p as u32;
+                }
+            }
             if pre_health && file_depths.is_empty() && std::env::var("CT_DEBUG_HEALTH").is_ok() {
                 // Should be rare (a file whose graph has no srcHealth
                 // gate) — but if it fires for files whose graph DOES have

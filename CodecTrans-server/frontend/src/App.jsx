@@ -430,8 +430,7 @@ export default function App() {
   const [autoScanDraft, setAutoScanDraft] = useState(null); // null = not loaded yet
   const [requeueDraft, setRequeueDraft] = useState(null); // null = not loaded yet (default 3)
   const [preHealthDraft, setPreHealthDraft] = useState(null); // null = not loaded yet (default true)
-  // "" = auto (GPU 4 / CPU 2); "0" = server decode off; "N" = fixed workers
-  const [serverHealthDraft, setServerHealthDraft] = useState("");
+  const [preHealthDepthDraft, setPreHealthDepthDraft] = useState("");
   const [pauseState, setPauseState] = useState({ all: false, nodeIds: [] }); // queue pause
   const [settingsMsg, setSettingsMsg] = useState("");
   const [lang, setLangState] = useState("ko"); // "ko" | "en" — server setting
@@ -497,7 +496,7 @@ export default function App() {
       setAutoScanDraft(s.autoScanMinutes ?? 0);
       setRequeueDraft(s.requeueLimit ?? 3);
       setPreHealthDraft(s.preHealthCheck ?? true);
-      setServerHealthDraft(s.healthWorkers === undefined || s.healthWorkers === null ? "" : String(s.healthWorkers));
+      setPreHealthDepthDraft(s.preHealthDepth === undefined || s.preHealthDepth === null ? "" : String(s.preHealthDepth));
       // setLang BEFORE setLangState: the re-render reads the module var,
       // and a bare module mutation (useEffect) would never re-render.
       const l = s.language === "en" ? "en" : "ko";
@@ -2353,7 +2352,12 @@ export default function App() {
             <label className="cfglabel">{t("\uB3D9\uC2DC \uC778\uCF54\uB529 \uC218")}<input type="number" className="num" min={1} max={16} value={nodeCfg.maxJobs} onChange={e => patchNodeCfg({
               maxJobs: Math.max(1, Math.min(16, Number(e.target.value) || 1))
             })} />
-              <span className="meta">{t("\uC608: 2-\uC2AC\uB77C\uC774\uC2A4 NVENC GPU\uB294 2~3\uAC1C \uB3D9\uC2DC \uC778\uCF54\uB529\uAE4C\uC9C0 \uC131\uB2A5 \uC190\uD574\uAC00 \uC801\uC74C")}</span>
+              <span className="meta">{t("\uC608: 2-\uC2AC\uB77C\uC774\uC2A4 NVENC GPU\uB294 2~3\uAC1C \uB3D9\uC2DC \uC778\uCF54\uB529\uAE4C\uC9C0 \uC131\uC7A5 \uC190\uD574\uAC00 \uC801\uC74C")}</span>
+            </label>
+            <label className="cfglabel">{t("사전 헬스체크 워커 (0 = 끄기)")}<input type="number" className="num" min={0} max={16} value={nodeCfg.healthWorkers} onChange={e => patchNodeCfg({
+              healthWorkers: Math.max(0, Math.min(16, Number(e.target.value) || 0))
+            })} />
+              <span className="meta">{t("인코딩 전에 소스 디코딩 헬스체크를 수행할 워커 수 — 이 노드가 같은 파일 시스템에서 소스를 볼 때만 사용되고, 인코딩 워커와 독립적입니다. 0 = 이 노드에서 헬스체크 안 함")}</span>
             </label>
             <div className="cfgactions">
               <span className="meta">{nodeCfg.msg}</span>
@@ -3375,19 +3379,14 @@ export default function App() {
       })}>{t("저장")}</button>
             </div>
             <div className="search">
-              <select value={serverHealthDraft} onChange={e => setServerHealthDraft(e.target.value)} title={t("서버가 직접 디코딩 헬스체크를 수행할 워커 수 (해당 노드가 없는 파일만) — 자동: GPU 4 / CPU 2")}>
-                <option value="">{t("서버 헬스체크 워커: 자동")}</option>
-                <option value="0">{t("서버 헬스체크 워커: 끄기 (노드만)")}</option>
-                <option value="1">{t("서버 헬스체크 워커: 1")}</option>
-                <option value="2">{t("서버 헬스체크 워커: 2")}</option>
-                <option value="4">{t("서버 헬스체크 워커: 4")}</option>
-                <option value="8">{t("서버 헬스체크 워커: 8")}</option>
-              </select>
+              <label className="cfglabel">{t("체크 범위 (% of source)")}<input type="number" className="num" min={1} max={100} value={preHealthDepthDraft} placeholder={t("로직별 기본")} onChange={e => setPreHealthDepthDraft(e.target.value === "" ? "" : String(Math.max(1, Math.min(100, Number(e.target.value) || 1))))} title={t("파일의 몇 %를 디코딩해 검사할지 (1-100) — 비워두면 각 로직 srcHealth 게이트가 정의한 값 사용")} />
+                <span className="meta">{t("예: 5 = 앞 5% + 랜덤 5% 윈도우 (최대 15초)")}</span>
+              </label>
               <button onClick={() => api.settingsPost({
-        healthWorkers: serverHealthDraft === "" ? null : Number(serverHealthDraft)
+        preHealthDepth: preHealthDepthDraft === "" ? 0 : Number(preHealthDepthDraft)
       }).then(r => {
-        setServerHealthDraft(r.healthWorkers === undefined || r.healthWorkers === null ? "" : String(r.healthWorkers));
-        flashBlock(t("서버 헬스체크 워커 저장됨 ✓"));
+        setPreHealthDepthDraft(r.preHealthDepth === undefined || r.preHealthDepth === null ? "" : String(r.preHealthDepth));
+        flashBlock(t("헬스체크 범위 저장됨 ✓"));
       })}>{t("저장")}</button>
             </div>
           </div>
