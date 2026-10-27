@@ -1829,7 +1829,7 @@ fn save_auto(c: &AutoConfig) -> std::io::Result<()> {
 /// The server walks the list in order and uses the FIRST choice the selected
 /// node can actually run (HW), so a folder can say "av1 on the GPU, else
 /// hevc" or "hevc on the nvenc box, h264 on the Mac" without per-node graphs.
-#[derive(Clone, PartialEq, Serialize, Deserialize, Default)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct TargetChoice {
     /// Logical video codec (h264/h265/av1/...).
@@ -1856,7 +1856,7 @@ pub struct TargetChoice {
 }
 
 /// Encoding target for a folder or a logic block.
-#[derive(Clone, PartialEq, Serialize, Deserialize, Default)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct TargetCfg {
     /// Logical video codec (h264/h265/av1/...); rewritten per-node to the
@@ -2215,7 +2215,7 @@ pub struct WorkflowGraph {
 /// A post-encode operation — chained on the encode action's OUTPUT port.
 /// The server executes the whole plan (in chain order) when the finished
 /// file arrives in `node_result`. The node never sees it.
-#[derive(Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", tag = "op")]
 pub enum PostOp {
     /// ffprobe the output: video stream present, positive duration, at
@@ -5095,7 +5095,7 @@ async fn cond_matches(
 }
 
 /// The verdict for one file after walking its logic graph.
-#[derive(Clone, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 enum GraphDecision {
     /// Encode with this target; `post` is the post-encode chain
     /// (verify → replace → …).
@@ -6492,6 +6492,17 @@ async fn library_scan_inner(store: Store, req: ScanReq) -> Response {
                 effective_graph_for(folder, &libcfg, &eff_graph)
                     .map(|g| src_health_depths(&[g]))
                     .unwrap_or_default();
+            if pre_health && file_depths.is_empty() && std::env::var("CT_DEBUG_HEALTH").is_ok() {
+                // Should be rare (a file whose graph has no srcHealth
+                // gate) — but if it fires for files whose graph DOES have
+                // gates, the effective-graph lookup is broken.
+                eprintln!(
+                    "[scan][debug-health] {} — preHealthCheck ON but no srcHealth depths (graph found: {}, folder logic_id: {:?})",
+                    key,
+                    effective_graph_for(folder, &libcfg, &eff_graph).is_some(),
+                    folder.and_then(|f| f.logic_id.clone())
+                );
+            }
             // None = the gate is never consulted for this file.
             let verdict: Option<bool> = if file_depths.is_empty() || !pre_health {
                 // (preHealthCheck OFF: the gate always passes — below the
@@ -6510,8 +6521,20 @@ async fn library_scan_inner(store: Store, req: ScanReq) -> Response {
                 if d_true == d_false {
                     // The health gate changes nothing for this file — skip
                     // the decode entirely.
+                    if std::env::var("CT_DEBUG_HEALTH").is_ok() {
+                        eprintln!(
+                            "[scan][debug-health] {} — lazy-skip: d_true==d_false ({:?}) depths={:?}",
+                            key, d_true, file_depths
+                        );
+                    }
                     None
                 } else {
+                    // The verdict will depend on the decode — this file is
+                    // part of the health workload.
+                    SCAN_STATE
+                        .lock()
+                        .unwrap_or_else(|p| p.into_inner())
+                        .health_total += 1;
                     match resolve_lib_source(&key, &store_t) {
                         None => {
                             // Source vanished (moved/renamed after the probe)
@@ -6555,8 +6578,17 @@ async fn library_scan_inner(store: Store, req: ScanReq) -> Response {
                                         // the legacy no-worker semantics).
                                         let sum_timeout: u64 =
                                             windows.iter().map(|w| w.timeout_s).sum();
-                                        let deadline =
-                                            now_ms() + ((sum_timeout.saturating_mul(3) / 2) + 300) as i64;
+                                        // Deadline in MILLISECONDS: 1.5x the
+                                        // window timeout budget (seconds)
+                                        // plus a 5-minute grace for a slow
+                                        // node. (Earlier build mixed units —
+                                        // "+300" was read as 300 ms, so the
+                                        // node job was cancelled 330 ms
+                                        // after creation and every check fell
+                                        // back to the server.)
+                                        let deadline = now_ms()
+                                            + (sum_timeout.saturating_mul(1500) / 2
+                                                + 300_000) as i64;
                                         let job = Job {
                                             id: uuid::Uuid::new_v4().to_string(),
                                             input_file: key.clone(),

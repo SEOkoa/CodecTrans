@@ -2246,7 +2246,13 @@ async fn do_register(client: &reqwest::Client, server: &str, name: &str, caps: &
             false
         }
         Err(e) => {
-            println!("[node] register transport error: {}", e);
+            let mut chain = String::new();
+            let mut src = std::error::Error::source(&e);
+            while let Some(s) = src {
+                chain.push_str(&format!(" <- {}", s));
+                src = s.source();
+            }
+            println!("[node] register transport error: {}{}", e, chain);
             false
         }
     }
