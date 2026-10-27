@@ -373,6 +373,12 @@ pub struct LibraryEntry {
     /// condition instead of decoding again.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub src_health: Option<bool>,
+    /// Last ffprobe attempt could not read the file at all (I/O error /
+    /// unreadable header). Such a file is NOT "notvideo": it stays
+    /// pending and is re-probed on the next scan, so a transient read
+    /// failure can't permanently mislabel it.
+    #[serde(default)]
+    pub probe_failed: bool,
 }
 
 /// Default post-encode requeue cap (overridable via the settings tab,
@@ -1290,11 +1296,26 @@ fn is_video_ext(ext: Option<&str>) -> bool {
 }
 
 /// Recursively collect video files under `cur` (relative to `root`), up to `limit`.
-fn walk_videos(cur: &std::path::Path, root: &std::path::Path, out: &mut Vec<PathBuf>, limit: usize) {
+fn walk_videos(
+    cur: &std::path::Path,
+    root: &std::path::Path,
+    out: &mut Vec<PathBuf>,
+    failed: &mut bool,
+    limit: usize,
+) {
     if out.len() >= limit {
         return;
     }
-    let Ok(rd) = std::fs::read_dir(cur) else { return };
+    let Ok(rd) = std::fs::read_dir(cur) else {
+        // A directory that cannot be listed loses its ENTIRE subtree from
+        // the plan — mark the walk incomplete so the scan's final catalog
+        // write can preserve the existing entries for files we could not
+        // see instead of erasing their records (a blind replacement
+        // silently drops every entry under a momentarily unreadable dir).
+        *failed = true;
+        eprintln!("[walk] read_dir failed — subtree skipped: {}", cur.display());
+        return;
+    };
     for e in rd.flatten() {
         if out.len() >= limit {
             break;
@@ -1305,7 +1326,10 @@ fn walk_videos(cur: &std::path::Path, root: &std::path::Path, out: &mut Vec<Path
         // (2026-10-27: repeated full rescans were the wedge trigger).
         // ZFS provides d_type, so regular files/dirs cost nothing; only
         // symlinks (rare here) fall back to a follow-stat.
-        let Ok(ft) = e.file_type() else { continue };
+        let Ok(ft) = e.file_type() else {
+            *failed = true;
+            continue;
+        };
         if ft.is_dir() {
             // Skip hidden dirs and NAS metadata/thumbnail caches (QNAP
             // .@__thumb is full of mjpeg "thumbnails" that would flood the
@@ -1314,7 +1338,7 @@ fn walk_videos(cur: &std::path::Path, root: &std::path::Path, out: &mut Vec<Path
             if name.starts_with('.') || name == "@eaDir" || name.starts_with('!') {
                 continue;
             }
-            walk_videos(&p, root, out, limit);
+            walk_videos(&p, root, out, failed, limit);
         } else if is_video_ext(p.extension().and_then(|x| x.to_str()))
             && (ft.is_file() || (ft.is_symlink() && p.is_file()))
         {
@@ -5953,6 +5977,10 @@ async fn library_scan_inner(store: Store, req: ScanReq) -> Response {
     // Walk ALL roots first (blocking, but cheap) so the total is known up
     // front, then probe each video reporting progress to SCAN_STATE
     // (polled by the UI via GET /api/library/scan/progress).
+    // walk_incomplete: a read_dir failure (or dead walk task) means some
+    // files were NOT seen — the final catalog write must preserve the
+    // existing entries for them instead of erasing them.
+    let mut walk_incomplete = false;
     let plan: Vec<(Option<String>, PathBuf, PathBuf)> = {
         let mut v: Vec<(Option<String>, PathBuf, PathBuf)> = Vec::new();
         for (fid, rootp) in &roots {
@@ -5962,16 +5990,24 @@ async fn library_scan_inner(store: Store, req: ScanReq) -> Response {
             // walk; a worker stuck on join() + the other workers idle-parked
             // is exactly the tokio #8342 driver-loss precondition).
             let rp = rootp.clone();
-            let rels = match tokio::task::spawn_blocking(move || {
+            let (rels, wf) = match tokio::task::spawn_blocking(move || {
                 let mut w: Vec<PathBuf> = Vec::new();
-                walk_videos(&rp, &rp, &mut w, limit);
-                w
+                let mut f = false;
+                walk_videos(&rp, &rp, &mut w, &mut f, limit);
+                (w, f)
             })
             .await
             {
                 Ok(r) => r,
-                Err(_) => Vec::new(),
+                Err(e) => {
+                    eprintln!(
+                        "[scan] walk task for {} died: {e} — preserving existing entries for this root",
+                        rootp.display()
+                    );
+                    (Vec::new(), true)
+                }
             };
+            walk_incomplete |= wf;
             for rel in rels {
                 let fname = rel.file_name().and_then(|x| x.to_str()).unwrap_or("");
                 if out_names.contains(fname) {
@@ -6187,6 +6223,16 @@ async fn library_scan_inner(store: Store, req: ScanReq) -> Response {
                     probe_full(&pstr).await
                 }
             };
+            // A probe that produced NO streams at all is a probe FAILURE
+            // (unreadable file / ffprobe error), not a non-video file:
+            // a genuine non-video (e.g. an mp3) still yields audio stream
+            // metadata — only a total read failure yields nothing. Marking
+            // it keeps the entry pending (re-probed next scan) instead of
+            // permanently labelling it notvideo.
+            let probe_failed = info.video_codec.is_none()
+                && info.audio_codec.is_none()
+                && info.duration.is_none()
+                && info.container.is_none();
             let mut e = LibraryEntry {
                 path: rel.to_string_lossy().to_string(),
                 name: full
@@ -6212,10 +6258,15 @@ async fn library_scan_inner(store: Store, req: ScanReq) -> Response {
                 reencoded: None,
                 new_size: None,
                 new_codec: None,
-                error: None,
+                error: if probe_failed {
+                    Some("ffprobe failed — retrying on next scan".into())
+                } else {
+                    None
+                },
                 decision: None,
                 decision_version: None,
                 requeue_count: 0,
+                probe_failed,
                 src_health: None,
             };
             commit_indexed_entry(&store_c, &mut e, old_for_commit.as_ref(), &live_c).await;
@@ -6224,10 +6275,35 @@ async fn library_scan_inner(store: Store, req: ScanReq) -> Response {
     }
     eprintln!("[scan] spawned {} probe tasks — collecting", handles.len());
     let mut entries: Vec<LibraryEntry> = Vec::with_capacity(plan.len());
-    for h in handles {
-        if let Ok(Some(e)) = h.await {
-            entries.push(e);
-            SCAN_STATE.lock().unwrap_or_else(|p| p.into_inner()).scanned += 1;
+    for (idx, h) in handles.into_iter().enumerate() {
+        match h.await {
+            Ok(Some(e)) => {
+                // (scanned is incremented in commit_indexed_entry — counting
+                // it here too made the progress bar overshoot the total.)
+                entries.push(e);
+            }
+            Ok(None) => {}
+            Err(je) => {
+                // A dead probe task would otherwise drop its file from the
+                // final catalog vector — and the final set_library()
+                // erases whatever is not in the vector. Preserve the
+                // previous entry so the file survives (re-probed next scan).
+                let (fid, _rp, rel) = &plan[idx];
+                let key = match fid {
+                    Some(f) => format!("{f}/{}", rel.to_string_lossy()),
+                    None => rel.to_string_lossy().to_string(),
+                };
+                eprintln!("[scan] probe task for {key} died: {je} — keeping previous entry");
+                if let Some(old) = store
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .library
+                    .get(&key)
+                    .cloned()
+                {
+                    entries.push(old);
+                }
+            }
         }
     }
 
@@ -6404,7 +6480,13 @@ async fn library_scan_inner(store: Store, req: ScanReq) -> Response {
                 .rsplit_once('.')
                 .map(|(_, x)| x.to_ascii_lowercase())
                 .is_some_and(|x| matches!(x.as_str(), "mpg" | "mpeg" | "vob" | "psv" | "evo" | "m2v"));
-        let not_video = if entries[i].video_codec.is_none() {
+        let not_video = if entries[i].probe_failed {
+            // ffprobe could not read the file at all (transient I/O or a
+            // damaged header) — NOT "non-video". Leave it pending so the
+            // next scan re-probes it; a failed read must not permanently
+            // mislabel the file.
+            None
+        } else if entries[i].video_codec.is_none() {
             Some("no video stream".to_string())
         } else if entries[i].video_codec.as_deref() == Some("mjpeg") {
             Some("still image (mjpeg)".to_string())
@@ -6697,7 +6779,27 @@ async fn library_scan_inner(store: Store, req: ScanReq) -> Response {
                                             healthy: None,
                                         };
                                         let jid = job.id.clone();
-                                        store_t.lock().unwrap_or_else(|p2| p2.into_inner()).insert(job);
+                                        {
+                                            let mut s =
+                                                store_t.lock().unwrap_or_else(|p2| p2.into_inner());
+                                            s.insert(job);
+                                            // Stamp the in-progress decision with THIS
+                                            // scan's logic version BEFORE the job waits:
+                                            // the reconcile's stale-queued sweep cancels
+                                            // any queued job whose
+                                            // entry.decision_version < current version,
+                                            // but the entry's decision (and its version
+                                            // stamp) is only written after the verdict
+                                            // lands. Without this stamp the sweep
+                                            // cancelled the scan's own freshly queued
+                                            // health jobs — self-cancel -> "cancelled"
+                                            // -> (pre-fix) srcHealth=false -> mass
+                                            // quarantine (2026-10-27, 693 then 691
+                                            // files).
+                                            if let Some(e) = s.library.get_mut(&key) {
+                                                e.decision_version = Some(logic_version);
+                                            }
+                                        }
                                         let mut verdict = None;
                                         loop {
                                             let (st, hd) = {
@@ -6713,8 +6815,20 @@ async fn library_scan_inner(store: Store, req: ScanReq) -> Response {
                                                     verdict = Some(hd.unwrap_or(true));
                                                     break;
                                                 }
-                                                "error" | "cancelled" => {
+                                                "error" => {
                                                     verdict = Some(hd.unwrap_or(false));
+                                                    break;
+                                                }
+                                                "cancelled" => {
+                                                    // A CANCELLED health job is not evidence of
+                                                    // corruption: the reconcile's
+                                                    // stale-logic sweep and user cancels
+                                                    // land here. Leave the entry as-is
+                                                    // (pending) — the next scan re-checks
+                                                    // it. (2026-10-27: "cancelled" mapped
+                                                    // to false and quarantined 691 healthy
+                                                    // files mid-scan.)
+                                                    verdict = None;
                                                     break;
                                                 }
                                                 _ => {
@@ -7004,6 +7118,32 @@ async fn library_scan_inner(store: Store, req: ScanReq) -> Response {
     let all = {
         let mut v = entries.clone();
         v.extend(carried);
+        if walk_incomplete {
+            // An incomplete walk (read_dir failure, dead walk task) silently
+            // drops whole subtrees from `entries` — a blind set_library()
+            // would ERASE the catalog records of those files (decisions,
+            // statuses, requeue counts). Preserve the previous entries of
+            // every file this walk could not see. Files the user actually
+            // deleted are already gone from the store (folder delete
+            // cascades its entries), so nothing stale can be resurrected.
+            let seen: std::collections::HashSet<String> =
+                v.iter().map(|e| e.key()).collect();
+            let keep: Vec<LibraryEntry> = store
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .library
+                .values()
+                .filter(|e| !seen.contains(&e.key()))
+                .cloned()
+                .collect();
+            if !keep.is_empty() {
+                eprintln!(
+                    "[scan] walk incomplete — preserving {} catalog entries the walk could not see",
+                    keep.len()
+                );
+                v.extend(keep);
+            }
+        }
         let mut s = store.lock().unwrap_or_else(|p| p.into_inner());
         s.set_library(v.clone());
         v
