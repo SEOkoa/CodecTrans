@@ -1207,7 +1207,13 @@ fn walk_videos(cur: &std::path::Path, root: &std::path::Path, out: &mut Vec<Path
             break;
         }
         let p = e.path();
-        if p.is_dir() {
+        // Prefer d_type from the dirent itself — is_dir()/is_file() would
+        // stat every single entry, doubling a full-library walk's NAS I/O
+        // (2026-10-27: repeated full rescans were the wedge trigger).
+        // ZFS provides d_type, so regular files/dirs cost nothing; only
+        // symlinks (rare here) fall back to a follow-stat.
+        let Ok(ft) = e.file_type() else { continue };
+        if ft.is_dir() {
             // Skip hidden dirs and NAS metadata/thumbnail caches (QNAP
             // .@__thumb is full of mjpeg "thumbnails" that would flood the
             // library as non-video garbage; @eaDir is QNAP metadata).
@@ -1216,7 +1222,9 @@ fn walk_videos(cur: &std::path::Path, root: &std::path::Path, out: &mut Vec<Path
                 continue;
             }
             walk_videos(&p, root, out, limit);
-        } else if p.is_file() && is_video_ext(p.extension().and_then(|x| x.to_str())) {
+        } else if is_video_ext(p.extension().and_then(|x| x.to_str()))
+            && (ft.is_file() || (ft.is_symlink() && p.is_file()))
+        {
             if let Ok(rel) = p.strip_prefix(root) {
                 out.push(rel.to_path_buf());
             }
@@ -5637,24 +5645,15 @@ async fn library_scan_inner(store: Store, req: ScanReq) -> Response {
         let sem = sem.clone();
         handles.push(tokio::spawn(async move {
             PROBE_TASKS_STARTED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            phase_set(&pstr, "wait");
-            let _g = match tokio::time::timeout(
-                std::time::Duration::from_secs(120),
-                sem.clone().acquire_owned(),
-            )
-            .await
-            {
-                Ok(g) => g.expect("probe semaphore"),
-                Err(_) => {
-                    eprintln!(
-                        "[scan] probe semaphore starved >120s (avail={}) — {pstr}",
-                        sem.available_permits()
-                    );
-                    sem.clone().acquire_owned().await.expect("probe semaphore")
-                }
-            };
-            phase_set(&pstr, "work");
-            let _pf = ProbeInflightGuard(pstr.clone());
+            phase_set(&pstr, "stat");
+            // Size check FIRST, outside the probe permit. The permit guards
+            // the scarce resource (ffprobe + GPU decode); holding it while
+            // stat-ing is what starved the semaphore on big rescans
+            // (2026-10-27: 124 tasks waiting while 3 holders sat in stat,
+            // and every 30-min auto-scan re-triggered the ZFS stall that
+            // wedges the tokio runtime). Unchanged files no longer touch
+            // the permit at all — a 4862-file rescan degrades to 4862
+            // cheap stats plus probes for new/changed files only.
             let size = tokio::task::spawn_blocking({
                 let f = full.clone();
                 move || std::fs::metadata(&f).map(|m| m.len()).unwrap_or(0)
@@ -5681,7 +5680,43 @@ async fn library_scan_inner(store: Store, req: ScanReq) -> Response {
                     audio_bit_rate: None,
                 },
                 None => {
+                    phase_set(&pstr, "wait");
+                    let _g = match tokio::time::timeout(
+                        std::time::Duration::from_secs(120),
+                        sem.clone().acquire_owned(),
+                    )
+                    .await
+                    {
+                        Ok(g) => g.expect("probe semaphore"),
+                        Err(_) => {
+                            // Starved: the OLD fallback waited on the permit
+                            // UNBOUNDED — one stuck permit hung the entire
+                            // scan forever (scan stayed "active" with 0
+                            // in-flight tasks). Defer the file to the next
+                            // scan instead: save it with a size-0 sentinel.
+                            // Reuse compares sizes, so 0 never matches and
+                            // the next scan re-probes it; the size-0 gate
+                            // in pass 1 keeps it out of the queue meanwhile.
+                            eprintln!(
+                                "[scan] probe semaphore starved >120s — deferring to next scan: {pstr}"
+                            );
+                            return Some(LibraryEntry {
+                                path: rel.to_string_lossy().to_string(),
+                                name: full
+                                    .file_name()
+                                    .and_then(|x| x.to_str())
+                                    .unwrap_or("")
+                                    .to_string(),
+                                size: 0,
+                                status: "pending".into(),
+                                container: if ext.is_empty() { None } else { Some(ext) },
+                                folder: fid,
+                                ..Default::default()
+                            });
+                        }
+                    };
                     phase_set(&pstr, "probe");
+                    let _pf = ProbeInflightGuard(pstr.clone());
                     probe_full(&pstr).await
                 }
             };
@@ -5833,6 +5868,13 @@ async fn library_scan_inner(store: Store, req: ScanReq) -> Response {
     let mut redispatch: Vec<usize> = Vec::new();
     for i in 0..entries.len() {
         if entries[i].status != "pending" {
+            continue;
+        }
+        // Starved sentinel: the probe was deferred to the next scan
+        // (permit timeout). size 0 marks it — never gate/health-check/
+        // queue a file whose metadata we don't have yet; the next scan
+        // re-probes it (reuse compares sizes, so 0 never matches).
+        if entries[i].size == 0 {
             continue;
         }
         // Fast path: already evaluated in a previous scan (the saved
@@ -7979,18 +8021,29 @@ async fn main() {
                     }
                     fails += 1;
                     if fails >= 3 {
-                        eprintln!("[wedge-watch] listener :{port} failed 3 HTTP probes in a row — nudging the runtime (tokio #8342 driver-handoff loss)");
-                        if let Err(e) = nudge_runtime() {
-                            eprintln!("[wedge-watch] nudge failed: {e}");
-                        }
-                        // Give the runtime a moment: the injected task wakes
-                        // a worker, which re-parks and re-runs the driver
-                        // handoff. Re-probe for ~20s.
+                        // Nudge up to 3 rounds: a deep ZFS stall can take
+                        // longer than one 20s re-probe window to clear, and
+                        // the issue's field reports show recovery only
+                        // happens once the kernel stops freezing the
+                        // threads. Each round injects a task (wakes a
+                        // worker, re-runs the park/driver-handoff).
                         let mut revived = false;
-                        for _ in 0..4 {
-                            std::thread::sleep(std::time::Duration::from_secs(5));
-                            if http_probe(&target, std::time::Duration::from_secs(5)) {
-                                revived = true;
+                        for round in 1..=3u32 {
+                            eprintln!("[wedge-watch] listener :{port} failed 3 HTTP probes in a row — nudging the runtime (round {round}/3, tokio #8342 driver-handoff loss)");
+                            if let Err(e) = nudge_runtime() {
+                                eprintln!("[wedge-watch] nudge failed: {e}");
+                            }
+                            // Give the runtime a moment: the injected task
+                            // wakes a worker, which re-parks and re-runs
+                            // the driver handoff. Re-probe for ~20s.
+                            for _ in 0..4 {
+                                std::thread::sleep(std::time::Duration::from_secs(5));
+                                if http_probe(&target, std::time::Duration::from_secs(5)) {
+                                    revived = true;
+                                    break;
+                                }
+                            }
+                            if revived {
                                 break;
                             }
                         }
@@ -7999,7 +8052,7 @@ async fn main() {
                             fails = 0;
                             continue;
                         }
-                        eprintln!("[wedge-watch] nudge did not revive the runtime — dumping state (external watchdog will restart the container)");
+                        eprintln!("[wedge-watch] nudge did not revive the runtime after 3 rounds — dumping state (external watchdog will restart the container)");
                         wedge_dump(port);
                         fails = 0;
                     }
