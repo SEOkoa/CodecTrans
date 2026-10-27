@@ -4,8 +4,10 @@
 > - 본 프로젝트의 코드는 **Qwen3.8 27B** 모델의 도움을 받아 작성되었습니다.
 > - 저자의 Rust 지식이 쌓이는 대로 **재설계**할 예정입니다.
 > - 본 프로젝트는 **비영리** 목적입니다. 대한민국 「군인의 지위 및 복무에 관한 기본법」 제30조(영리행위 및 겸직 금지)에 따라 군인은 군무 외의 영리 업무 종사 및 국방부 장관 허가 없는 겸직이 금지되어 있으며, 본 프로젝트는 이에 준해 영리화되지 않습니다.
+> - **AI 개발 총 토큰 사용량 (2026-10-23 ~ 10-27, 모델 호출 7,558회): 약 9.28억 토큰**
+>   - 신규 입력 1,311만 / 출력 532만 / 추론 328만, 나머지 약 9.06억은 컨텍스트 재읽기(프롬프트 캐시)입니다.
 >
-> *This project was written with the assistance of the Qwen3.8 27B model, is non-commercial, and will be redesigned as the author's Rust expertise grows.*
+> *This project was written with the assistance of the Qwen3.8 27B model, is non-commercial, and will be redesigned as the author's Rust expertise grows. Total AI token usage across 7,558 model calls (2026-10-23 → 10-27): ≈ 928 million tokens — 13.1M fresh input, 5.3M output, 3.3M reasoning, ~906M context re-reads (prompt cache).*
 
 Self-hosted media transcoding with a central server + distributed worker nodes (Tdarr-style).
 Upload a video, pick a codec (logical like `h264`/`av1`, or a specific HW encoder), and it is

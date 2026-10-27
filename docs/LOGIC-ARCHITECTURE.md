@@ -47,7 +47,7 @@ auto-scan (5분 주기, CT_AUTO_SCAN)
 ```
 
 - **hwOnly 인코딩**: `hw_only=true`면 해당 코덱의 HW 인코더를 가진 노드만 수락,
-  없으면 에러(노드 재시도 대기). AV1 = a node with av1_nvenc (e.g. RTX PRO 4000) 전용.
+  없으면 에러(노드 재시도 대기). AV1 = av1_nvenc 인코더가 있는 노드 전용 (예: RTX PRO 4000).
 - **PostOp 실행 시점**: entry 락을 **해제한 뒤** (Cmd 실행 중엔 entry 점유 없음 —
   `PostOp::Cmd`는 실행 직전에 필요한 값만 락 밖으로 클론).
 

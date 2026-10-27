@@ -50,8 +50,8 @@ services:
       CT_MAX_UPLOAD_MB: "16384"
     volumes:
       - /share/Container/codectrans/config:/data
-      - /share/YourVolume1:/media/Volume1
-      - /share/YourVolume2:/media/Volume2
+      - /share/YourVolume1:/media/Volume1  # adjust to your share names
+      - /share/YourVolume2:/media/Volume2  # adjust to your share names
       - /share/YourVolume3:/media/Volume3
     devices:
       - /dev/nvidia0
@@ -84,8 +84,8 @@ services:
     volumes:
       - /share/Container/codectrans/work:/opt/ct/work
       - /share/Container/codectrans/config/outputs:/data/outputs
-      - /share/YourVolume1:/media/Volume1
-      - /share/YourVolume2:/media/Volume2
+      - /share/YourVolume1:/media/Volume1  # adjust to your share names
+      - /share/YourVolume2:/media/Volume2  # adjust to your share names
       - /share/YourVolume3:/media/Volume3
     devices:
       - /dev/nvidia0

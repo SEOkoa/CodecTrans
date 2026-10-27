@@ -7,7 +7,7 @@
 set -euo pipefail
 cd "$(dirname "$0")"
 
-NODE_BIN="/usr/local/bin"
+NODE_BIN="${NODE_BIN:-/usr/local/bin}"
 command -v npm >/dev/null 2>&1 || export PATH="$NODE_BIN:$PATH"
 
 echo "==> building frontend (skipped when frontend/dist is already built)"

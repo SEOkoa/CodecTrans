@@ -1,6 +1,9 @@
 #!/usr/bin/env python3
 """E2E: plugin field/cmd conditions through the real scan pipeline (local smoke server)."""
 import json, os, shutil, subprocess, time, urllib.request, urllib.error
+from pathlib import Path
+
+REPO = Path(__file__).resolve().parents[1]
 
 BASE = "http://127.0.0.1:8411"
 ROOT = "/tmp/ct_vids"
@@ -34,9 +37,9 @@ for d in "ABCD":
 # --- start smoke server ---
 sh(f"rm -rf {CT_BASE}")
 env = dict(os.environ, CT_PORT="8411", CT_BASE=CT_BASE, CT_REDIS="redis://127.0.0.1:6379",
-           CT_FRONTEND="/path/to/CodecTrans/CodecTrans-server/frontend/dist",
+           CT_FRONTEND=str(REPO / "CodecTrans-server/frontend/dist"),
            CT_MAX_QUEUED="10")
-srv = subprocess.Popen(["/path/to/CodecTrans/CodecTrans-server/backend/target/release/CodecTrans"],
+srv = subprocess.Popen([str(REPO / "CodecTrans-server/backend/target/release/CodecTrans")],
                        env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 time.sleep(4)
 

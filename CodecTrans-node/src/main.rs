@@ -144,7 +144,7 @@ fn out_dir() -> PathBuf {
 
 /// CT_PATH_MAP: comma-separated `from:to` prefix pairs remapping the
 /// server's source paths onto this host's filesystem. The server reports
-/// paths from ITS mounts (e.g. /media/Volume2/AV/x.mp4); the same tree can
+/// paths from ITS mounts (e.g. /media/Volume_E/AV/x.mp4); the same tree can
 /// live elsewhere here — an NFS mount at ~/nfs (macOS: /media is
 /// unwritable on the sealed root) or /mnt/ctfs on a box. Example:
 ///   CT_PATH_MAP=/media:/Users/<user>/nfs

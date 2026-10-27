@@ -74,8 +74,8 @@ services:
       - /share/Container/codectrans/config:/data
       # ── 미디어: 기존 Tdarr과 같은 3개 공유 폴더 ──────────────
       # (UI에서 /media/Volume1 형태로 폴더 등록)
-      - /share/YourVolume1:/media/Volume1
-      - /share/YourVolume2:/media/Volume2
+      - /share/YourVolume1:/media/Volume1  # adjust to your share names
+      - /share/YourVolume2:/media/Volume2  # adjust to your share names
       - /share/YourVolume3:/media/Volume3
       # ────────────────────────────────────────────────────────
     depends_on:
@@ -115,6 +115,6 @@ services:
       # 결과 = 서버의 /data/outputs와 같은 디렉터리 (로컬 스테이징, 업로드 불필요)
       - /share/Container/codectrans/config/outputs:/data/outputs
       # 같은 파일시스템 소스 직접 읽기 (멀티 GB 루프백 회피)
-      - /share/YourVolume1:/media/Volume1
-      - /share/YourVolume2:/media/Volume2
+      - /share/YourVolume1:/media/Volume1  # adjust to your share names
+      - /share/YourVolume2:/media/Volume2  # adjust to your share names
       - /share/YourVolume3:/media/Volume3
