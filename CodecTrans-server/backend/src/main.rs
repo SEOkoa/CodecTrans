@@ -2971,8 +2971,10 @@ fn save_lib_cfg(c: &LibraryConfig) -> std::io::Result<()> {
     let tmp = p.with_extension("json.tmp");
     std::fs::write(&tmp, json)?;
     std::fs::rename(&tmp, &p)?;
-    // Drop the in-memory cache so the next read sees the new generation.
-    *LIB_CFG_CACHE.lock().unwrap_or_else(|p| p.into_inner()) = None;
+    // Refresh the in-memory cache IN PLACE (not a drop): dropping it forces
+    // the next load_lib_cfg into a synchronous 38KB NAS read on whatever
+    // tokio worker runs it — one more stall point per settings save.
+    *LIB_CFG_CACHE.lock().unwrap_or_else(|p| p.into_inner()) = Some(c.clone());
     Ok(())
 }
 
@@ -2991,7 +2993,8 @@ fn save_lib_cfg_quiet(c: &LibraryConfig) -> std::io::Result<()> {
     let tmp = p.with_extension("json.tmp");
     std::fs::write(&tmp, json)?;
     std::fs::rename(&tmp, &p)?;
-    *LIB_CFG_CACHE.lock().unwrap_or_else(|p| p.into_inner()) = None;
+    // In-place cache refresh (a drop = next load reads the NAS on a worker).
+    *LIB_CFG_CACHE.lock().unwrap_or_else(|p| p.into_inner()) = Some(c.clone());
     Ok(())
 }
 
@@ -3052,12 +3055,34 @@ fn persist_catalog(store: &Store) {
     persist_catalog_snapshot(&entries);
 }
 
-/// Persist a catalog snapshot. No global locks are held for the heavy I/O
-/// (serialize + .bak + tmp + rename of the multi-MB catalog); only the
-/// short tombstone-upkeep section takes LIB_CFG_LOCK (small file, shared
-/// with the settings-save handlers). Concurrent persists converge: writes
-/// are atomic and last-writer-wins.
+/// Run the catalog I/O OFF the tokio workers. The persist is up to ~200KB of
+/// synchronous ZFS I/O (serialize + .bak + tmp + rename + config
+/// read-modify-write) and can stall for seconds under ARC pressure. 20+
+/// async handlers call persist directly, so a burst (scan finish + job
+/// completion + a folders POST — the user's enable/disable habit) stalled
+/// every worker and killed the listener: the recurring scan/enable wedge of
+/// 2026-10-27. Fire-and-forget: callers don't need the write to have landed
+/// (the next persist converges, jobs are also tracked in Redis), and a
+/// dedicated lock keeps overlapping snapshots in rename order.
 fn persist_catalog_snapshot(entries: &[LibraryEntry]) {
+    let entries = entries.to_vec();
+    if let Some(handle) = RUNTIME_HANDLE.lock().unwrap_or_else(|p| p.into_inner()).clone() {
+        let _ = handle.spawn_blocking(move || persist_catalog_io(&entries));
+        return;
+    }
+    persist_catalog_io(&entries);
+}
+
+// Serializes the whole I/O sequence of a persist (see persist_catalog_io).
+static PERSIST_IO_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+fn persist_catalog_io(entries: &[LibraryEntry]) {
+    let _io = PERSIST_IO_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    /// Persist a catalog snapshot. No global locks are held for the heavy I/O
+    /// (serialize + .bak + tmp + rename of the multi-MB catalog); only the
+    /// short tombstone-upkeep section takes LIB_CFG_LOCK (small file, shared
+    /// with the settings-save handlers). Concurrent persists converge: writes
+    /// are atomic and last-writer-wins (I/O serialized by PERSIST_IO_LOCK).
     let json = match serde_json::to_string(entries) {
         Ok(j) => j,
         Err(e) => {
@@ -5625,15 +5650,22 @@ async fn library_scan_inner(store: Store, req: ScanReq) -> Response {
     let plan: Vec<(Option<String>, PathBuf, PathBuf)> = {
         let mut v: Vec<(Option<String>, PathBuf, PathBuf)> = Vec::new();
         for (fid, rootp) in &roots {
-            let rels = std::thread::scope(|sc| {
-                sc.spawn(|| {
-                    let mut w: Vec<PathBuf> = Vec::new();
-                    walk_videos(rootp, rootp, &mut w, limit);
-                    w
-                })
-                .join()
-                .unwrap_or_default()
-            });
+            // The walk is a stream of read_dir I/O calls on ZFS — run it on
+            // the blocking pool so a stall can't even OCCUPY a tokio worker
+            // (the old thread::scope+join blocked its worker for the whole
+            // walk; a worker stuck on join() + the other workers idle-parked
+            // is exactly the tokio #8342 driver-loss precondition).
+            let rp = rootp.clone();
+            let rels = match tokio::task::spawn_blocking(move || {
+                let mut w: Vec<PathBuf> = Vec::new();
+                walk_videos(&rp, &rp, &mut w, limit);
+                w
+            })
+            .await
+            {
+                Ok(r) => r,
+                Err(_) => Vec::new(),
+            };
             for rel in rels {
                 let fname = rel.file_name().and_then(|x| x.to_str()).unwrap_or("");
                 if out_names.contains(fname) {
