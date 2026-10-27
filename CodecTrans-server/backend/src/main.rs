@@ -732,6 +732,7 @@ async fn reg_node(
     accels: &[Accel],
     diag: &[String],
     mounts: &[String],
+    health_workers: Option<u32>,
 ) -> Result<Node, String> {
     let mut c = c;
     let now = now_ms();
@@ -767,6 +768,21 @@ async fn reg_node(
         .arg("mounts").arg(serde_json::to_string(mounts).unwrap_or_else(|_| "[]".into()))
         .arg("firstSeen").arg(first_seen)
         .arg("lastHeartbeat").arg(now);
+    // Health worker budget: seeded from the node's CT_HEALTH_WORKERS when
+    // the registry has no value yet (new node, or a node restarted with a
+    // new env before the UI field existed). Once set (UI or seed), the
+    // stored value wins — re-registration must never clobber user settings.
+    let hw_existing: Option<String> = redis::cmd("HGET")
+        .arg(rk_node(&id))
+        .arg("healthWorkers")
+        .query_async(&mut c)
+        .await
+        .ok()
+        .flatten();
+    if hw_existing.as_deref().map(str::is_empty).unwrap_or(true) {
+        let hw: u32 = health_workers.unwrap_or(0).clamp(0, 16);
+        pipe.cmd("HSET").arg(rk_node(&id)).arg("healthWorkers").arg(hw);
+    }
     // Registration = (re)start: whatever job the old process "had" is gone.
     pipe.cmd("HSET").arg(rk_node(&id)).arg("currentJob").arg("");
     pipe.cmd("SETEX").arg(rk_online(&id)).arg(ONLINE_TTL_SECS).arg("1");
@@ -7263,6 +7279,10 @@ struct RegisterReq {
     /// nodes whose mounts cover the source path.
     #[serde(default)]
     mounts: Vec<String>,
+    /// Decode worker budget the node was started with (CT_HEALTH_WORKERS).
+    /// Used as the initial healthWorkers value on FIRST registration only.
+    #[serde(default)]
+    health_workers: Option<u32>,
 }
 
 /// POST /api/nodes/register — a node announces itself with its ffmpeg capabilities.
@@ -7287,7 +7307,7 @@ async fn node_register(State(store): State<Store>, Json(req): Json<RegisterReq>)
         .await
         .ok()
         .flatten();
-    let node = match reg_node(c, &req.name, &ffmpeg_version, &haccels, &hw_encoders, &accels, &diag, &mounts).await {
+    let node = match reg_node(c, &req.name, &ffmpeg_version, &haccels, &hw_encoders, &accels, &diag, &mounts, req.health_workers).await {
         Ok(n) => n,
         Err(e) => return (StatusCode::BAD_GATEWAY, Json(json!({ "error": e }))).into_response(),
     };
@@ -7617,7 +7637,7 @@ async fn search_node(State(store): State<Store>, Json(req): Json<SearchReq>) -> 
 
     // 3. Upsert into the Redis registry (idempotent by name).
     let c = store.lock().unwrap_or_else(|p| p.into_inner()).redis();
-    let node = match reg_node(c, &name, &ffmpeg_version, &haccels, &hw_encoders, &accels, &[], &[]).await {
+    let node = match reg_node(c, &name, &ffmpeg_version, &haccels, &hw_encoders, &accels, &[], &[], None).await {
         Ok(n) => n,
         Err(e) => return (StatusCode::BAD_GATEWAY, Json(json!({ "error": e }))).into_response(),
     };

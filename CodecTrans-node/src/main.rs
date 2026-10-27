@@ -2218,6 +2218,14 @@ async fn do_register(client: &reqwest::Client, server: &str, name: &str, caps: &
         // server routes pre-encode health decodes here only when a mount
         // covers the source path (same FS, no download).
         "mounts": mount_prefixes(),
+        // Our decode worker budget (CT_HEALTH_WORKERS). Seeded by the server
+        // on FIRST registration only — afterwards the UI (node settings) is
+        // the source of truth and survives re-registrations.
+        "healthWorkers": std::env::var("CT_HEALTH_WORKERS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0)
+            .clamp(0, 16),
     });
     let resp = client.post(format!("{}/api/nodes/register", server)).json(&body).send().await;
     match resp {
