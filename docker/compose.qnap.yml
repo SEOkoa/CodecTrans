@@ -4,10 +4,12 @@
 #   /share/<your-data-volume>/.qpkg/container-station/bin/docker compose -f compose.yml up -d
 #
 # Notes:
-# - Memory/CPU caps are deliberate (2026-10-26 incident): a runaway container
-#   must OOM-restart (restart policy brings it back, in-flight jobs re-queue)
-#   instead of starving the host. Idle usage is tiny (server ~50MB, node ~6MB);
-#   4GB covers worst-case transcode + health decodes with margin.
+# - Memory/CPU caps are deliberate (2026-10-26 incident, tightened 2026-10-27):
+#   a runaway container must OOM-restart (restart policy brings it back,
+#   in-flight jobs re-queue) instead of starving the host — a host-level
+#   OOM killed dockerd (Exited 137) once. Idle usage is tiny (measured
+#   server 15MB / node 37MB / redis 7MB); 2G covers worst-case health
+#   decodes, 3.5G covers 2 concurrent 4K NVENC jobs, 512M the redis AOF.
 # - Redis data (node registry AOF) persists in redis-data/ — safe to recreate.
 # - The QEMU VM (Home Assistant) on this box is OUTSIDE this stack.
 services:
@@ -19,7 +21,7 @@ services:
     command: ["redis-server", "--appendonly", "yes", "--port", "6380"]
     volumes:
       - /share/Container/codectrans/redis-data:/data
-    mem_limit: 1g
+    mem_limit: 512m
     cpus: 1
 
   server:
@@ -61,7 +63,7 @@ services:
       # health decode + node NVENC silently fall back to CPU.
       - /dev/nvidia-caps/nvidia-cap1
       - /dev/nvidia-caps/nvidia-cap2
-    mem_limit: 4g
+    mem_limit: 2g
     cpus: 4
 
   node:
@@ -92,5 +94,5 @@ services:
       - /dev/nvidia-uvm-tools
       - /dev/nvidia-caps/nvidia-cap1
       - /dev/nvidia-caps/nvidia-cap2
-    mem_limit: 4g
+    mem_limit: 3.5g
     cpus: 4
