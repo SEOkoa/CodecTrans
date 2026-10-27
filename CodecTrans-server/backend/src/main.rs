@@ -5603,7 +5603,7 @@ async fn library_scan_inner(store: Store, req: ScanReq) -> Response {
                 if !ph.is_empty() || avail < 3 {
                     let holders: Vec<String> = ph
                         .iter()
-                        .filter(|(_, v)| *v != "wait")
+                        .filter(|(_, v)| *v == "probe")
                         .map(|(k, _)| k.clone())
                         .collect();
                     let hhead = holders.iter().take(4).cloned().collect::<Vec<_>>().join(" | ");
@@ -5660,7 +5660,19 @@ async fn library_scan_inner(store: Store, req: ScanReq) -> Response {
             })
             .await
             .unwrap_or(0);
-            let reuse = old_entry.filter(|o| o.size == size && o.status != "error");
+            // A done+replaced file sits on disk as the ENCODED OUTPUT — its
+            // catalog size is the historical SOURCE size, so the size check
+            // against the current (output) file never matches and the file
+            // would be re-probed on every rescan (105+ GPU decodes per full
+            // scan, all discarded by the carry-forward). Trust new_size as
+            // the expected on-disk size for replaced files.
+            let reuse = old_entry.filter(|o| {
+                o.status != "error"
+                    && (o.size == size
+                        || (o.status == "done"
+                            && o.reencoded.is_some()
+                            && o.new_size == Some(size)))
+            });
             let info = match reuse {
                 Some(o) => MediaInfo {
                     duration: o.duration,
