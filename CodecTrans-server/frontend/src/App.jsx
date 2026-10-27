@@ -1136,7 +1136,9 @@ export default function App() {
     }
     // spec filters: resolution / bitrate / fps (in-between values bucket down)
     if (libResFilter || libBrFilter || libFpsFilter) {
-      base = base.filter(e => (!libResFilter || resBucket(e.resolution) === libResFilter) && (!libBrFilter || brBucket(e.bitrateKbps) === libBrFilter) && (!libFpsFilter || fpsBucket(e.fps) === libFpsFilter));
+      // NOTE: entry fields are width/height/videoBitRate(bps) — the probe
+      // never emits `resolution`/`bitrateKbps`, so bucket from the real fields.
+      base = base.filter(e => (!libResFilter || resBucket(e.height) === libResFilter) && (!libBrFilter || brBucket(e.videoBitRate ? e.videoBitRate / 1000 : null) === libBrFilter) && (!libFpsFilter || fpsBucket(e.fps) === libFpsFilter));
     }
     const {
       key,
