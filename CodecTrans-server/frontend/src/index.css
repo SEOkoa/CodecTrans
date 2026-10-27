@@ -354,6 +354,10 @@ button:disabled {
   opacity: 0.45;
   cursor: default;
 }
+label {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
 
 button.primary {
   width: 100%;
@@ -485,6 +489,10 @@ button.primary:disabled {
   font-size: 12px;
   white-space: nowrap;
   min-width: 0;
+  /* nowrap job meta (node · codec → container · size → out.mp4) used to
+     bleed off the right screen edge on phones — ellipsize instead */
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 /* Node card row: everything from the ffmpeg-version meta to the button
    cluster sticks to the RIGHT edge as one tight group (the old
