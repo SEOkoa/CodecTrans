@@ -6,7 +6,7 @@ COPY CodecTrans-node/Cargo.toml CodecTrans-node/Cargo.lock ./
 COPY CodecTrans-node/src ./src
 RUN cargo build --release
 
-# Bundled NVIDIA driver *userland* series (575, 535, 525 — extracted, NOT
+# Bundled NVIDIA driver *userland* series (580, 575, 535, 525 — extracted, NOT
 # installed, so they can coexist with the system 545 libs):
 #
 #   /opt/nvidia-userland/<series>/lib  libcuda.so.1, libnvidia-encode.so.1,
@@ -55,7 +55,25 @@ RUN set -x; \
         ln -sf libnvcuvid.so.575.64.05 libnvcuvid.so.1); \
     echo "series 575 (official .run 575.64.05):"; ls -la /opt/nvidia-userland/575/lib/; \
     rm -rf /tmp/575-ex /tmp/575.run; \
-    # ── 535 / 525 (Ubuntu jammy — older NAS firmware) ──
+    # ── 580 (official NVIDIA .run, 580.159.04 — the current QNAP host driver,
+    #    QuTS hero h5.2.11. Same rule as 575: exact point release, extracted
+    #    not installed, libnvcuvid included). ──
+    mkdir -p /opt/nvidia-userland/580/lib /opt/nvidia-userland/580/bin; \
+    curl -sf -o /tmp/580.run https://us.download.nvidia.com/XFree86/Linux-x86_64/580.159.04/NVIDIA-Linux-x86_64-580.159.04.run; \
+    sh /tmp/580.run --extract-only --target /tmp/580-ex; \
+    for f in libcuda.so* libnvidia-encode.so* libnvidia-ml.so* libnvidia-cfg.so* libnvcuvid.so*; do \
+        cp -a /tmp/580-ex/$f /opt/nvidia-userland/580/lib/; \
+    done; \
+    cp -a /tmp/580-ex/nvidia-smi /opt/nvidia-userland/580/bin/; \
+    (cd /opt/nvidia-userland/580/lib && \
+        ln -sf libcuda.so.580.159.04 libcuda.so.1 && \
+        ln -sf libnvidia-encode.so.580.159.04 libnvidia-encode.so.1 && \
+        ln -sf libnvidia-ml.so.580.159.04 libnvidia-ml.so.1 && \
+        ln -sf libnvidia-cfg.so.580.159.04 libnvidia-cfg.so.1 && \
+        ln -sf libnvcuvid.so.580.159.04 libnvcuvid.so.1); \
+    echo "series 580 (official .run 580.159.04):"; ls -la /opt/nvidia-userland/580/lib/; \
+    rm -rf /tmp/580-ex /tmp/580.run; \
+    # ── 535 / 525 (Ubuntu jammy — older NAS firmware) ── \
     for v in 535 525; do \
         mkdir -p /opt/nvidia-userland/$v/lib /opt/nvidia-userland/$v/bin; \
         ok=1; \
